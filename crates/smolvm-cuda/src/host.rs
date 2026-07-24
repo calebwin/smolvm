@@ -584,20 +584,26 @@ fn path3_enabled() -> bool {
 /// ranges (IPC-import without copy) instead of privately copying them — one
 /// weight set in VRAM for the whole fork pool instead of one per clone.
 ///
-/// ON by default: density is the point of a fork pool, and sharing is
-/// self-limiting because only chunks that pass share verification are shared
-/// (`verify_chunk_content`) — a chunk whose device bytes no longer match what
-/// the H2Ds uploaded (i.e. something wrote it, like unsloth's embedding fixup
-/// during the golden's warmup step) is privately copied instead. Set
-/// `SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0` to force the all-private behaviour.
+/// OPT-IN (`SMOLVM_CUDA_FORK_SHARE_WEIGHTS=1`), because sharing is only safe
+/// under a precondition smolvm cannot enforce for an arbitrary golden.
 ///
-/// NOTE: verification only sees writes that happened BEFORE the fork, so the
-/// golden must exercise its write path (warm up) before forking — otherwise a
-/// post-fork write to a shared chunk races across clones.
+/// Sharing IS self-limiting for chunks written before the fork: only chunks
+/// that pass `verify_chunk_content` are shared, so a chunk whose device bytes
+/// no longer match what the H2Ds uploaded — unsloth's embedding fixup during
+/// the golden's warmup step, say — is privately copied instead. That is why a
+/// warmed golden shares safely (measured: 260 shared / 160 private, per-clone
+/// VRAM 6928 -> 1648 MiB, training results bit-identical to all-private).
+///
+/// What verification CANNOT see is a write that happens AFTER the fork: a
+/// kernel writing the base in each clone races on the shared physical, and a
+/// device-side write to a read-only mapping faults fatally rather than
+/// trapping into a copy-on-write handler, so there is no safe fallback today.
+/// Until the daemon privately copies a chunk on first post-fork write, the
+/// default stays all-private and callers opt in when their golden is warm.
 pub fn path3_share_weights_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
+        Ok("1") | Ok("true") | Ok("on")
     )
 }
 
@@ -4470,19 +4476,17 @@ mod tests {
         assert!(g.maps[&0x1000].covered_exactly() && g.maps[&0x2000].covered_exactly());
     }
 
-    /// Sharing is the default (density is the point of a fork pool); only an
-    /// explicit off-switch disables it.
+    /// Sharing is OPT-IN: a golden that has not exercised its write path before
+    /// forking would race on the shared physical, and smolvm cannot verify that
+    /// for an arbitrary workload, so the default must stay all-private.
     #[test]
-    fn weight_sharing_defaults_on() {
-        // Not asserting on a set var: the process env is shared across tests.
-        assert!(matches!(
-            std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").as_deref(),
-            Err(_) | Ok(_)
-        ));
+    fn weight_sharing_is_opt_in() {
         std::env::remove_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS");
-        assert!(path3_share_weights_enabled());
+        assert!(!path3_share_weights_enabled(), "unset must not share");
+        std::env::set_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "1");
+        assert!(path3_share_weights_enabled(), "explicit 1 opts in");
         std::env::set_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "0");
-        assert!(!path3_share_weights_enabled());
+        assert!(!path3_share_weights_enabled(), "explicit 0 stays private");
         std::env::remove_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS");
     }
 
