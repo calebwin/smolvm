@@ -1,7 +1,9 @@
 # CUDA fork-pool throughput investigation & graph-capture plan
 
-Status: investigation complete, root cause fully attributed, one blocking assumption
-(kernel-argument stability) not yet resolved. Nothing in §6/§7 is implemented.
+Status: the original investigation gates are resolved. Transparent daemon-side
+auto-capture is a **no-go**; explicit CUDA graphs initiated above the per-op API
+boundary are a **go**. The next prototype is workload-level capture with fixed-shape
+inputs and static device buffers. No production performance feature is implemented.
 
 ## 1. TL;DR
 
@@ -10,21 +12,29 @@ Status: investigation complete, root cause fully attributed, one blocking assump
   loudly in one clone instead of corrupting every sibling silently. Shipped in
   [#741](https://github.com/smol-machines/smolvm/pull/741) and
   [#742](https://github.com/smol-machines/smolvm/pull/742) (both merged).
-- **Native still wins raw throughput at every configuration measured.** The gap is
-  fully root-caused: it is CUDA op *count* × a small per-op remoting cost, not any
-  slow path. Five other hypotheses were tested and eliminated (§4).
-- The only large lever left is **CUDA graph capture at the remoting boundary**. Measured
-  through the boundary it nearly erases the per-op tax (1.241 µs/op remoted vs 1.224
-  native — a 3.7x reduction). It is blocked by two unresolved questions, not a wall:
-  clone-side capture reliability, and whether kernel arguments are stable enough to
-  replay. See §6 for the validated numbers and §7 for the phased plan with go/no-go
-  gates.
-- Separately, fork's *saturated* ceiling (~13.7k tok/s regardless of N) is a different,
-  architectural issue — per-clone CUDA contexts time-slice the GPU. Fixing that needs a
-  single-context/multi-stream redesign, which is a real project, not started, and needs
-  an explicit decision before any work begins (§5).
-- **There is real uncommitted work on disk right now** (§8) — the diagnostics that
-  produced §6's numbers are not on any branch. Read that section before it's lost.
+- **Native still wins raw throughput at every configuration measured.** The steady
+  gap tracks CUDA op count and per-call guest/framework work. Host-side launch
+  suppression does not improve it; even returning at the start of the guest shim only
+  moves 3.76 to 2.89 µs/launch. The original claim that the entire gap was a
+  ~3 µs transport tax was too strong (§3).
+- **Explicit CUDA graphs are still the one validated large lever.** Through the
+  boundary, a K=500 graph measures 1.241 µs/op versus native's 1.224. Fresh fork
+  clones now pass capture and exact-readback tests reliably (§6).
+- **Transparent daemon auto-capture is ruled out.** It sees all K guest crossings
+  before it can recognize a segment, so it cannot remove the dominant guest-side
+  work. In addition, the upgraded real-DPO probe found moving device pointers in
+  every repeated structural group. Hash-and-replay would therefore be unsafe (§6).
+- The next path is an explicit graph at the workload/framework boundary: fixed-shape
+  batches copied into static device buffers, warm up once per clone, capture a large
+  training region, and replay it. The target application must stop issuing the K
+  eager calls; moving recognition from the daemon to the guest shim is insufficient
+  (§7).
+- Separately, fork's *saturated* ceiling (~13.7k tok/s regardless of N) remains an
+  architectural question. Per-clone contexts and scheduling are the leading
+  explanation, but the current data do not prove that they are the only cause. A
+  single-context/multi-stream redesign remains a separate project (§5).
+- The original diagnostics are committed on the investigation branch. New boundary,
+  pointer-classification, and fresh-clone probes are currently uncommitted (§8).
 
 ## 2. Shipped (merged)
 
@@ -44,7 +54,7 @@ Validated density numbers (H100 80 GiB, Qwen2.5-7B-bnb-4bit DPO):
   read-only shared chunks → 8/8 clean, 0 faults, identical `260/148` split and identical
   VRAM to read-write sharing.
 
-## 3. Throughput investigation — root cause, fully attributed
+## 3. Throughput investigation — mechanism located, attribution bounded
 
 Cost decomposition (steps 20 vs 100, N=1, batch 8×1024, isolates fixed cost from
 per-step cost):
@@ -66,9 +76,30 @@ decode=141ms (1%)
 
 The daemon is idle 73% of the time — **guest-bound, not host- or GPU-bound.** An
 op-size-matched launch-rate benchmark (tiny kernel, tight loop, one sync) shows the
-clone's per-op *work* is at native parity (**4.38 µs/launch vs native 4.47**), so the
-30% tax is not a slow operation anywhere — it is **op count × a small per-crossing
-cost**, multiplied across ~55.7k ops/step.
+clone's complete per-op path at native parity (**4.38 µs/launch vs native 4.47**).
+That establishes that there is no catastrophic host slow path, but it does not assign
+all guest time to transport.
+
+Two deliberately wrong-result lower-bound probes locate that time more precisely:
+
+| arm | behavior | µs/launch | daemon RPC count |
+|---|---|---:|---:|
+| normal | full guest → daemon → driver path | 3.76 | ~244k |
+| host no-op | daemon acknowledges `LaunchKernel`, no driver submission | 4.37 | ~244k |
+| guest-shim no-op | return before encoding/ring publication | **2.89** | ~42k |
+
+Four normal/host-no-op pairs gave normal **3.16–3.95** and host-no-op
+**3.55–4.37 µs/launch**: host suppression is never materially faster. Returning at the
+start of the guest shim removes the 200k launch RPCs but saves only ~0.87 µs/launch.
+The remaining ~2.89 µs is above that boundary (PyTorch/dispatcher/kernel launch
+preparation and call overhead). Therefore:
+
+- daemon-side recognition cannot deliver the graph result because all crossings have
+  already happened;
+- a transparent guest-shim trace cache has a limited ceiling because the framework
+  still prepares and invokes every CUDA call;
+- explicit graph replay wins because the framework itself issues one `GraphLaunch`
+  instead of K eager launches.
 
 The ~33s/clone fixed-cost gap is **not** module reload (`prewarm_clone_worker` already
 eagerly reloads all 482 modules in 1.4–1.7 s) — root cause not fully pinned, deprioritized
@@ -101,16 +132,20 @@ Saturation curve (batch 8×1024, steps=50):
 | fork | 16 | 2 | 12,399 | 89% | 45.1 GB |
 
 **Fork plateaus at ~13.7k tok/s (66% of native) regardless of N** — N=4 beats N=8 and
-N=16, so oversubscribing further *hurts*. Not CPU-bound (§4). Cause: each clone worker
-owns its own CUDA context; the GPU **time-slices** between them (N clones + the golden).
+N=16, so oversubscribing further *hurts*. It is not explained by the VM CPU limits
+tested in §4. Each clone worker owns its own CUDA context, and multi-context scheduling
+is the leading explanation, but this sweep does not prove causality or exclude another
+shared bottleneck. The six-clone graph stress test also produced K=500 replay rates
+from 1.26 to 2.68 µs/op under concurrency, consistent with scheduling variance.
 
 Shared-context mode exists (`BENCH_FORK_WORKERS=0` — all clones on streams of *one*
 context) but is not a drop-in fix: tested at N=4, result was `0/4 learners, timeout`,
 `shared=0`. By design this mode is for *"resume the golden's exact work"*
 (checkpoint/continue, a single successor) — independent serving needs per-clone address
-translation the shared-context path doesn't do. **Closing this ceiling needs a real
-single-context/multi-stream redesign with per-clone translation — not started, and
-should be an explicit decision, not something attempted incidentally inside this work.**
+translation the shared-context path doesn't do. **Testing or closing this ceiling needs
+a real single-context/multi-stream experiment with per-clone translation — not started,
+and should be an explicit decision, not something attempted incidentally inside graph
+work.**
 
 ## 6. CUDA graph capture — the validated lever
 
@@ -128,133 +163,182 @@ Through the boundary, replayed per-op cost is within **1.4%** of native's own gr
 number. One `GraphLaunch` crossing carries K kernels, so the ~3 µs/op crossing tax
 stops mattering once K is large enough. Capture itself: 40 ms for K=500.
 
-### A2/A3 — is the real workload's op stream capturable? **Mixed — this is the gate.**
+### A2/A3 — can the daemon safely recognize and replay DPO segments? **No.**
 
-Instrumented the daemon (`SMOLVM_CUDA_OPSTREAM_PROBE=1`) to hash every op's bytes into
-two rolling hashes per sync boundary, on the real DPO workload:
+The first probe proved that opcode sequences repeat but conflated pointers and scalars.
+The upgraded probe is per connection and records, per synchronization segment:
 
-- `ops_hash` (op bytes only) → **does the sequence repeat?** — **YES.** 291 iterations
-  recorded, only 138 distinct `ops_hash` values (one repeated 77 times consecutively).
-  The op *sequence* is periodic (A3 confirmed).
-- `full_hash` (whole encoded request, i.e. including arguments) → **do the arguments
-  repeat too?** — **NO.** All 291 iterations had a distinct `full_hash`. CUDA graphs
-  bake in device addresses, so naive capture-and-replay would use stale/wrong values.
+- opcode, full-request, structural-shape, device-pointer, non-pointer, and handle
+  hashes;
+- pointer-like 8-byte words only when they resolve inside a device allocation known to
+  that session;
+- structural metadata for kernel launches and library calls without hashing their
+  changing argument values.
 
-**Open question, not yet answered:** is the `full_hash` divergence caused by device
-*pointers* moving between iterations (fatal — every step would need a fresh capture,
-probably no net win) or by legitimate *scalars* changing (step counters, stream/event
-handles, loss scale — fixable by marshalling those into a small patchable region before
-replay)? The probe as written conflates the two. **This is Phase 0 below and should be
-run before any capture-engine code is written.**
+On the real eight-step DPO workload it recorded **291 segments / 169 structural
+groups**. Repeated groups existed (the largest appeared nine times), but **every
+repeated group had a distinct pointer hash on every occurrence**. Handles were often
+stable; device pointers were not. The old open question is resolved:
 
-### Clone-side capture reliability — currently unreliable, not fundamentally broken
+- periodic opcode/shape sequences: **yes**;
+- stable device-pointer arguments: **no**;
+- safe daemon hash-and-replay: **no-go**.
 
-- A hand-rolled bisection (stream create → side-stream warm → `CUDAGraph()` alloc →
-  pre-resolve kernel → capture → replay) **succeeded once, fully**, in a fresh clone.
-- A capture-length sweep (k=1,4,16,...,500) **failed at k=1** in a separate run with
-  `CUDA error: unknown error` — same operation, different preceding state.
-- ⇒ **order/state-dependent bug, not a capability gap.** Fixable.
-- Diagnosed with a first-failure reporter added to the daemon
-  (`SMOLVM_CUDA_LOG_ERRORS=1`, covers both a non-zero dispatch status *and* a
-  `LibResult` with a non-zero `lib_status` — the latter is missed by naively checking
-  dispatch status alone, and is exactly the kind of failure a fresh cuBLAS/cuDNN handle
-  in a clone would produce). Reproduction with this logging armed was in progress when
-  this doc was written and needs to be re-run (§8).
+Capturing an observed segment and replaying it on the next matching opcode hash would
+use stale addresses. Correcting that below the framework would require understanding
+tensor semantics and patching graph nodes, not merely hashing the wire stream.
 
-## 7. Implementation plan (phased, each with a go/no-go gate)
+### Placement probe — where must graph recognition happen?
 
-### Phase 0 — Pointer-vs-scalar disambiguation (~half day, do this first)
+The no-op measurements in §3 give an independent no-go:
 
-Extend the op-stream probe with a **third hash over pointer-like argument bytes only**
-(8-byte windows resolving inside a known device allocation — the daemon already runs
-this exact scan for `LaunchKernel` arg translation, see `xlat` in
-`crates/smolvm-cuda/src/host.rs`), plus a per-arg-slot variance map.
+- daemon recognition is too late because K requests have already crossed;
+- guest-shim recognition is also below most of the remaining ~2.89 µs/call;
+- only explicit graph replay above the eager API sequence prevents the framework from
+  preparing and issuing K calls.
 
-| outcome | verdict |
-|---|---|
-| pointers stable, only scalars vary | proceed — capture is viable if scalars are marshalled into a small patchable region before each replay |
-| pointers vary every iteration | **stop** — re-capture-per-step is probably not a net win; do not build the engine |
-| both vary with no structure | **stop**, feature is dead as designed |
+This invalidates the original daemon capture-engine design even independently of the
+moving-pointer result.
 
-Do not write Phase 2 before this gate.
+### Clone-side capture reliability — **go**
 
-### Phase 1 — Fix clone graph capture (prerequisite, 1–2 days)
+`graph_fresh_trial.py` performs exactly one capture in each fresh clone, independently
+varying K=1/K=500 and standard/preallocated/double-warm state, then replays and checks a
+device readback.
 
-A fork pool that can't capture in its clones gets none of this benefit. Use the
-`SMOLVM_CUDA_LOG_ERRORS=1` reporter to attribute the `k=1` failure to a specific op +
-driver/lib status, then fix that path. Deliverable: the `graph_len.py` sweep (1→500)
-passes reliably in a clone, matching native's behavior.
+- Corrected gated harness: **12/12** fresh clones passed across two six-clone runs.
+- Stress arm: six clones × 400 replays, **6/6 exact readbacks**.
+- K=500 under concurrency: **1.26–2.68 µs/op**. K=1: 4.69–6.67 µs/op, confirming that
+  graphs must cover a substantial region to amortize replay overhead.
+- One attempted 12-clone run stopped at clone 5 because the VM agent exited during
+  startup, before capture. The immediate six-clone retry passed; track this as a
+  separate high-fan-out clone-start reliability issue.
 
-### Phase 2 — Capture engine (3–5 days, only after Phase 0 says "proceed")
+The harness originally released the golden before all clones were forked, creating a
+snapshot-state race. It now forks every clone while the guest waits, then releases the
+gate. `[op-err] GpaDtoH ... st=500` still appears during successful readback because
+the fast GPA path can fail before the normal D2H fallback succeeds; it is not a graph
+failure.
 
-- **Segment detection**: hash the op stream between syncs; identify the repeating cycle
-  (A3 already proves one exists for this workload).
-- **Capture**: on the *n*-th identical `ops_hash`, wrap the segment in
-  `cuStreamBeginCapture` in the daemon's context, instantiate, cache by hash.
-- **Replay gate**: replay only when `ops_hash` **and** the pointer-arg hash (from Phase
-  0) match the captured instance; any mismatch → fall back to eager for that iteration.
-  Fail-safe by construction — mirrors how weight-sharing verification already gates on
-  content (§2).
-- Reuses existing primitives from the P3b clone-graph work (`#695`): `capture_rec`,
-  `clone_graph_oplogs`, `replay_capture_graph`, `rebuild_clone_graphs`.
+## 7. Revised implementation path (phased, each with a go/no-go gate)
 
-### Phase 3 — Correctness hardening (2–3 days)
+### Phase 0 — daemon autographs: **complete, no-go**
 
-- Segment boundaries must exclude non-capture-safe ops (H2D from host memory,
-  allocations, event queries) — split segments around them, don't try to capture through
-  them.
-- Scalar-argument handling per Phase 0's finding (static-buffer marshalling, or refuse to
-  capture segments whose scalars can't be pinned to a stable location).
-- **Numerical equivalence test**: same workload, graphs on vs off, losses must match —
-  same bar used to validate weight sharing (§2's bit-identical losses).
+Do not implement segment detection/capture/replay in the daemon. Both required
+assumptions failed: recognition is below the cost that needs to be removed, and
+repeated real-workload segments do not retain pointer arguments.
 
-### Phase 4 — Measurement & rollout (1 day)
+### Phase 1 — explicit graph substrate in fork clones: **complete, go**
 
-Re-run the saturation curve (§5's table). Target: move fork's plateau from 13.7k toward
-native's 20.8k (A1 showed the per-op tax nearly vanishes under replay — this is where
-that shows up in a real training loop). Ship **opt-in** first
-(`SMOLVM_CUDA_AUTOGRAPH=1`); default-on only once Phase 3's equivalence test is green —
-same discipline used for weight-sharing's default (§2).
+Current cudart capture/instantiate/launch forwarding works in fresh isolated clone
+contexts and retains exact results in the synthetic graph probe. No clone graph fix is
+currently justified. Preserve the corrected reliability test as a regression.
+
+### Phase 2 — actual DPO graphability prototype (next; no engine code first)
+
+Prototype one real training region using PyTorch's explicit `torch.cuda.CUDAGraph`
+contract, which smolvm already forwards:
+
+1. Force fixed batch/sequence shapes and preallocate static device buffers.
+2. Copy each new batch into those buffers; do not expose changing tensor addresses to
+   captured kernels.
+3. Warm the exact forward/backward/optimizer region on a side stream in each clone.
+4. Capture the largest safe region. If the whole step contains a capture-unsafe host
+   operation, split at that operation rather than shrinking immediately to tiny
+   graphs.
+5. Replay for at least 20 steps with eager versus graph loss/parameter checks and
+   daemon op counts.
+
+Go only if all of these hold:
+
+- exact or tolerance-defined numerical equivalence is green;
+- K is large enough to amortize replay (the K=1 probe is explicitly insufficient);
+- boundary-visible op count collapses by at least an order of magnitude;
+- end-to-end N=1 fork throughput improves materially, not just the microbenchmark.
+
+If capture fails, first attribute the exact unsupported CUDA/runtime operation. Add a
+missing graph API to smolvm only when the real workload proves it is required. Do not
+build a general graph-update engine speculatively.
+
+### Phase 3 — fork saturation measurement
+
+After Phase 2 passes, run eager versus graph at N=1 and N=4 first, then N=8/N=16:
+
+- throughput, step latency, SM utilization, and aggregate VRAM;
+- final losses/parameters;
+- graph capture/replay counts and daemon op counts;
+- per-clone fairness under concurrent contexts.
+
+This separates removal of the eager-call tax from the independent saturation ceiling.
+The target is to move the N=4 fork result toward native's 20.8k tok/s; A1 proves the
+mechanism but does not guarantee that end-to-end result.
+
+### Phase 4 — productization choice
+
+If the DPO prototype wins, choose the narrowest useful integration:
+
+- an explicit graph-enabled workload adapter/static-buffer runner for known training
+  stacks; or
+- a small application-visible capture contract for serving/training loops that can
+  guarantee fixed shapes and stable storage.
+
+Keep it opt-in until eager/graph equivalence and fallback behavior are tested. A
+transparent `SMOLVM_CUDA_AUTOGRAPH=1` daemon feature is no longer proposed.
+
+### Separate decision — single-context/multi-stream architecture
+
+Only after graph-enabled saturation data exist should the larger per-clone address
+translation/shared-context project be approved. Graphs reduce API issue overhead; they
+do not by themselves prove or remove a multi-context scheduling ceiling.
 
 ### Explicit non-goals for this work
 
-- No more per-op micro-optimization — measured at parity twice (§4), there is nothing
-  left to shave there.
-- Not bundling the single-context/multi-stream redesign (§5) into this — that's a
-  separate, larger architectural decision.
-- Not depending on framework cooperation (`torch.compile`, `reduce-overhead`) — §4 shows
-  why that's a dead end for at least the unsloth+TRL stack; capture must happen
-  transparently at the daemon, below any framework.
+- No daemon-side hash-and-replay engine.
+- No more per-op host micro-optimization; host launch suppression already falsified
+  that path as a material lever.
+- No speculative graph-node update API work before the actual DPO capture identifies a
+  concrete need.
+- No bundled single-context redesign.
 
-## 8. Current repo state — uncommitted work, read before it's lost
+## 8. Current repo state
 
-Branch `fork-share-safety` is now **stale**: PR #742 squash-merged as `181248f`, so the
-branch's own commit history is no longer an ancestor of `origin/main` (expected for a
-squash merge — the content is in main, the commits aren't). `origin/main` has also moved
-past that point (`711a12c` GPU/DRI libkrunfw bump, `a31810e` README docs — neither is
-mine).
+Branch: `cuda-graph-capture-investigation`, based on `a31810e`.
 
-**Uncommitted on disk right now** (this is what produced every number in §3/§6 — if it's
-lost, the diagnostic tooling has to be rewritten from scratch):
+The at-risk investigation and validation work is now preserved in four commits:
 
-| file | state | contents |
-|---|---|---|
-| `crates/smolvm-cuda/src/host.rs` | modified | `[op-err]` first-failure diagnostic (`SMOLVM_CUDA_LOG_ERRORS=1`, covers dispatch status *and* `LibResult` lib-status); op-stream periodicity/pointer-stability probe (`SMOLVM_CUDA_OPSTREAM_PROBE=1`) |
-| `bench/bench.sh` | modified | self-verifying `--share on\|off\|default` (checks the daemon's own `M2` log line, ANSI-escape-stripped), `--vcpu`/`--vmem` for the golden, `--batch`/`--maxseq`, `BENCH_FORK_WORKERS` shared-context switch, `--timeout` |
-| `bench/workload_dpo.py` | modified | `GRAPHS=1` attempts `torch_compile(reduce-overhead)` — does not currently engage, see §4's unsloth finding |
-| `bench/mm_bench.py`, `op_bench.py`, `lat_bench.py`, `launch_rate.py`, `cpu_bench.py`, `graph_rate.py`, `graph_probe.py`, `graph_len.py` | untracked | the microbenchmarks behind every number in §3, §4, §6 |
+| commit | contents |
+|---|---|
+| `39b8a35` | host first-failure and original opstream diagnostics |
+| `c6ed98b` | reproducible benchmark/probe tooling |
+| `9bc21e1` | the original investigation plan |
+| `cdf7337` | placement no-ops, upgraded pointer probe, and corrected fresh-clone graph matrix |
 
-**Recommendation:** before continuing this work, cut a fresh branch off current
-`origin/main` and commit the above (host.rs diagnostics as one focused commit, the bench
-scripts as another) — same pattern used for `fork-pool-ops` → `fork-share-safety`
-earlier in this investigation. Not done automatically here since it wasn't asked for.
+The latest validation files are:
+
+| file | contents |
+|---|---|
+| `crates/smolvm-cuda/src/host.rs` | per-session structural/pointer/non-pointer/handle opstream hashes; diagnostic host launch no-op |
+| `crates/smolvm-cuda/src/client.rs` | diagnostic guest-shim launch no-op |
+| `bench/analyze_opstream.py` | groups repeated structures and classifies pointer stability |
+| `bench/run_boundary_floor.sh` | normal/host-no-op/guest-no-op placement benchmark |
+| `bench/graph_fresh_trial.py` | one capture per fresh clone with exact readback and replay timing |
+| `bench/run_graph_fresh_trials.sh` | corrected fork-before-release clone matrix |
+
+The untracked `demo/*` files belong to separate user work and were not modified.
+Safety snapshots:
+
+- `/home/binsquare/smolvm-graph-snapshots/demo-untracked-20260725.tgz`
+- `/home/binsquare/smolvm-graph-snapshots/validation-pre-h100-20260725.tgz`
 
 ## 9. Where the supporting data lives
 
 - **On the H100 box** (`ubuntu@192.222.53.56`): `~/bench/` (harness + scripts),
   `~/bench_run/*/daemon.log` (per-run logs — `M2` sharing verdict, `[op-err]`,
   `[opstream]`, `[serve-prof]` lines), `~/bench/results/*.json` (raw run data with full
-  environment manifests).
+  environment manifests), `~/boundary_floor_guest_1/` (placement result),
+  `~/coord_os/daemon.log` (upgraded real-DPO opstream), and
+  `~/coord_graph_perf_2/` / `~/coord_graph_reliability_corrected_2/` (corrected clone
+  graph results).
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table).
 - **Session memory** (cross-conversation continuity, not in this repo):
