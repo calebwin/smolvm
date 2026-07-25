@@ -938,6 +938,15 @@ impl<S: Read + Write> Client<S> {
         stream: u64,
         params: &[Vec<u8>],
     ) -> Result<()> {
+        // Diagnostic-only lower bound for a transparent guest-shim trace
+        // cache: return before encoding or crossing the boundary, while the
+        // framework still invokes every CUDA API call. Results are
+        // intentionally wrong; production behavior is unchanged unless the
+        // explicit probe variable is present.
+        static NOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NOOP.get_or_init(|| std::env::var_os("SMOLVM_CUDA_CLIENT_NOOP_LAUNCHES").is_some()) {
+            return Ok(());
+        }
         // Deferred: kernel launches are asynchronous by CUDA contract; launch
         // failures surface at the next synchronize (or as a sticky error),
         // exactly like a real asynchronous launch error.

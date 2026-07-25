@@ -440,6 +440,10 @@ struct Session {
     /// alternative to node-by-node graph rebuild, which can't reconstruct
     /// library-API (cuBLAS) kernels or non-kernel nodes.
     capture_rec: Option<(u64, Vec<Vec<u8>>)>,
+    /// Diagnostic-only, per-connection operation-stream classifier. Keeping it
+    /// in the session prevents runtime/driver traffic from unrelated guests
+    /// from being folded into one process-global hash stream.
+    opstream: Option<OpstreamAcc>,
     /// Worker-side (clone) inherited capture-replay logs, keyed by the golden's
     /// exec vhandle: the ordered op payloads to re-capture on first launch.
     /// Drained from the layout at clone resume.
@@ -2551,34 +2555,196 @@ fn opstream_probe_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("SMOLVM_CUDA_OPSTREAM_PROBE").is_some())
 }
 
-/// Accumulate per-iteration hashes of the op stream and report them at each
-/// sync boundary (a sync is where a training step ends in practice).
-fn opstream_record(req: &Request) {
-    struct Acc {
-        ops: u64,
-        full: u64,
-        n: u64,
-        iter: u64,
+const OPSTREAM_FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+struct OpstreamAcc {
+    ops: u64,
+    full: u64,
+    shape: u64,
+    pointers: u64,
+    nonpointers: u64,
+    handles: u64,
+    pointer_words: u64,
+    n: u64,
+    iter: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+impl OpstreamAcc {
+    fn new(ranges: Vec<(u64, u64)>) -> Self {
+        Self {
+            ops: OPSTREAM_FNV_BASIS,
+            full: OPSTREAM_FNV_BASIS,
+            shape: OPSTREAM_FNV_BASIS,
+            pointers: OPSTREAM_FNV_BASIS,
+            nonpointers: OPSTREAM_FNV_BASIS,
+            handles: OPSTREAM_FNV_BASIS,
+            pointer_words: 0,
+            n: 0,
+            iter: 0,
+            ranges,
+        }
     }
-    static ACC: std::sync::Mutex<Option<Acc>> = std::sync::Mutex::new(None);
-    let mut g = ACC.lock().unwrap();
-    let a = g.get_or_insert(Acc {
-        ops: 0xcbf2_9ce4_8422_2325,
-        full: 0xcbf2_9ce4_8422_2325,
-        n: 0,
-        iter: 0,
-    });
-    let bytes = encode_request(req);
-    // FNV-1a folded incrementally: op byte only, then the whole request.
-    let mix = |h: &mut u64, b: u8| {
+
+    fn reset_segment(&mut self) {
+        self.ops = OPSTREAM_FNV_BASIS;
+        self.full = OPSTREAM_FNV_BASIS;
+        self.shape = OPSTREAM_FNV_BASIS;
+        self.pointers = OPSTREAM_FNV_BASIS;
+        self.nonpointers = OPSTREAM_FNV_BASIS;
+        self.handles = OPSTREAM_FNV_BASIS;
+        self.pointer_words = 0;
+        self.n = 0;
+    }
+}
+
+fn opstream_mix(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
         *h ^= b as u64;
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    if let Some(op) = bytes.first() {
-        mix(&mut a.ops, *op);
     }
-    for b in &bytes {
-        mix(&mut a.full, *b);
+}
+
+fn opstream_mix_u64(h: &mut u64, value: u64) {
+    opstream_mix(h, &value.to_le_bytes());
+}
+
+fn opstream_pointer_ranges(sess: &Session) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    ranges.extend(
+        sess.alloc_table
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&base, &(size, _))| (base, size)),
+    );
+    ranges.extend(sess.owned_dptrs.iter().map(|(&base, &size)| (base, size)));
+    ranges.extend(
+        sess.vmm_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&base, &size)| (base, size)),
+    );
+    // Requests have already passed through translate_dptrs when classified,
+    // so clone-private destination ranges are the values that can appear.
+    ranges.extend(
+        sess.dptr_trans
+            .iter()
+            .map(|&(_, size, private)| (private, size)),
+    );
+    ranges.extend(sess.shared_ranges.iter().copied());
+    ranges.sort_unstable_by_key(|&(base, _)| base);
+    ranges.dedup();
+    ranges
+}
+
+fn opstream_is_pointer(ranges: &[(u64, u64)], value: u64) -> bool {
+    if value == 0 {
+        return false;
+    }
+    let i = ranges.partition_point(|&(base, _)| base <= value);
+    i > 0 && {
+        let (base, size) = ranges[i - 1];
+        value < base.saturating_add(size)
+    }
+}
+
+/// Accumulate per-segment hashes of the op stream and report them at each sync
+/// boundary. Besides the original opcode/full hashes, classify structural
+/// shape, device-pointer values, explicit handles, and all remaining bytes.
+/// The packed LibCall ABI is mixed-width, so pointer discovery scans every byte
+/// offset for a value inside a known device allocation rather than assuming
+/// eight-byte alignment.
+fn opstream_record(
+    slot: &mut Option<OpstreamAcc>,
+    initial_ranges: Option<Vec<(u64, u64)>>,
+    req: &Request,
+) {
+    let a = slot.get_or_insert_with(|| OpstreamAcc::new(Vec::new()));
+    if let Some(ranges) = initial_ranges {
+        if !ranges.is_empty() {
+            a.ranges = ranges;
+        }
+    }
+    let bytes = encode_request(req);
+    if let Some(op) = bytes.first() {
+        opstream_mix(&mut a.ops, &[*op]);
+        opstream_mix(&mut a.shape, &[*op]);
+    }
+    opstream_mix(&mut a.full, &bytes);
+    opstream_mix_u64(&mut a.shape, bytes.len() as u64);
+
+    match req {
+        Request::LaunchKernel {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            stream,
+            params,
+        } => {
+            opstream_mix_u64(&mut a.shape, *function);
+            for value in grid.iter().chain(block.iter()) {
+                opstream_mix(&mut a.shape, &value.to_le_bytes());
+            }
+            opstream_mix(&mut a.shape, &shared_bytes.to_le_bytes());
+            opstream_mix_u64(&mut a.shape, params.len() as u64);
+            for param in params {
+                opstream_mix_u64(&mut a.shape, param.len() as u64);
+            }
+            opstream_mix_u64(&mut a.handles, *function);
+            opstream_mix_u64(&mut a.handles, *stream);
+        }
+        Request::LibCall { lib, func, args } => {
+            opstream_mix(&mut a.shape, &[*lib]);
+            opstream_mix(&mut a.shape, &func.to_le_bytes());
+            opstream_mix_u64(&mut a.shape, args.len() as u64);
+        }
+        Request::EventRecord { event, stream } | Request::StreamWaitEvent { stream, event, .. } => {
+            opstream_mix_u64(&mut a.handles, *stream);
+            opstream_mix_u64(&mut a.handles, *event);
+        }
+        Request::StreamSynchronize { stream }
+        | Request::StreamQuery { stream }
+        | Request::StreamDestroy { stream } => {
+            opstream_mix_u64(&mut a.handles, *stream);
+        }
+        _ => {}
+    }
+
+    let classify_pointer_bytes = matches!(
+        req,
+        Request::LaunchKernel { .. }
+            | Request::LibCall { .. }
+            | Request::MemcpyDtoDAsync { .. }
+            | Request::MemsetD8Async { .. }
+            | Request::EventRecord { .. }
+            | Request::StreamWaitEvent { .. }
+    );
+    if classify_pointer_bytes {
+        let mut pointer_bytes = vec![false; bytes.len()];
+        let mut offset = 1usize;
+        while offset + 8 <= bytes.len() {
+            let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            if opstream_is_pointer(&a.ranges, value) {
+                opstream_mix_u64(&mut a.pointers, a.n);
+                opstream_mix_u64(&mut a.pointers, offset as u64);
+                opstream_mix_u64(&mut a.pointers, value);
+                pointer_bytes[offset..offset + 8].fill(true);
+                a.pointer_words += 1;
+                offset += 8;
+            } else {
+                offset += 1;
+            }
+        }
+        for (index, &byte) in bytes.iter().enumerate() {
+            if !pointer_bytes[index] {
+                opstream_mix(&mut a.nonpointers, &[byte]);
+            }
+        }
+    } else {
+        opstream_mix(&mut a.nonpointers, &bytes);
     }
     a.n += 1;
     // A sync ends an iteration for this purpose: torch synchronises once per
@@ -2590,12 +2756,21 @@ fn opstream_record(req: &Request) {
     if is_sync && a.n > 64 {
         a.iter += 1;
         eprintln!(
-            "[opstream] iter={} ops={} ops_hash={:016x} full_hash={:016x}",
-            a.iter, a.n, a.ops, a.full
+            "[opstream] iter={} ops={} ops_hash={:016x} full_hash={:016x} \
+             shape_hash={:016x} ptr_hash={:016x} nonptr_hash={:016x} \
+             handle_hash={:016x} ptr_words={} ranges={}",
+            a.iter,
+            a.n,
+            a.ops,
+            a.full,
+            a.shape,
+            a.pointers,
+            a.nonpointers,
+            a.handles,
+            a.pointer_words,
+            a.ranges.len()
         );
-        a.ops = 0xcbf2_9ce4_8422_2325;
-        a.full = 0xcbf2_9ce4_8422_2325;
-        a.n = 0;
+        a.reset_segment();
     }
 }
 
@@ -2984,9 +3159,25 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     //   ops  — op bytes only  => does the SEQUENCE repeat? (periodicity)
     //   full — whole encoded request => do the ARGUMENTS repeat too? (pointer
     //          stability; graphs bake device addresses, so this must hold)
-    if opstream_probe_enabled() {
-        opstream_record(&req);
+    let opstream_on = opstream_probe_enabled();
+    if opstream_on {
+        let initial_ranges = (sess.opstream.is_none()
+            || sess
+                .opstream
+                .as_ref()
+                .is_some_and(|probe| probe.ranges.is_empty()))
+        .then(|| opstream_pointer_ranges(sess));
+        opstream_record(&mut sess.opstream, initial_ranges, &req);
     }
+    let refresh_opstream_ranges = opstream_on
+        && matches!(
+            &req,
+            Request::PrimaryCtxRetain { .. }
+                | Request::MemAlloc { .. }
+                | Request::MemFree { .. }
+                | Request::MemMap { .. }
+                | Request::MemUnmap { .. }
+        );
     // Name the op up front (only when first-failure logging is armed) — the
     // match below consumes `req`.
     let err_name = if log_errors_enabled() {
@@ -3409,6 +3600,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             stream,
             params,
         } => {
+            if noop_launches_enabled() {
+                return Ok(Response::Ok);
+            }
             let raw_fn = raw_fn_h(sess, b, function);
             let raw_str = raw_stream(sess, stream)?;
             b.launch_kernel(raw_fn, grid, block, shared_bytes, raw_str, &params)
@@ -4126,6 +4320,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         optrace_write(&line, status);
     }
+    if refresh_opstream_ranges {
+        let ranges = opstream_pointer_ranges(sess);
+        if let Some(probe) = sess.opstream.as_mut() {
+            probe.ranges = ranges;
+        }
+    }
     // First-failure report (`SMOLVM_CUDA_LOG_ERRORS=1`). A guest only ever sees
     // the aggregate — torch surfaces "CUDA error: unknown error" at whatever API
     // call notices the sticky error next — so without this the failing op is
@@ -4165,6 +4365,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
 fn log_errors_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SMOLVM_CUDA_LOG_ERRORS").is_some())
+}
+
+/// Diagnostic-only transport floor: acknowledge kernel launches without
+/// submitting them to the driver. This deliberately produces wrong results
+/// and exists only to measure the cost that remains when a hypothetical
+/// daemon-side replay suppresses every eager driver launch but the guest still
+/// sends every original request.
+fn noop_launches_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCHES").is_some())
 }
 
 // ===========================================================================
