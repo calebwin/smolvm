@@ -538,12 +538,27 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // device count crosses its table size (measured: 4 user mounts + the
         // ring device fails; either alone boots). Skip the ring mount rather
         // than brick the boot — such machines simply stay on socket transport.
-        if mounts_vec.len() > 3 {
+        //
+        // That fallback is EXPENSIVE, so say so on the console rather than only
+        // in a log nobody reads: measured on an H100, a fork clone runs 4693
+        // tok/s on the file ring versus 2500 on the socket — 1.9x. A machine
+        // with four mounts silently loses nearly half its clone throughput and
+        // gives the user no reason why. `SMOLVM_CUDA_FILE_RING=force` mounts the
+        // ring anyway (for a libkrun whose device table is large enough); the
+        // boot fails loudly if it is not.
+        let ring_pref = std::env::var("SMOLVM_CUDA_FILE_RING").unwrap_or_default();
+        if mounts_vec.len() > 3 && ring_pref != "force" {
             tracing::warn!(
                 mounts = mounts_vec.len(),
                 "skipping CUDA ring mount: virtio device budget exhausted (clone rings unavailable; socket transport)"
             );
-        } else if std::env::var("SMOLVM_CUDA_FILE_RING").as_deref() != Ok("0") {
+            eprintln!(
+                "[smolvm] WARNING: {} mounts leaves no virtio slot for the CUDA ring mount, so \
+                 fork clones fall back to socket transport (~1.9x slower per clone). Use fewer \
+                 mounts, or SMOLVM_CUDA_FILE_RING=force if your libkrun has the device slots.",
+                mounts_vec.len()
+            );
+        } else if ring_pref != "0" {
             if let Some(dir) = cs.parent().map(|d| d.join("cuda-ring")) {
                 if std::fs::create_dir_all(&dir).is_ok() {
                     // SAFETY-free env set: single-threaded launch path, before
