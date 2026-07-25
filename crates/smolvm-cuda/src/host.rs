@@ -2420,7 +2420,13 @@ fn optrace_summary(req: &Request) -> Option<String> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| std::env::var_os("SMOLVM_CUDA_OPTRACE").map(Into::into))
         .as_ref()?;
-    Some(match req {
+    Some(op_summary(req))
+}
+
+/// One-line human name for a request, shared by the op trace and the
+/// first-failure report. Total: unknown ops fall back to their wire opcode.
+fn op_summary(req: &Request) -> String {
+    (match req {
         Request::MemAlloc { bytes } => format!("MemAlloc bytes={bytes:#x}"),
         Request::MemFree { dptr } => format!("MemFree dptr={dptr:#x}"),
         Request::MemcpyHtoD { dptr, data, .. } => {
@@ -2509,6 +2515,7 @@ fn optrace_summary(req: &Request) -> Option<String> {
             encode_request(other).first().copied().unwrap_or(0)
         ),
     })
+    .to_string()
 }
 
 fn op_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
@@ -2535,6 +2542,60 @@ pub fn op_ring_dump() {
         for (i, l) in r.iter().enumerate() {
             eprintln!("  [{i:02}] {l}");
         }
+    }
+}
+
+/// Opt-in op-stream periodicity/pointer-stability probe; see `opstream_record`.
+fn opstream_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SMOLVM_CUDA_OPSTREAM_PROBE").is_some())
+}
+
+/// Accumulate per-iteration hashes of the op stream and report them at each
+/// sync boundary (a sync is where a training step ends in practice).
+fn opstream_record(req: &Request) {
+    struct Acc {
+        ops: u64,
+        full: u64,
+        n: u64,
+        iter: u64,
+    }
+    static ACC: std::sync::Mutex<Option<Acc>> = std::sync::Mutex::new(None);
+    let mut g = ACC.lock().unwrap();
+    let a = g.get_or_insert(Acc {
+        ops: 0xcbf2_9ce4_8422_2325,
+        full: 0xcbf2_9ce4_8422_2325,
+        n: 0,
+        iter: 0,
+    });
+    let bytes = encode_request(req);
+    // FNV-1a folded incrementally: op byte only, then the whole request.
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    if let Some(op) = bytes.first() {
+        mix(&mut a.ops, *op);
+    }
+    for b in &bytes {
+        mix(&mut a.full, *b);
+    }
+    a.n += 1;
+    // A sync ends an iteration for this purpose: torch synchronises once per
+    // step (loss .item(), optimizer, or an explicit synchronize).
+    let is_sync = matches!(
+        req,
+        Request::CtxSynchronize | Request::StreamSynchronize { .. }
+    );
+    if is_sync && a.n > 64 {
+        a.iter += 1;
+        eprintln!(
+            "[opstream] iter={} ops={} ops_hash={:016x} full_hash={:016x}",
+            a.iter, a.n, a.ops, a.full
+        );
+        a.ops = 0xcbf2_9ce4_8422_2325;
+        a.full = 0xcbf2_9ce4_8422_2325;
+        a.n = 0;
     }
 }
 
@@ -2914,6 +2975,25 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     cow_written(sess, b, &req);
     let req = translate_dptrs(&sess.dptr_trans, req);
     let trace = optrace_summary(&req);
+    // Op-stream probe (`SMOLVM_CUDA_OPSTREAM_PROBE=1`): is the guest's op stream
+    // periodic, and are its pointer arguments stable across iterations? Those are
+    // the two preconditions for capturing the stream into a CUDA graph at the
+    // remoting boundary (a replay carries K kernels per crossing, which measured
+    // 1.24 us/op remoted vs 1.22 native — i.e. it erases the per-op tax).
+    // Emits TWO rolling hashes per sync boundary so the failure modes separate:
+    //   ops  — op bytes only  => does the SEQUENCE repeat? (periodicity)
+    //   full — whole encoded request => do the ARGUMENTS repeat too? (pointer
+    //          stability; graphs bake device addresses, so this must hold)
+    if opstream_probe_enabled() {
+        opstream_record(&req);
+    }
+    // Name the op up front (only when first-failure logging is armed) — the
+    // match below consumes `req`.
+    let err_name = if log_errors_enabled() {
+        Some(op_summary(&req))
+    } else {
+        None
+    };
     if let Some(_l) = &trace {
         optrace_write(&format!("BEGIN {_l}"), -999);
     }
@@ -4046,7 +4126,45 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         optrace_write(&line, status);
     }
+    // First-failure report (`SMOLVM_CUDA_LOG_ERRORS=1`). A guest only ever sees
+    // the aggregate — torch surfaces "CUDA error: unknown error" at whatever API
+    // call notices the sticky error next — so without this the failing op is
+    // guesswork. Names the op and driver status the moment it goes wrong, which
+    // is how a clone-side failure (e.g. graph capture) gets attributed to an op
+    // instead of inferred from a Python traceback. Rate-limited so a workload
+    // that legitimately probes for errors cannot flood the log.
+    // A forwarded library call reports failure INSIDE its response (a non-zero
+    // cuBLAS/cuDNN status with dispatch status 0), so checking `status` alone
+    // misses exactly the ops most likely to fail in a fresh clone context.
+    let lib_status = match &resp {
+        Response::LibResult(lst, _) if *lst != 0 => Some(*lst),
+        _ => None,
+    };
+    if status != 0 || lib_status.is_some() {
+        if let Some(name) = err_name {
+            static REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 32 {
+                match lib_status {
+                    Some(lst) => eprintln!(
+                        "[op-err] {name} failed st={status} lib_st={lst} (pid={})",
+                        std::process::id()
+                    ),
+                    None => eprintln!(
+                        "[op-err] {name} failed st={status} (pid={})",
+                        std::process::id()
+                    ),
+                }
+            }
+        }
+    }
     (status, resp)
+}
+
+/// Opt-in first-failure logging; see the `[op-err]` report in `dispatch`.
+fn log_errors_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SMOLVM_CUDA_LOG_ERRORS").is_some())
 }
 
 // ===========================================================================
