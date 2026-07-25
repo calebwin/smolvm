@@ -1,9 +1,10 @@
 # CUDA fork-pool throughput investigation & graph-capture plan
 
-Status: the original investigation gates are resolved. Transparent daemon-side
+Status: the original graph-placement gates are resolved. Transparent daemon-side
 auto-capture is a **no-go**; explicit CUDA graphs initiated above the per-op API
-boundary are a **go**. The next prototype is workload-level capture with fixed-shape
-inputs and static device buffers. No production performance feature is implemented.
+boundary are a **go**. Before changing a workload, the remaining transparent layers
+are being exhausted and bounded (§7). No production performance feature is
+implemented.
 
 ## 1. TL;DR
 
@@ -24,11 +25,19 @@ inputs and static device buffers. No production performance feature is implement
   before it can recognize a segment, so it cannot remove the dominant guest-side
   work. In addition, the upgraded real-DPO probe found moving device pointers in
   every repeated structural group. Hash-and-replay would therefore be unsafe (§6).
-- The next path is an explicit graph at the workload/framework boundary: fixed-shape
-  batches copied into static device buffers, warm up once per clone, capture a large
-  training region, and replay it. The target application must stop issuing the K
-  eager calls; moving recognition from the daemon to the guest shim is insufficient
-  (§7).
+- **Generic transparent transport optimizations have now been tested and rejected:**
+  socket batching is ~2x slower than the ring, compound ring records do not improve
+  launch rate, 4 KiB records remove 1,126 blocking launches but regress DPO throughput,
+  and an exact TMA-descriptor cache hits ~89% without an end-to-end win (§7).
+- The remaining pre-workload investigation is deliberately narrow: make the previous
+  silent `torch.compile` fallback fail loudly, determine whether runtime-only graph
+  activation can work without source changes, bound safe synchronization elision, and
+  calculate the maximum possible benefit of the residual blocking classes (§7).
+- If those transparent gates fail, the next path is an explicit graph at the
+  workload/framework boundary: fixed-shape batches copied into static device buffers,
+  warm up once per clone, capture a large training region, and replay it. The target
+  application must stop issuing the K eager calls; daemon recognition cannot do that
+  (§8).
 - Separately, fork's *saturated* ceiling (~13.7k tok/s regardless of N) remains an
   architectural question. Per-clone contexts and scheduling are the leading
   explanation, but the current data do not prove that they are the only cause. A
@@ -116,7 +125,7 @@ entirely and the fixed cost only matters for very short runs.
 | Guest virtualization overhead (single-thread CPU) | Int-loop / method-call / alloc microbenchmark, host vs guest | Parity: 1.02–1.12x. |
 | Per-op *latency* (round-trip cost) | `sync_empty`, `sync_after_kernel`, `event_query`, 4-byte D2H | Parity: +3 µs, not the 50–100 µs a slow path would need. |
 | A pathological cuBLASLt path ("157x slower") | Re-measured with an op-size-matched benchmark instead of a 200-iteration 4096³-matmul loop | **My own benchmark artifact** — the first run timed the clone's *first* post-fork ops (real one-time cost) and divided by 200, mistaking a fixed cost for a per-op rate. |
-| `torch.compile` in the unsloth+TRL workload | Instrumented `torch._dynamo` state before/after `import unsloth` | Not a smolvm issue: unsloth's patching sets `dynamo.suppress_errors = True`, which makes `torch.compile` **silently fall back to eager** — `first_call_s` went from 6.29s (real compile) to 0.0s (no-op) purely from the import. Flags are accepted; nothing traces. This is why boundary-level capture (§6) is the only approach that works for *any* workload — it never asks the framework's permission. |
+| Default `torch.compile` attempt in the unsloth+TRL workload | Instrumented `torch._dynamo` state before/after `import unsloth` | The measured arm was **not a valid compile result**: unsloth's patching sets `dynamo.suppress_errors = True`, so it silently fell back to eager (`first_call_s` 6.29s before import, 0.0s after). Do not cite this as proof that compile cannot work. The next diagnostic disables suppression and captures the first real failure (§7). |
 
 ## 5. The structural ceiling (separate from §3/§4 — not addressed by graphs)
 
@@ -220,7 +229,79 @@ gate. `[op-err] GpaDtoH ... st=500` still appears during successful readback bec
 the fast GPA path can fail before the normal D2H fallback succeeds; it is not a graph
 failure.
 
-## 7. Revised implementation path (phased, each with a go/no-go gate)
+## 7. Transparent smolvm investigation before workload changes
+
+This section separates three materially different product experiences:
+
+1. **Pure smolvm transparency:** changes stay below the application's CUDA/framework
+   calls. The user runs the same program with the same arguments.
+2. **Runtime/framework activation:** smolvm supplies environment or runtime
+   interception, but the workload source is unchanged. This may still affect framework
+   behavior and must be disclosed and safely fall back.
+3. **Workload integration:** the user or an adapter changes configuration/code to use
+   static buffers and an explicit captured region.
+
+Only (1) qualifies as "without injection." The experiments below test that layer
+before proceeding to (2) or (3).
+
+### Completed transparent transport/cache prototypes — all no-go
+
+All prototypes preserved CUDA results and were measured on the same H100. Prototype
+code that failed its gate is reverted rather than left in the production path.
+
+| prototype | measured result | decision |
+|---|---|---|
+| Disable the shared-memory ring and use the deferred socket batching path | Ring: 4.10 / 3.92 / 3.56 µs per launch. Socket: 8.49 / 7.74 / 8.42. | **No-go.** Blocking socket round trips are roughly 2x slower; the ring is the correct generic transport. |
+| Put 2/4/8/16 quiet requests in one compound ring record | Baseline 3.87 µs; B2 4.25; B4 3.87; B8 5.21; B16 4.04. Paired B4 comparisons also straddled baseline noise. | **No-go.** Fewer publications do not remove framework call preparation and add buffering cost. |
+| Increase ring records from 1 KiB to 4 KiB so all kernel-launch payloads can be quiet | Blocking ops fell 8,049→6,921 and all 1,126 formerly blocking launches became quiet. Twenty-step DPO runs were 2,417 and 2,355 tok/s versus historical 1 KiB median ~2,546. | **No-go.** It removes the intended barriers but regresses end-to-end throughput ~5–7%, consistent with worse queue locality. |
+| Exact guest-side cache for 152-byte `cuTensorMapEncodeTiled` inputs and 128-byte descriptors, invalidated on clone reconnect | Clone hit ratio reached 2,280/2,560 (~89%). Twenty-step DPO runs were 2,574 / 2,475 / 2,459 tok/s, median 2,475 versus baseline median ~2,546; losses remained exact. | **No-go for performance.** High repetition does not imply material wall-clock cost. The reconnect-generation mechanism was required because a Firecracker clone preserves the guest PID. |
+
+### Unchanged DPO operation census
+
+A two-step, N=1 fork run produced 116,409 boundary operations:
+
+- 108,360 quiet and 8,049 blocking with the production 1 KiB ring;
+- 26,228 quiet plus 1,126 blocking `LaunchKernel` calls;
+- 2,688 blocking `LibCall(6:0)` calls (`cuTensorMapEncodeTiled`);
+- 2,332 blocking D2H copies;
+- 784 context synchronizations, 295 stream synchronizations, and smaller event/VMM
+  classes.
+
+All 1,126 blocking launches were only 1.1–3.5 KiB; the 4 KiB experiment therefore
+isolated record capacity cleanly. Its throughput regression and the TMA cache result
+show why call counts alone are not enough: every remaining proposal needs a measured
+end-to-end gate.
+
+### Remaining pure-smolvm questions
+
+These are not yet validated improvements:
+
+1. **Safe barrier elision/coalescing.** Classify which D2H, synchronization, and event
+   calls actually expose results to the CPU or order later work. Elide only barriers
+   whose data dependencies prove them redundant; call-type-only suppression is
+   incorrect.
+2. **Upper bound by residual class.** Measure time, not just count, for each blocking
+   class. Stop if eliminating an entire class cannot materially move step time.
+3. **Earlier transparent sequence handling.** Determine whether any stable sequence
+   can be recognized before PyTorch performs its per-op preparation. The current
+   evidence already rules out the daemon and puts a tight ceiling on a CUDA-shim-only
+   trace cache; the investigation should close this with a quantified bound rather
+   than assume it.
+
+### Unchanged-source runtime activation (category 2, diagnostic only)
+
+The previous Unsloth compile arm silently fell back to eager because
+`torch._dynamo.config.suppress_errors` was enabled. Run the unchanged benchmark source
+with suppression disabled and capture the first graph break/unsupported operation.
+Then determine whether configuration supplied outside the workload can activate a real
+compile/graph path. This does **not** establish pure smolvm transparency; it determines
+whether source edits can be avoided.
+
+Go only if logs and boundary counts prove that tracing/capture occurred, numerical
+results match eager, and end-to-end throughput improves. An accepted flag followed by
+eager execution is a failed result.
+
+## 8. Revised implementation path (phased, each with a go/no-go gate)
 
 ### Phase 0 — daemon autographs: **complete, no-go**
 
@@ -300,11 +381,12 @@ do not by themselves prove or remove a multi-context scheduling ceiling.
   concrete need.
 - No bundled single-context redesign.
 
-## 8. Current repo state
+## 9. Current repo state
 
 Branch: `cuda-graph-capture-investigation`, based on `a31810e`.
 
-The at-risk investigation and validation work is now preserved in four commits:
+The investigation and validation work is preserved in the following commits and at
+the current branch tip:
 
 | commit | contents |
 |---|---|
@@ -312,6 +394,7 @@ The at-risk investigation and validation work is now preserved in four commits:
 | `c6ed98b` | reproducible benchmark/probe tooling |
 | `9bc21e1` | the original investigation plan |
 | `cdf7337` | placement no-ops, upgraded pointer probe, and corrected fresh-clone graph matrix |
+| current branch tip | transparent transport/cache no-go results and operation-census tooling |
 
 The latest validation files are:
 
@@ -323,6 +406,8 @@ The latest validation files are:
 | `bench/run_boundary_floor.sh` | normal/host-no-op/guest-no-op placement benchmark |
 | `bench/graph_fresh_trial.py` | one capture per fresh clone with exact readback and replay timing |
 | `bench/run_graph_fresh_trials.sh` | corrected fork-before-release clone matrix |
+| `bench/analyze_oplog.py` | counts quiet/blocking operations by process and operation class |
+| `bench/run_transport_matrix.sh` | paired shared-memory-ring versus socket transport launch-rate harness |
 
 The untracked `demo/*` files belong to separate user work and were not modified.
 Safety snapshots:
@@ -330,7 +415,7 @@ Safety snapshots:
 - `/home/binsquare/smolvm-graph-snapshots/demo-untracked-20260725.tgz`
 - `/home/binsquare/smolvm-graph-snapshots/validation-pre-h100-20260725.tgz`
 
-## 9. Where the supporting data lives
+## 10. Where the supporting data lives
 
 - **On the H100 box** (`ubuntu@192.222.53.56`): `~/bench/` (harness + scripts),
   `~/bench_run/*/daemon.log` (per-run logs — `M2` sharing verdict, `[op-err]`,
@@ -338,7 +423,9 @@ Safety snapshots:
   environment manifests), `~/boundary_floor_guest_1/` (placement result),
   `~/coord_os/daemon.log` (upgraded real-DPO opstream), and
   `~/coord_graph_perf_2/` / `~/coord_graph_reliability_corrected_2/` (corrected clone
-  graph results).
+  graph results). The unchanged-DPO operation censuses are in
+  `~/bench_run/fork_n1_s2_c4_20260725-200836_r1/` (production 1 KiB ring) and
+  `~/bench_run/fork_n1_s2_c4_20260725-202926_r1/` (temporary 4 KiB ring).
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table).
 - **Session memory** (cross-conversation continuity, not in this repo):
