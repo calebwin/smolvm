@@ -68,6 +68,14 @@ def run_dpo(lid, steps):
         output_dir=os.environ.get("OUTBASE", "/root") + f"/dpo{lid}", report_to=[], beta=BETA,
         max_length=MAXSEQ, max_prompt_length=MAXSEQ // 2,
         remove_unused_columns=False, warmup_steps=1,
+        # GRAPHS=1: torch.compile in reduce-overhead mode captures the step as
+        # CUDA graphs, collapsing a step's ~55k individual CUDA ops into a
+        # replay. That matters far more under CUDA remoting than natively: the
+        # remoting tax measured as op-count x ~3us of per-op boundary cost, so
+        # cutting op COUNT is the only large lever left (per-op work is already
+        # at native parity: 4.38 vs 4.47 us per launch).
+        **({"torch_compile": True, "torch_compile_mode": "reduce-overhead"}
+           if os.environ.get("GRAPHS") == "1" else {}),
     )
     FastLanguageModel.for_training(model)
     # ref_model=None: with a PEFT/LoRA policy, DPO uses the adapter-disabled

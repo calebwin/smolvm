@@ -23,7 +23,7 @@
 #        [--cold] [--share on|off|default] [--batch 2] [--maxseq 256]
 set -u
 
-ARM=""; N=4; STEPS=20; REPS=1; CPUS=4; COLD=0; BATCH=2; MAXSEQ=256; TIMEOUT=600; SHARE=default
+ARM=""; N=4; STEPS=20; REPS=1; CPUS=4; COLD=0; BATCH=2; MAXSEQ=256; TIMEOUT=600; SHARE=default; VCPU=""; VMEM=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arm) ARM="$2"; shift 2 ;;
@@ -38,6 +38,13 @@ while [[ $# -gt 0 ]]; do
         # on|off|default — sets SMOLVM_CUDA_FORK_SHARE_WEIGHTS for the run and
         # VERIFIES the daemon actually honoured it (see check_share_mode).
         --share) SHARE="$2"; shift 2 ;;
+        # vCPU/RAM given to the golden (clones inherit). Separate from
+        # --cpus, which pins the NATIVE arm. Thin clones matter at high N:
+        # N x vcpu must stay near the host core count or the clones starve
+        # each other feeding the GPU (N=16 x 4 vCPU on 26 cores regressed
+        # below N=8, while a single clone gains nothing from 8 over 4).
+        --vcpu) VCPU="$2"; shift 2 ;;
+        --vmem) VMEM="$2"; shift 2 ;;
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
 done
@@ -153,8 +160,18 @@ run_fork() {
         default) unset SMOLVM_CUDA_FORK_SHARE_WEIGHTS ;;
         *) echo "bad --share: $SHARE (want on|off|default)"; exit 2 ;;
     esac
-    env SMOLVM_CUDA_FORK_WORKERS=1 SMOLVM_CUDA_FORK_ISOLATE=1 SMOLVM_CUDA_DAEMON_IDLE_SECS=0 \
-        RUST_LOG=warn,smolvm::cuda_daemon=info "$S" _cuda-daemon "$SOCK" > "$CO/daemon.log" 2>&1 &
+    # CONTEXT MODE. Default (workers=1) gives each clone its own CUDA context,
+    # which is isolated but makes the GPU TIME-SLICE between clones. Setting
+    # BENCH_FORK_WORKERS=0 selects the legacy shared-context path, where clones
+    # run on separate streams of ONE context and their kernels can actually
+    # overlap -- the only way to fill a GPU that a single learner leaves ~64%
+    # idle. Native cannot do this at all: separate processes = separate
+    # contexts (absent MPS).
+    local daemon_env=(SMOLVM_CUDA_DAEMON_IDLE_SECS=0 RUST_LOG=warn,smolvm::cuda_daemon=info)
+    if [[ "${BENCH_FORK_WORKERS:-1}" == "1" ]]; then
+        daemon_env+=(SMOLVM_CUDA_FORK_WORKERS=1 SMOLVM_CUDA_FORK_ISOLATE=1)
+    fi
+    env "${daemon_env[@]}" "$S" _cuda-daemon "$SOCK" > "$CO/daemon.log" 2>&1 &
     for i in $(seq 1 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
     # No manual CUDA env: smolvm injects SMOLVM_CUDA_ZEROCOPY and stages the
     # guest shims (libcuda.so.1 + the unversioned dev names) itself.
@@ -165,7 +182,10 @@ run_fork() {
 STEPS=$STEPS NSLOTS=$N MODEL=$MODEL OUTBASE=/root BATCH=$BATCH MAXSEQ=$MAXSEQ \
 PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
 /home/ubuntu/ptwork/bin/python /opt/coord/dpo_train.py 2>>/opt/coord/g.err"
-    $S machine create --name bench-g --cuda --net -v "$CO:/opt/coord:rw" \
+    local vmargs=()
+    [[ -n "$VCPU" ]] && vmargs+=(--cpus "$VCPU")
+    [[ -n "$VMEM" ]] && vmargs+=(--mem "$VMEM")
+    $S machine create --name bench-g --cuda --net "${vmargs[@]}" -v "$CO:/opt/coord:rw" \
         --from "$PACK" --storage 30 --overlay 20 -- sh -c "$GUEST" >/dev/null 2>&1
     env SMOLVM_CUDA_SHARED=1 $S machine start --forkable --name bench-g >/dev/null 2>&1
     local tgold
@@ -192,7 +212,13 @@ PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
 # that did not actually run.
 check_share_mode() {
     local CO="$1" line shared
-    line=$(grep -o "shared=[0-9]* private=[0-9]*" "$CO/daemon.log" 2>/dev/null | tail -1)
+    # The daemon logs through tracing, which interleaves ANSI escapes between
+    # the field name and its value ("shared\e[0m\e[2m=\e[0m260"), so strip
+    # escapes before matching -- a plain grep silently finds nothing and the
+    # check reports "<none>" for every run, which is how this guard first
+    # shipped broken.
+    line=$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null \
+           | grep -o "shared=[0-9]* private=[0-9]*" | tail -1)
     shared=$(echo "$line" | sed -E "s/shared=([0-9]*).*/\1/")
     echo "  share-mode requested=$SHARE  daemon reported: ${line:-<none>}"
     if [[ "$SHARE" == "off" && "${shared:-0}" -gt 0 ]]; then
@@ -219,7 +245,7 @@ for rep in $(seq 1 "$REPS"); do
     WALL=$(echo "$T1 - $T0" | bc)
     GOLD=""; [[ -f "$CO/.t_golden" ]] && GOLD=$(echo "$(cat "$CO/.t_golden") - $T0" | bc)
     FORKED=""; [[ -f "$CO/.t_forked" ]] && FORKED=$(echo "$(cat "$CO/.t_forked") - $(cat "$CO/.t_golden")" | bc)
-    SHARE_RECORD="$SHARE" SHARED_RANGES="$(grep -o 'shared=[0-9]*' "$CO/daemon.log" 2>/dev/null | tail -1 | cut -d= -f2)" BATCH_RECORD="$BATCH" MAXSEQ_RECORD="$MAXSEQ" ALLOC_CONF_RECORD="$ALLOC_CONF" SW_RECORD="${SMOLVM_CUDA_FORK_SHARE_WEIGHTS:-unset}" python3 - "$CO" "$RESULTS/$RUNID.json" "$ARM" "$N" "$STEPS" "$CPUS" "$COLD" "$WALL" "${GOLD:-null}" "${FORKED:-null}" "$(cat "$PEAK" 2>/dev/null || echo 0)" "$MF" <<'PY'
+    VCPU_RECORD="$VCPU" VMEM_RECORD="$VMEM" FW_RECORD="${BENCH_FORK_WORKERS:-1}" SHARE_RECORD="$SHARE" SHARED_RANGES="$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null | grep -o 'shared=[0-9]*' | tail -1 | cut -d= -f2)" BATCH_RECORD="$BATCH" MAXSEQ_RECORD="$MAXSEQ" ALLOC_CONF_RECORD="$ALLOC_CONF" SW_RECORD="${SMOLVM_CUDA_FORK_SHARE_WEIGHTS:-unset}" python3 - "$CO" "$RESULTS/$RUNID.json" "$ARM" "$N" "$STEPS" "$CPUS" "$COLD" "$WALL" "${GOLD:-null}" "${FORKED:-null}" "$(cat "$PEAK" 2>/dev/null || echo 0)" "$MF" <<'PY'
 import sys, json, glob
 co, out, arm, n, steps, cpus, cold, wall, gold, forked, peak, mf = sys.argv[1:13]
 learners = []
@@ -238,6 +264,9 @@ rec = {
   "maxseq": int(__import__("os").environ.get("MAXSEQ_RECORD", "0")),
   "share_weights_env": __import__("os").environ.get("SW_RECORD", ""),
   "share_mode": __import__("os").environ.get("SHARE_RECORD", ""),
+  "fork_workers": __import__("os").environ.get("FW_RECORD", "1"),
+  "golden_vcpu": __import__("os").environ.get("VCPU_RECORD", ""),
+  "golden_vmem": __import__("os").environ.get("VMEM_RECORD", ""),
   "shared_ranges": __import__("os").environ.get("SHARED_RANGES", ""),
   "wall_s": round(float(wall), 2),
   "golden_load_s": None if gold == "null" else round(float(gold), 2),
