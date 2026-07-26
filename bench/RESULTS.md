@@ -6,6 +6,10 @@ is in `results/`.
 
 Host: NVIDIA H100 80GB HBM3 · driver 570.148.08 · torch 2.7.0+cu126 · 26 cores / 237 GB
 
+This is the original pre-MPS density matrix, not the current performance
+qualification. See `results/mps-managed-h100-20260726.json` and
+`results/grpo-h100-20260726.json` for the release-qualified DPO and GRPO results.
+
 | arm | N | steps | batch×seq | done | agg tok/s | peak GPU MiB | golden load s | shared ranges |
 |---|---|---|---|---|---|---|---|---|
 | fork | 4 | 20 | 2x256 | 4/4 | 546 | 14550 | 165.59 | - |

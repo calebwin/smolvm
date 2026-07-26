@@ -52,7 +52,9 @@ $T/smolvm-cuda-run --proto-hash > $R/proto-hash
   --workload workload_grpo.py --tag grpo-reference
 ./bench.sh --arm fork --n 4 --steps 200 --cpus 2 --batch 1 \
   --workload workload_grpo.py --tag grpo
-./summarize.py                    # median + spread per (arm, N, batch), and the ratio
+./compare_grpo.py results/native_grpo-reference_....json \
+  results/fork_grpo_....json      # correctness, quality, throughput, and density gate
+./summarize.py                    # source-identical groups, medians, spreads, ratios
 ```
 
 `workload_grpo.py` is the real sampled-GRPO qualification workload. It records
@@ -62,6 +64,13 @@ requires `ACCELERATE_MIXED_PRECISION=bf16` to agree with
 `GRPOConfig(bf16=True)`; the workload establishes that contract before importing
 Unsloth in both arms. This is a framework requirement for this workload, not a
 smolvm-wide environment injection.
+
+`compare_grpo.py` requires deterministic setup and final CPU RNG state to match
+exactly, then applies explicit tolerances to reward means and final adapter L2
+norms. Sampled RL trajectories can cross a token boundary after small numerical
+differences, so final adapter bytes are retained as evidence but are not used as
+an inappropriate bitwise pass/fail rule. The command exits nonzero on any failed
+gate.
 
 Flags that exist because leaving them out produces misleading numbers:
 
@@ -86,12 +95,20 @@ noise. `bench.sh` refuses to start if the GPU already holds >500 MiB.
 ## Reading the output
 
 ```
-wall=253.79s done=4/4 agg_tok_s=546 peak_gpu=14550MiB golden_load=165.59s
+wall=253.79s done=4/4 agg_tok_s=546 exact_agg_tok_s=546.2 \
+tail_agg_tok_s=531.8 aggregate_step_s=1.6 peak_gpu=14550MiB golden_load=165.59s
 ```
 
 - `done` — learners that reported `event: done`. **Less than N usually means OOM**;
   `summarize.py` flags those rows, since a partial aggregate looks like a real
   datapoint otherwise.
+- `exact_agg_tok_s` — sum of each learner's unrounded token rate.
+- `tail_agg_tok_s` — all learner tokens divided by the slowest learner's training
+  time. This is the pool's useful completion throughput and is the default metric
+  selected by `summarize.py` when available.
+- `aggregate_step_s` — completed learner-steps divided by the same tail time. For
+  sampled workloads, this prevents a low-quality run that emits many extra tokens
+  from looking faster merely because it generated more text.
 - `peak_gpu` — whole-device peak, so it includes the golden's own context in the
   fork arm. For a per-process split use `probe_mem.sh` during a run.
 - `golden_load` — fork arm only; paid once per pool, not per learner.

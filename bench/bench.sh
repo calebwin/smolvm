@@ -377,8 +377,27 @@ rec = {
   "learners": learners,
   "env": json.loads(mf),
 }
+timed = [l for l in learners if l.get("train_s") and l.get("train_s") > 0]
+rollout_timed = [l for l in timed if l.get("rollout_tokens") is not None]
+if rollout_timed:
+    rec["exact_agg_tok_s"] = round(sum(
+        l["rollout_tokens"] / l["train_s"] for l in rollout_timed
+    ), 3)
+if timed:
+    rec["train_tail_s"] = max(l["train_s"] for l in timed)
+    rec["aggregate_step_s"] = round(
+        sum(int(l.get("steps") or steps) for l in timed) / rec["train_tail_s"], 3
+    )
+if rollout_timed and len(rollout_timed) == len(timed):
+    rec["tail_agg_tok_s"] = round(
+        sum(l["rollout_tokens"] for l in rollout_timed) / rec["train_tail_s"], 3
+    )
 json.dump(rec, open(out, "w"), indent=2)
-print(f"  wall={rec['wall_s']}s done={rec['learners_done']}/{n} agg_tok_s={rec['agg_tok_s']} peak_gpu={rec['peak_gpu_mib']}MiB" + (f" golden_load={rec['golden_load_s']}s" if rec["golden_load_s"] else "") + f" mps={rec['mps_mode']}")
+tail_metrics = ""
+for key in ("exact_agg_tok_s", "tail_agg_tok_s", "aggregate_step_s"):
+    if key in rec:
+        tail_metrics += f" {key}={rec[key]}"
+print(f"  wall={rec['wall_s']}s done={rec['learners_done']}/{n} agg_tok_s={rec['agg_tok_s']}{tail_metrics} peak_gpu={rec['peak_gpu_mib']}MiB" + (f" golden_load={rec['golden_load_s']}s" if rec["golden_load_s"] else "") + f" mps={rec['mps_mode']}")
 print(f"  -> {out}")
 PY
 done

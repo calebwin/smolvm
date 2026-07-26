@@ -15,11 +15,13 @@ digests match fair native controls. SFT remains below native throughput, so this
 correctness/reliability candidate rather than a new performance claim (§7).
 
 Unsloth + TRL GRPO is now qualified as a third real workload on Qwen2.5-7B. It
-completes at N=1 and N=4 with exact frozen-policy, initial-state, reward, and RNG
-checks. A two-step pair is byte-exact through the final 40.4-million-value adapter;
+completes at N=1, N=4, and N=8 with exact frozen-policy and initial-state checks.
+A two-step pair is byte-exact through the final 40.4-million-value adapter;
 longer stochastic runs show small, bounded remoted numerical variation in sampled
-text while retaining identical reward sequences and final RNG states. GRPO obtains
-the density benefit but does not yet approach native throughput (§7).
+text. The long N=8 gate reaches 74.75 tail aggregate tok/s versus 52.63 native and
+3.075 versus 2.154 aggregate learner-steps/s while using 64.0% less peak VRAM. The
+qualification gate rejects an independently observed low-reward sampled trajectory
+rather than misreporting its extra generated tokens as speed (§7).
 
 ## 1. TL;DR
 
@@ -41,14 +43,16 @@ the density benefit but does not yet approach native throughput (§7).
   exactly. This found and fixed blind cross-process worker attachment, missing
   proc-mem metadata on late attachment, ambiguous tokenless routing, and a broken
   all-private kill switch (§7).
-- **Real Unsloth GRPO is compatible and density-qualified, not throughput-qualified.**
-  The 7B N=4 gate completes 4/4 with 14,515 MiB peak versus native's 29,762 MiB
-  (51.2% less). A two-step N=1 pair has identical rollout bytes and final adapter;
-  at four steps, all reward/RNG sequences match but sampled text can cross a nearby
-  numerical boundary and final adapter bytes need not remain identical. The final
-  cache-scoped N=1 four-step phase takes 56.71 s versus 14.08 s native. An explicit
-  BF16 environment contract is currently required by the installed Unsloth GRPO
-  implementation (§7).
+- **Real Unsloth GRPO now exceeds native at its useful concurrency point.** The 7B
+  N=8, 200-step quality-qualified fork run reaches **74.75 tail aggregate tok/s
+  versus 52.63 native (+42.1%)** and **3.075 versus 2.154 aggregate learner-steps/s
+  (+42.8%)**, with 21,459 versus 59,522 MiB peak GPU memory (**64.0% less**).
+  Deterministic setup and final CPU RNG match exactly; the maximum per-learner reward
+  mean delta is 0.0114 and adapter-L2 relative delta is 0.000218. One separate fork
+  execution produced a low-reward learner from its first sampled step and fails the
+  explicit quality gate; its larger token count is excluded from performance claims.
+  The installed Unsloth stack still requires its explicit BF16 environment contract
+  in both native and fork arms (§7).
 - **Synthetic explicit CUDA graphs remain fast through the boundary**, but the real
   installed Unsloth training path is not graphable today. A K=500 graph measures
   1.241 µs/op versus native's 1.224, yet forced Inductor graphs contained one op each,
@@ -61,8 +65,10 @@ the density benefit but does not yet approach native throughput (§7).
 - **Generic transparent transport optimizations have now been tested and rejected:**
   socket batching is ~2x slower than the ring, compound ring records do not improve
   launch rate, 4 KiB records remove 1,126 blocking launches but regress DPO throughput,
-  an exact TMA-descriptor cache hits ~89% without an end-to-end win, deferred VMM
-  unmaps only move the wait, and direct clone-RAM copies regress throughput (§7).
+  a 128-page request ring stays inside the 32-page completed-step band and fails the
+  GRPO quality gate, an exact TMA-descriptor cache hits ~89% without an end-to-end
+  win, deferred VMM unmaps only move the wait, and direct clone-RAM copies regress
+  throughput (§7).
 - **Weight sharing is not the SFT speed limiter.** A valid all-private in-Trainer
   control measured 241 tok/s versus 246 shared while increasing peak VRAM from about
   11.1 to 16.3 GiB. A later snapshot inside a live Trainer improves 10-step SFT
@@ -416,6 +422,7 @@ code that failed its gate is reverted rather than left in the production path.
 | Disable the shared-memory ring and use the deferred socket batching path | Ring: 4.10 / 3.92 / 3.56 µs per launch. Socket: 8.49 / 7.74 / 8.42. | **No-go.** Blocking socket round trips are roughly 2x slower; the ring is the correct generic transport. |
 | Put 2/4/8/16 quiet requests in one compound ring record | Baseline 3.87 µs; B2 4.25; B4 3.87; B8 5.21; B16 4.04. Paired B4 comparisons also straddled baseline noise. | **No-go.** Fewer publications do not remove framework call preparation and add buffering cost. |
 | Increase ring records from 1 KiB to 4 KiB so all kernel-launch payloads can be quiet | Blocking ops fell 8,049→6,921 and all 1,126 formerly blocking launches became quiet. Twenty-step DPO runs were 2,417 and 2,355 tok/s versus historical 1 KiB median ~2,546. | **No-go.** It removes the intended barriers but regresses end-to-end throughput ~5–7%, consistent with worse queue locality. |
+| Increase the GRPO request ring from 32 to 128 pages after observing backpressure | Source-identical N=8 candidate: 2.981 aggregate learner-steps/s versus the 32-page 2.967–3.075 release band; -3.0% versus the passing reference, and two reward-mean deltas fail the quality gate. | **No-go.** A full queue proves burst pressure, not that a deeper queue removes guest operation preparation or increases useful throughput. Keep 32 pages. |
 | Exact guest-side cache for 152-byte `cuTensorMapEncodeTiled` inputs and 128-byte descriptors, invalidated on clone reconnect | Clone hit ratio reached 2,280/2,560 (~89%). Twenty-step DPO runs were 2,574 / 2,475 / 2,459 tok/s, median 2,475 versus baseline median ~2,546; losses remained exact. | **No-go for performance.** High repetition does not imply material wall-clock cost. The reconnect-generation mechanism was required because a Firecracker clone preserves the guest PID. |
 | Defer status-only `cuMemUnmap` and preserve unmap→release order | Guest sync timing attributed 1,390 ms to 220 inherited golden+clone unmaps. Correctness passed, but clean 20-step baseline was 2,530 / 2,497 tok/s (median 2,513.5) and deferred-unmap was 2,440 / 2,583 (median 2,511.5). All four losses were exactly 0.6862→0.4095. | **No-go.** The apparent synchronous time merely moves into a later dependency because the host must still execute the unmaps in order; paired throughput changes by effectively 0%. |
 | Activate the existing direct clone-RAM `/proc/<pid>/mem` transport instead of bounce copies | The default warm dial accidentally starts a clone worker before its proc-mem advert arrives, so 2,332 D2H operations fall back to bounce copies. Disabling warm dial made all 2,332 use `MemcpyGpaDtoH` and made 139 H2D GPA copies succeed. A 20-step gate nevertheless fell from 2,616 to 2,196 tok/s with identical 0.6862→0.4095 loss. | **No-go for performance.** Thousands of tiny direct proc-mem reads are slower than the shared bounce path, and successful H2D GPA copies save only millisecond-scale time. The warm-dial advert bug is a correctness/transport cleanup, not a speed feature. |
@@ -747,24 +754,73 @@ versus the final shared control's 56.71 s, and increases peak memory from 9,408 
 Imported read-only weights therefore cause neither the GRPO throughput gap nor the
 observed numerical boundary crossing.
 
-#### GRPO performance verdict and next gate
+#### GRPO long-run performance and quality verdict
 
-GRPO compatibility and density are **go**, but native-parity performance is **not
-demonstrated**. The final byte-identical workload and per-run cache policy measure an
-N=1 four-step phase of 14.08 s native versus 56.71 s fork. An earlier 10-step pair is
-retained only as correctness evidence: native fell from 63.86 to 33.76 s on an
-artifact-reusing repeat while a new VM began from a clean overlay, so using 98.82 s
-fork against either number would be an invalid performance ratio.
+The 200-step, N=8 source-identical gate resolves the startup-dominated short-run
+result. Both arms use two CPU cores per learner and the same per-run compiler-cache
+policy:
 
-Before changing GRPO or proposing a new optimization:
+| arm | completion | tail aggregate tok/s | aggregate learner-steps/s | peak GPU memory |
+|---|---:|---:|---:|---:|
+| native | 8/8 | 52.627 | 2.154 | 59,522 MiB |
+| fork + managed MPS | 8/8 | **74.755** | **3.075** | **21,459 MiB** |
 
-1. run long N=4 and N=8 pairs with the final per-run compiler-cache isolation;
-2. record aggregate and per-learner rates separately from golden load/compilation;
-3. compare adapter deltas with a defined numeric tolerance and reward distributions,
-   while retaining exact RNG and per-step rollout evidence;
-4. collect a GRPO-specific steady operation/timing census if the long pair remains
-   below native.
+The valid fork execution is +42.1% by useful tail token throughput, +42.8% by the
+token-count-independent completed-step rate, and uses 64.0% less peak VRAM. The
+comparison requires exact model snapshot/output, initial adapter, dataset, initial
+CPU/CUDA RNG, final CPU RNG, and parameter count. It then bounds the stochastic
+quantities: maximum per-learner reward-mean delta is 0.011319 (gate 0.02), and maximum
+final parameter-L2 relative delta is 0.0002173 (gate 0.001). Final CUDA RNG is retained
+but is not required to match after a sampled token boundary changes.
 
+An independent N=8 fork execution is explicitly excluded: learner 0 had mean reward
+0.1064 versus 0.9728 native, beginning at its first sampled step, while the other
+seven learners matched an earlier run byte-for-byte. Its 11,627 generated tokens
+would inflate a token-rate-only comparison. `bench/compare_grpo.py` rejects that run
+and reports completed-step throughput alongside tokens so a poor policy cannot look
+faster merely by generating more text. Across three long 32-page N=8 fork executions,
+two have healthy reward/adapter endpoints and one fails this quality gate; performance
+and density were otherwise stable. This is a stochastic-quality reliability signal,
+not evidence of memory corruption, and release claims use only gate-passing runs.
+
+A GRPO operation census explains why it benefits from concurrency: an N=1 profile
+(one golden warmup plus 20 learner steps) emitted 2.68 million proxy operations,
+dominated by 721,806 quiet kernel launches and at least 1.62 million library calls. The
+production 32-page request ring was observed full at least 8,192 times, motivating
+the capacity-only A/B recorded below.
+
+The operation-log profile is never used as a performance result: logging grows the
+daemon log to about 90 MiB and perturbs decode time. The temporary ring-full counter
+also adds atomics after every observed full condition, so it was removed before the
+capacity run rather than being left as dormant production instrumentation. Partial
+N=4 setup-dominated screening attempts are retained on the H100 but excluded from the
+capacity verdict.
+
+#### Request-ring capacity gate — **no-go; keep 32 pages**
+
+The final capacity arm changed only the libcudart request ring from 32 to 128 pages;
+the host binary (`18d33faa…`), driver shim, workload hash, N=8 shape, batch 1, 200
+steps, two vCPUs, and managed-MPS policy match the production runs. It completed 8/8,
+reported `shared=260 private=162`, had no CUDA operation errors, and used 21,463 MiB:
+
+| request pages | aggregate learner-steps/s | tail aggregate tok/s | tail train | quality gate |
+|---:|---:|---:|---:|---|
+| 32 (two completed release runs) | **2.967–3.075** | trajectory-dependent | 520–539 s | one pass, one low-reward failure |
+| 128 | **2.981** | 77.370 | 536.68 s | fail: two reward-mean deltas exceed 0.02 |
+
+The 128-page step rate is inside the 32-page run-to-run band and 3.0% below the
+passing 32-page run. Its token rate is 3.5% higher only because two sampled
+trajectories generated more tokens; completed-step rate correctly shows no speedup.
+All deterministic setup fields match and the maximum adapter-L2 relative delta is
+only 0.000173, but reward-mean deltas of 0.0272 and 0.0362 exceed the release limit.
+There is no performance or quality basis to ship the deeper ring, so the override and
+all hot-loop diagnostics were removed and the H100 was restored byte-for-byte to the
+32-page production bundle.
+
+An earlier 128-page N=8 run used the harness default batch 2 by mistake. It completed
+8/8 with healthy rewards, but `compare_grpo.py` rejected it because the production
+reference is batch 1; its timings are retained only as a different-shape compatibility
+result, never as capacity evidence.
 The durable machine-readable evidence and exclusions are in
 `bench/results/grpo-h100-20260726.json`.
 
@@ -798,11 +854,11 @@ untested transport tweak:
    must not be generalized to every training method. The remaining transparent
    architectural lever is the explicitly undecided single-context/per-clone-address-
    translation design; the current Unsloth backward remains non-capturable.
-6. **Treat GRPO parity as independently open.** Qwen2.5-7B completes at N=1/N=4 and
-   retains exact rewards/RNG with bounded sampled-trajectory variation, but the final
-   short N=1 phase is 56.71 versus 14.08 s and the N=4 result is startup-dominated.
-   Run the long cache-scoped concurrency gate before attributing its residual to the
-   same operation mix as SFT or DPO.
+6. **GRPO parity is closed at N=8, with a quality gate retained.** The long
+   cache-scoped run exceeds native by 42.1% tail token throughput and 42.8% completed
+   learner-step throughput while using 64.0% less VRAM. Do not accept token rate by
+   itself: one of three fork executions sampled a low-reward trajectory that emitted
+   more tokens and is rejected by `compare_grpo.py`.
 
 ### Unchanged-source runtime activation (category 2, diagnostic only)
 
@@ -948,7 +1004,8 @@ the current branch tip:
 | `5201032` | managed-MPS implementation, immutable-candidate parity result, and real-DPO graph no-go |
 | `55cf22d` | release qualification, owned-path cleanup/collision hardening, and fail-loud fork benchmark retries |
 | `900414c` | multi-process lineage routing; atomic late-attach live-RAM metadata; fail-closed tokenless routing; sharing kill-switch fix; generalized real-workload harness; SFT qualification and in-Trainer placement probe |
-| current change | real Qwen2.5-7B GRPO qualification, precision-contract diagnosis, exact stochastic-state checks, density/performance controls, and the SFT parity roadmap |
+| `05c0e37` | initial real Qwen2.5-7B GRPO qualification, precision-contract diagnosis, exact stochastic-state checks, density controls, and the SFT parity roadmap |
+| current change | long N=8 GRPO throughput/quality qualification, tail-aware metrics and automated gate, request-ring capacity result, and final cross-workload release evidence |
 
 The latest validation files are:
 
@@ -970,6 +1027,7 @@ The latest validation files are:
 | `bench/workload_sft.py` | real Unsloth/TRL SFT qualification with exact adapter, model-output, dataset, and RNG fingerprints |
 | `bench/workload_sft_resume.py` | diagnostic fork-from-live-Trainer placement upper bound |
 | `bench/workload_grpo.py` | real sampled Unsloth/TRL GRPO qualification with exact model/adapter/RNG state and per-step rollout/reward fingerprints |
+| `bench/compare_grpo.py` | source-identity, deterministic-setup, reward/adapter-quality, tail-throughput, completed-step, and density release gate |
 | `bench/results/grpo-h100-20260726.json` | durable H100 GRPO precision, correctness, density, isolation-control, exclusion, and next-gate summary |
 | `src/cuda_daemon.rs` | managed private MPS policy, ownership supervisor, bounded path cleanup/collision refusal, fallback, and tests |
 | `src/main.rs` | hidden MPS supervisor process entry point |
@@ -1051,7 +1109,16 @@ Safety snapshots:
   `fork_grpo_7b_n4_fork_n4_s4_c2_20260726-071610_r1`; native-MPS and all-private
   controls are `native_grpo_7b_steps_native_mps_n1_s4_c2_20260726-070826_r1` and
   `fork_grpo_7b_steps_private_n1_s4_c2_20260726-070958_r1`. Matching raw JSON is
-  under `~/bench/results/`.
+  under `~/bench/results/`. Long N=8 results are
+  `native_grpo-long200-ref_n8_s200_c2_20260726-080310_r1`, excluded quality run
+  `fork_grpo-long200-vcpu2-release_n8_s200_c2_20260726-083001_r1`, and passing run
+  `fork_grpo-long200-vcpu2-repeat2_n8_s200_c2_20260726-084655_r1`. The diagnostic
+  operation/ring profile is
+  `fork_grpo-ring32-profile-final_n1_s20_c2_20260726-092231_r1`; its `daemon.log`
+  contains the operation census and its `g.err` contains the exponentially sampled
+  ring-full events. The source-identical 128-page capacity run is
+  `fork_grpo-ring128-n8-b1-release_n8_s200_c2_20260726-101846_r1`; the excluded batch-2
+  compatibility run is `fork_grpo-ring128-n8-release_n8_s200_c2_20260726-095756_r1`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus

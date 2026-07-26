@@ -86,6 +86,91 @@
     "daemon_operation_errors": 0,
     "performance_qualification": "directional only; this pair predates per-run compiler-cache scoping and is too short to establish steady throughput"
   },
+  "n8_two_hundred_step_gate": {
+    "native_result": "/home/ubuntu/bench/results/native_grpo-long200-ref_n8_s200_c2_20260726-080310_r1.json",
+    "fork_result": "/home/ubuntu/bench/results/fork_grpo-long200-vcpu2-repeat2_n8_s200_c2_20260726-084655_r1.json",
+    "completion": "8/8 in both arms",
+    "cpu_cores_per_learner": 2,
+    "vm_vcpus_per_learner": 2,
+    "native_tail_aggregate_tok_s": 52.626762,
+    "fork_tail_aggregate_tok_s": 74.754968,
+    "tail_token_throughput_gain_percent": 42.047441,
+    "native_aggregate_step_s": 2.153635,
+    "fork_aggregate_step_s": 3.074913,
+    "aggregate_step_throughput_gain_percent": 42.777799,
+    "native_peak_gpu_mib": 59522,
+    "fork_peak_gpu_mib": 21459,
+    "gpu_memory_reduction_percent": 63.947784,
+    "shared_private_ranges": "260/162",
+    "daemon_operation_errors": 0,
+    "quality_gate": {
+      "passed": true,
+      "exact_fields": [
+        "model snapshot and frozen-policy output",
+        "initial adapter and parameter count",
+        "dataset and initial CPU/CUDA RNG",
+        "final CPU RNG"
+      ],
+      "max_reward_mean_delta": 0.01131875,
+      "reward_mean_delta_limit": 0.02,
+      "max_parameter_l2_relative_delta": 0.000217303,
+      "parameter_l2_relative_delta_limit": 0.001,
+      "final_cuda_rng_match_required": false
+    }
+  },
+  "excluded_n8_quality_run": {
+    "fork_result": "/home/ubuntu/bench/results/fork_grpo-long200-vcpu2-release_n8_s200_c2_20260726-083001_r1.json",
+    "completion": "8/8",
+    "failed_learner": 0,
+    "native_reward_mean": 0.97276875,
+    "fork_reward_mean": 0.1064,
+    "failure_began": "first sampled step",
+    "failed_learner_rollout_tokens": 11627,
+    "reason": "fails the reward-quality gate; extra generated tokens would inflate a token-throughput-only result"
+  },
+  "request_ring_profile": {
+    "run": "/home/ubuntu/bench/results/fork_grpo-ring32-profile-final_n1_s20_c2_20260726-092231_r1.json",
+    "classification": "diagnostic only; operation logging perturbs timing",
+    "proxy_operations": 2683046,
+    "quiet_operations": 2475255,
+    "blocking_operations": 207791,
+    "quiet_kernel_launches": 721806,
+    "ring_full_events_observed_at_least": 8192,
+    "ring_full_spin_iterations_at_event_8192": 7934151
+  },
+  "request_ring_capacity_gate": {
+    "candidate_result": "/home/ubuntu/bench/results/fork_grpo-ring128-n8-b1-release_n8_s200_c2_20260726-101846_r1.json",
+    "request_pages": 128,
+    "reference_request_pages": 32,
+    "source_identical_to_n8_gate": true,
+    "completion": "8/8",
+    "shared_private_ranges": "260/162",
+    "daemon_operation_errors": 0,
+    "candidate_aggregate_step_s": 2.981292,
+    "reference_completed_release_step_s_range": [2.966589, 3.074913],
+    "candidate_vs_passing_reference_step_percent": -3.044645,
+    "candidate_tail_aggregate_tok_s": 77.370127,
+    "candidate_vs_passing_reference_token_percent": 3.498309,
+    "candidate_tail_train_s": 536.68,
+    "candidate_peak_gpu_mib": 21463,
+    "quality_gate": {
+      "passed": false,
+      "failures": [
+        "learner 1 reward mean delta 0.027215 exceeds 0.02",
+        "learner 3 reward mean delta 0.036236 exceeds 0.02"
+      ],
+      "max_parameter_l2_relative_delta": 0.000172552
+    },
+    "verdict": "no-go; completed-step throughput remains inside the 32-page baseline band and quality does not pass; production remains 32 pages"
+  },
+  "excluded_request_ring_shape_mismatch": {
+    "result": "/home/ubuntu/bench/results/fork_grpo-ring128-n8-release_n8_s200_c2_20260726-095756_r1.json",
+    "completion": "8/8",
+    "batch": 2,
+    "reference_batch": 1,
+    "aggregate_step_s": 1.65349,
+    "reason": "compare_grpo.py rejected the batch and RNG identity mismatch; retained as batch-2 compatibility evidence, not a capacity comparison"
+  },
   "isolation_controls": {
     "native_external_mps": {
       "result": "/home/ubuntu/bench/results/native_grpo_7b_steps_native_mps_n1_s4_c2_20260726-070826_r1.json",
@@ -110,9 +195,9 @@
   },
   "verdict": {
     "compatibility": "go with the explicit installed-framework BF16 precision contract",
-    "density": "go; N=4 uses 51.23% less peak GPU memory",
-    "correctness": "go for bounded stochastic training semantics; exact at two steps and exact rewards/RNG at longer gates, with small remoted numeric trajectory variation documented",
-    "throughput_parity": "not demonstrated",
-    "next_gate": "long source-identical N=4/N=8 pairs with per-run compiler caches, plus parameter-delta tolerance rather than an inappropriate bitwise requirement for sampled RL"
+    "density": "go; the long N=8 gate uses 63.95% less peak GPU memory",
+    "correctness": "go only when compare_grpo.py passes bounded stochastic training semantics; one separately retained N=8 run fails the reward-quality gate",
+    "throughput_parity": "exceeded at N=8: +42.05% tail token throughput and +42.78% aggregate completed-step throughput",
+    "next_gate": "none below the workload: the 128-page request ring is no-go and the exact 32-page production bundle is restored"
   }
 }
