@@ -108,6 +108,11 @@ print(json.dumps({
   "torch": sh(f"{sys.argv[2]} -c 'import torch;print(torch.__version__)'"),
   "host_cores": os.cpu_count(),
   "host_mem_gb": round(os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES')/1e9),
+  "cuda_mps_pipe_directory": os.environ.get("CUDA_MPS_PIPE_DIRECTORY"),
+  "cuda_mps_log_directory": os.environ.get("CUDA_MPS_LOG_DIRECTORY"),
+  "cuda_mps_active_thread_percentage": os.environ.get(
+      "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+  ),
 }))
 PY
 }
@@ -259,6 +264,12 @@ for f in sorted(glob.glob(f"{co}/learner_*.jsonl")):
 rec = {
   "arm": arm, "n": int(n), "steps": int(steps), "cpus_per_learner": int(cpus),
   "cold_cache": bool(int(cold)),
+  "cuda_mps_pipe_directory": __import__("os").environ.get(
+      "CUDA_MPS_PIPE_DIRECTORY"
+  ),
+  "cuda_mps_active_thread_percentage": __import__("os").environ.get(
+      "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"
+  ),
   "alloc_conf": __import__("os").environ.get("ALLOC_CONF_RECORD", ""),
   "batch": int(__import__("os").environ.get("BATCH_RECORD", "0")),
   "maxseq": int(__import__("os").environ.get("MAXSEQ_RECORD", "0")),
@@ -278,7 +289,7 @@ rec = {
   "env": json.loads(mf),
 }
 json.dump(rec, open(out, "w"), indent=2)
-print(f"  wall={rec['wall_s']}s done={rec['learners_done']}/{n} agg_tok_s={rec['agg_tok_s']} peak_gpu={rec['peak_gpu_mib']}MiB" + (f" golden_load={rec['golden_load_s']}s" if rec["golden_load_s"] else ""))
+print(f"  wall={rec['wall_s']}s done={rec['learners_done']}/{n} agg_tok_s={rec['agg_tok_s']} peak_gpu={rec['peak_gpu_mib']}MiB" + (f" golden_load={rec['golden_load_s']}s" if rec["golden_load_s"] else "") + (f" mps={rec['cuda_mps_active_thread_percentage'] or 'uncapped'}" if rec["cuda_mps_pipe_directory"] else " mps=off"))
 print(f"  -> {out}")
 PY
 done

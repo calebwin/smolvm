@@ -242,6 +242,20 @@ fn ring_dir_advert() -> Option<Vec<u8>> {
 /// it a worker's reconstructed COPY of its memory.
 fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
     let preamble = || clone_preamble(false);
+    #[cfg(target_os = "linux")]
+    fn clone_ram_trace(message: &str) {
+        let Some(path) = std::env::var_os("SMOLVM_CUDA_CLONE_RAM_TRACE") else {
+            return;
+        };
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "pid={} {message}", std::process::id());
+        }
+    }
     /// Guest-RAM advertisement for a SHARED daemon: when this VM's RAM is
     /// memfd-backed (forkable machines), tell the daemon how to map the same
     /// pages via `/proc/<pid>/fd/<memfd>` — magic + pid + fd + count +
@@ -343,12 +357,25 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
     #[cfg(target_os = "linux")]
     fn guest_ram_procmem_advert() -> Option<Vec<u8>> {
         if std::env::var_os("SMOLVM_CUDA_NO_RAM_ADVERT").is_some() {
+            clone_ram_trace("proc-mem advert disabled by SMOLVM_CUDA_NO_RAM_ADVERT");
             return None;
         }
-        let regions = GUEST_RAM.get().and_then(|f| f())?; // (gpa, host_va, len)
+        let Some(provider) = GUEST_RAM.get() else {
+            clone_ram_trace("proc-mem advert unavailable: no guest-RAM provider");
+            return None;
+        };
+        let Some(regions) = provider() else {
+            clone_ram_trace("proc-mem advert unavailable: provider returned no regions");
+            return None;
+        };
         if regions.is_empty() {
+            clone_ram_trace("proc-mem advert unavailable: provider returned zero regions");
             return None;
         }
+        clone_ram_trace(&format!(
+            "proc-mem advert ready: {} region(s)",
+            regions.len()
+        ));
         let mut p = Vec::with_capacity(20 + regions.len() * 24);
         p.extend_from_slice(b"SMVGPVM1");
         p.extend_from_slice(&std::process::id().to_le_bytes());

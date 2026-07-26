@@ -68,7 +68,10 @@ fn count_sync_key(key: &str, dur: std::time::Duration) {
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by_key(|b| std::cmp::Reverse(b.1 .1));
         eprintln!("[sync-times after {total}]");
-        for (k, (n, us)) in v.iter().take(12) {
+        // Diagnostic mode only: include low-count synchronization classes as
+        // well as the dominant entries. A top-12 cutoff hid context/stream
+        // synchronizations behind one-time module loads in real DPO traces.
+        for (k, (n, us)) in v.iter().take(64) {
             eprintln!("  {:>9.1}ms {n:>7}x  {k}", *us as f64 / 1000.0);
         }
     }

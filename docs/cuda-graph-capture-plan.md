@@ -28,22 +28,34 @@ implemented.
 - **Generic transparent transport optimizations have now been tested and rejected:**
   socket batching is ~2x slower than the ring, compound ring records do not improve
   launch rate, 4 KiB records remove 1,126 blocking launches but regress DPO throughput,
-  and an exact TMA-descriptor cache hits ~89% without an end-to-end win (§7).
-- The remaining pre-workload investigation is deliberately narrow: make the previous
-  silent `torch.compile` fallback fail loudly, determine whether runtime-only graph
-  activation can work without source changes, bound safe synchronization elision, and
-  calculate the maximum possible benefit of the residual blocking classes (§7).
-- If those transparent gates fail, the next path is an explicit graph at the
-  workload/framework boundary: fixed-shape batches copied into static device buffers,
-  warm up once per clone, capture a large training region, and replay it. The target
-  application must stop issuing the K eager calls; daemon recognition cannot do that
-  (§8).
-- Separately, fork's *saturated* ceiling (~13.7k tok/s regardless of N) remains an
-  architectural question. Per-clone contexts and scheduling are the leading
-  explanation, but the current data do not prove that they are the only cause. A
-  single-context/multi-stream redesign remains a separate project (§5).
-- The original diagnostics are committed on the investigation branch. New boundary,
-  pointer-classification, and fresh-clone probes are currently uncommitted (§8).
+  an exact TMA-descriptor cache hits ~89% without an end-to-end win, deferred VMM
+  unmaps only move the wait, and direct clone-RAM copies regress throughput (§7).
+- **NVIDIA MPS is the first validated workload-transparent speed lever.** At N=4,
+  two 50-step controls measured 12,905 / 13,058 aggregate tok/s and two MPS runs
+  measured 14,993 / 15,495: a **17.4% median gain**, 4/4 completion, the same
+  `shared=260 private=148` split, and only 39 MiB more peak VRAM. All four clone
+  workers were observed as clients of one MPS server. At N=8, a paired arm improved
+  **17,152→22,597 tok/s (+31.7%)**, completed 8/8, and retained bit-identical loss
+  endpoints per learner. At N=16, a 20-step density pair improved
+  **12,552→14,915 tok/s (+18.8%)** with 16/16 completion. MPS improves multi-context
+  scheduling without changing the workload, but it does not remove the eager
+  per-operation tax (§5/§7).
+- Runtime-only `torch.compile` activation and the remaining synchronization/transport
+  alternatives have now been closed as no-go. The remaining transparent validation is
+  MPS numerical-repeatability bounds and an immutable-build confirmation; basic
+  lifecycle/restart/fallback probes are green (§7).
+- After the uncapped-MPS implementation, the next *additional* lever is an explicit
+  graph at the workload/framework boundary: fixed-shape batches copied into static
+  device buffers, warm up once per clone, capture a large training region, and replay
+  it. That later step changes/integrates with the workload because the target
+  application must stop issuing K eager calls; daemon recognition cannot do that (§8).
+- The old ~13.7k "hard ceiling" is superseded: the current paired N=8 control reached
+  17,152 and uncapped MPS reached **22,597**. That directly validates multi-context
+  scheduling as a material limiter. A full single-context/multi-stream redesign is now
+  lower priority than productizing the much narrower MPS path (§5).
+- The investigation diagnostics and transparent transport results are committed on
+  the investigation branch; the latest MPS/lifecycle findings and clone-RAM tracing
+  are in the current working tree (§9).
 
 ## 2. Shipped (merged)
 
@@ -140,12 +152,55 @@ Saturation curve (batch 8×1024, steps=50):
 | fork | 8 | 2 | 11,008 | 86% | 26.3 GB |
 | fork | 16 | 2 | 12,399 | 89% | 45.1 GB |
 
-**Fork plateaus at ~13.7k tok/s (66% of native) regardless of N** — N=4 beats N=8 and
-N=16, so oversubscribing further *hurts*. It is not explained by the VM CPU limits
-tested in §4. Each clone worker owns its own CUDA context, and multi-context scheduling
-is the leading explanation, but this sweep does not prove causality or exclude another
-shared bottleneck. The six-clone graph stress test also produced K=500 replay rates
-from 1.26 to 2.68 µs/op under concurrency, consistent with scheduling variance.
+**The original no-MPS sweep appeared to plateau at ~13.7k tok/s (66% of native)** —
+N=4 beat N=8 and N=16, so oversubscribing further hurt in that sweep. It was not
+explained by the VM CPU limits tested in §4. Each clone worker owns its own CUDA
+context, and multi-context scheduling was the leading explanation. The six-clone graph
+stress test also produced K=500 replay rates from 1.26 to 2.68 µs/op under concurrency,
+consistent with scheduling variance. The current paired N=8 control later disproved
+13.7k as a stable hard ceiling, but not the scheduling attribution.
+
+A paired MPS prototype now provides direct evidence for that attribution. With the
+unchanged DPO workload at N=4, steps=50, batch=8, maxseq=1024:
+
+| mode | run 1 | run 2 | median | peak VRAM |
+|---|---:|---:|---:|---:|
+| ordinary per-clone contexts | 12,905 | 13,058 | 12,981.5 tok/s | 16,852 MiB |
+| same workers under NVIDIA MPS | 14,993 | 15,495 | **15,244 tok/s** | 16,891 MiB |
+
+That is a **17.4% median throughput improvement**. Every run completed 4/4 learners
+and reported `shared=260 private=148`; live MPS queries listed the daemon plus all four
+clone workers as clients of the same server. The controller/server were stopped after
+each arm and the GPU returned to 0 MiB. This is a pure-smolvm-transparent candidate:
+smolvm can manage the host MPS lifecycle and environment while the guest runs the same
+program and arguments.
+
+The N=4 result raises the current fork rate from 62% to 73% of the paired native N=4
+reference (20,796 tok/s), but does not close that same-N gap. At N=8, the next paired
+observation was stronger:
+
+| mode | aggregate tok/s | per-clone range | completion | peak VRAM |
+|---|---:|---:|---:|---:|
+| ordinary per-clone contexts | 17,152 | 2,133–2,189 | 8/8 | 26,260 MiB |
+| same workers under NVIDIA MPS | **22,597** | 2,718–2,915 | 8/8 | 26,321 MiB |
+
+That is **+31.7%** with only 61 MiB additional peak memory. Every learner's reported
+loss endpoints were bit-identical between the paired arms. Live control queries listed
+the daemon plus all eight clone workers under one MPS server, and cleanup again
+returned the GPU to 0 MiB.
+
+The N=8 ordinary control is itself much faster than the older 11,008 tok/s result in
+the original sweep, despite matching its documented configuration. Therefore the old
+13.7k "hard plateau" is not stable enough to retain as a universal ceiling; only
+same-build paired arms should be used for the MPS decision. MPS addresses inter-context
+scheduling; explicit graphs address the independent eager operation-issue tax.
+
+The N=16 density pair (20 steps, so compared only within its pair) completed 16/16 and
+improved 12,552→14,915 tok/s (**+18.8%**) at essentially unchanged peak memory
+(45,070→45,054 MiB). MPS attached all 16 workers plus the daemon. The result remains
+below N=8/MPS because 16 two-vCPU guests oversubscribe the 26-core host and per-clone
+rates fall to 868–1,055 tok/s. The best measured performance point is therefore
+**N=8 with MPS**, while N=16 remains the density point.
 
 Shared-context mode exists (`BENCH_FORK_WORKERS=0` — all clones on streams of *one*
 context) but is not a drop-in fix: tested at N=4, result was `0/4 learners, timeout`,
@@ -255,6 +310,91 @@ code that failed its gate is reverted rather than left in the production path.
 | Put 2/4/8/16 quiet requests in one compound ring record | Baseline 3.87 µs; B2 4.25; B4 3.87; B8 5.21; B16 4.04. Paired B4 comparisons also straddled baseline noise. | **No-go.** Fewer publications do not remove framework call preparation and add buffering cost. |
 | Increase ring records from 1 KiB to 4 KiB so all kernel-launch payloads can be quiet | Blocking ops fell 8,049→6,921 and all 1,126 formerly blocking launches became quiet. Twenty-step DPO runs were 2,417 and 2,355 tok/s versus historical 1 KiB median ~2,546. | **No-go.** It removes the intended barriers but regresses end-to-end throughput ~5–7%, consistent with worse queue locality. |
 | Exact guest-side cache for 152-byte `cuTensorMapEncodeTiled` inputs and 128-byte descriptors, invalidated on clone reconnect | Clone hit ratio reached 2,280/2,560 (~89%). Twenty-step DPO runs were 2,574 / 2,475 / 2,459 tok/s, median 2,475 versus baseline median ~2,546; losses remained exact. | **No-go for performance.** High repetition does not imply material wall-clock cost. The reconnect-generation mechanism was required because a Firecracker clone preserves the guest PID. |
+| Defer status-only `cuMemUnmap` and preserve unmap→release order | Guest sync timing attributed 1,390 ms to 220 inherited golden+clone unmaps. Correctness passed, but clean 20-step baseline was 2,530 / 2,497 tok/s (median 2,513.5) and deferred-unmap was 2,440 / 2,583 (median 2,511.5). All four losses were exactly 0.6862→0.4095. | **No-go.** The apparent synchronous time merely moves into a later dependency because the host must still execute the unmaps in order; paired throughput changes by effectively 0%. |
+| Activate the existing direct clone-RAM `/proc/<pid>/mem` transport instead of bounce copies | The default warm dial accidentally starts a clone worker before its proc-mem advert arrives, so 2,332 D2H operations fall back to bounce copies. Disabling warm dial made all 2,332 use `MemcpyGpaDtoH` and made 139 H2D GPA copies succeed. A 20-step gate nevertheless fell from 2,616 to 2,196 tok/s with identical 0.6862→0.4095 loss. | **No-go for performance.** Thousands of tiny direct proc-mem reads are slower than the shared bounce path, and successful H2D GPA copies save only millisecond-scale time. The warm-dial advert bug is a correctness/transport cleanup, not a speed feature. |
+
+### Validated transparent scheduling prototype — MPS go
+
+NVIDIA MPS is below the guest workload and requires no CUDA/framework interception.
+The prototype used dedicated pipe/log directories, let the smolvm daemon and clone
+workers inherit them, and always sent `quit` through an exit trap. On the H100, MPS
+accepted smolvm's existing CUDA VMM/imported-memory behavior, and all clone workers
+were verified as MPS clients during the run.
+
+At N=4, two paired 50-step controls and two MPS arms produced the 17.4% median gain
+reported in §5. Per-clone throughput improved together rather than through an outlier:
+the first pair was 3,208–3,245 tok/s per control clone versus 3,660–3,806 under MPS.
+Weight density and completion were unchanged.
+
+At N=8, the paired arm improved 17,152→22,597 tok/s (+31.7%). All eight clone workers
+were visible as MPS clients, per-clone throughput rose from 2,133–2,189 to
+2,718–2,915 tok/s, and each learner's reported loss endpoints matched its control
+bit-for-bit. This both strengthens the scheduling attribution and shows that the MPS
+gain does not trade aggregate throughput for a starving tail.
+
+At N=16/20 steps, MPS improved 12,552→14,915 tok/s (+18.8%) with 16/16 completion and
+no memory increase. This confirms compatibility at the maximum density point already
+validated by the fork pool, but N=8 remains faster in aggregate because N=16
+oversubscribes host CPUs. Several per-learner loss endpoints varied across the N=16
+pair, as they also do across ordinary repeated N=4 runs; this is why a deterministic
+numerical probe remains a productization gate rather than claiming bitwise DPO
+repeatability from the current harness.
+
+#### Active-thread partitioning — generic no-go
+
+MPS can cap the fraction of active SM threads available to each client. A targeted
+N=8 sweep tested whether explicit partitioning could improve on default MPS:
+
+| mode | aggregate tok/s | per-clone range | peak VRAM | numerical result |
+|---|---:|---:|---:|---|
+| no MPS | 17,152 | 2,133–2,189 | 26,260 MiB | finite |
+| MPS, uncapped | 22,597 | 2,718–2,915 | 26,321 MiB | bit-identical to paired control |
+| MPS, 12% | 21,772 | 2,658–2,804 | 21,603 MiB | finite |
+| MPS, 25% | 23,415 | 2,864–2,977 | 22,321 MiB | finite, endpoints drifted |
+| MPS, 33% | 23,520 | 2,845–3,031 | 22,701 MiB | **all 8 learners NaN from first logged loss** |
+
+The apparent 33% throughput lead is invalid. There were zero daemon operation errors,
+and an isolation run of the same Unsloth workload **natively** under MPS/33% also
+produced NaN from its first loss. The failure is therefore a workload/kernel
+interaction with the MPS resource cap, not smolvm transport or clone state.
+
+Decision: **do not set `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` transparently.** Uncapped
+MPS is the generic candidate. A cap can save several GiB and 25% happened to be finite
+and ~3.6% faster in this workload, but resource partitions are workload-visible in
+practice and require explicit qualification/opt-in. They are not part of the pure
+smolvm performance proposal.
+
+This is a **go for further validation**, not yet a default-on implementation. Before
+productizing:
+
+1. repeat the positive N=8 point on the immutable production candidate; it is the
+   current performance optimum, while N=16 is the validated density point;
+2. compare repeated numerical endpoints against repeated ordinary and native runs;
+   the harness already shows endpoint variation between ordinary runs, so exact
+   bitwise cross-run equality is not a valid gate without first making the workload
+   deterministic;
+3. test controller discovery, stale-controller handling, daemon crash cleanup, and
+   safe fallback when MPS is unavailable;
+4. keep MPS scoped to compatible NVIDIA/Linux pool configurations and never silently
+   change a system-wide MPS service owned by another user.
+5. leave active-thread percentage uncapped by default; the 33% native isolation
+   failure proves this tuning is not generically transparent.
+
+The first lifecycle/fallback probe is green:
+
+- a second controller start against the same private pipe directory fails explicitly
+  with `An instance of this daemon is already running`;
+- after terminating the owned controller abruptly, a new controller successfully
+  reclaims the same directory despite stale entries;
+- a real CUDA tensor operation succeeds with both a nonexistent controller directory
+  and the stale post-crash directory, demonstrating ordinary CUDA fallback instead of
+  a hang or initialization failure;
+- graceful `quit` removes both controller and server processes; all performance arms
+  also returned the GPU to 0 MiB.
+
+Product code still needs an ownership lock/supervisor and must only stop a controller
+it started. The safe design is a private smolvm pipe/log directory and fallback to
+ordinary contexts when no owned controller is available.
 
 ### Unchanged DPO operation census
 
@@ -272,21 +412,35 @@ isolated record capacity cleanly. Its throughput regression and the TMA cache re
 show why call counts alone are not enough: every remaining proposal needs a measured
 end-to-end gate.
 
+The guest-side synchronous-call profiler then ranked full round-trip wall time. In
+the useful post-fork interval:
+
+- ordinary D2H readbacks dominated: 1,579 observed calls added ~2.42 s by the next
+  snapshot (~1.53 ms/call, including the GPU dependency they wait on);
+- stream synchronizations were frequent but cheap: 240 calls added ~0.4 ms;
+- the separate driver-shim tally attributed 1,390 ms/220 calls to VMM unmap and
+  601 ms/3,821 calls to TMA encoding across inherited golden+clone state.
+
+The deferred-unmap paired result above is the important interpretation: synchronous
+wall time is not automatically removable wall time. A barrier that waits on required
+ordered work can only move that wait to the next consumer.
+
 ### Remaining pure-smolvm questions
 
-These are not yet validated improvements:
+The per-operation transport questions are now bounded. The remaining material
+pure-smolvm question is how far MPS can move the multi-context ceiling:
 
-1. **Safe barrier elision/coalescing.** Classify which D2H, synchronization, and event
-   calls actually expose results to the CPU or order later work. Elide only barriers
-   whose data dependencies prove them redundant; call-type-only suppression is
-   incorrect.
-2. **Upper bound by residual class.** Measure time, not just count, for each blocking
-   class. Stop if eliminating an entire class cannot materially move step time.
-3. **Earlier transparent sequence handling.** Determine whether any stable sequence
-   can be recognized before PyTorch performs its per-op preparation. The current
-   evidence already rules out the daemon and puts a tight ceiling on a CUDA-shim-only
-   trace cache; the investigation should close this with a quantified bound rather
-   than assume it.
+1. **MPS policy confirmation.** Repeat N=8 on the immutable production candidate and
+   define a private, ownership-aware controller lifecycle. N=8 is the current
+   throughput optimum; N=16 remains the density configuration. Missing/stale
+   controllers already fall back successfully in the driver probe.
+2. **Numerical-repeatability bound.** Separate pre-existing stochastic/nondeterministic
+   DPO variation from an MPS-specific effect. The current harness seeds its data and
+   trainer but does not request deterministic CUDA algorithms.
+3. **No speculative barrier suppression.** Ordinary D2H calls dominate observed
+   synchronous wall time because the CPU consumes their results. Stream sync is cheap,
+   deferred VMM unmap only moves the wait, and direct proc-mem D2H is slower. No
+   dependency proof has exposed a material safely removable class.
 
 ### Unchanged-source runtime activation (category 2, diagnostic only)
 
@@ -300,6 +454,20 @@ whether source edits can be avoided.
 Go only if logs and boundary counts prove that tracing/capture occurred, numerical
 results match eager, and end-to-end throughput improves. An accepted flag followed by
 eager execution is a failed result.
+
+This gate is now resolved **no-go for the installed Unsloth path**:
+
+- `GRAPHS=1`, `torch_compile=True`, reduce-overhead mode, and
+  `UNSLOTH_COMPILE_IGNORE_ERRORS=0` completed without an exception;
+- the clone emitted exactly **116,409 boundary operations**, identical to the eager
+  census, with **zero** `StreamBeginCapture`, `GraphInstantiate`, or `GraphLaunch`
+  operations;
+- installed Unsloth replaces Accelerate's compile kwargs and explicitly supplies
+  `"triton.cudagraphs": False`.
+
+The accepted configuration therefore did not activate graphs or reduce the eager
+boundary sequence. Changing that override would be runtime/framework injection
+(category 2), not a pure-smolvm improvement.
 
 ## 8. Revised implementation path (phased, each with a go/no-go gate)
 
@@ -315,7 +483,19 @@ Current cudart capture/instantiate/launch forwarding works in fresh isolated clo
 contexts and retains exact results in the synthetic graph probe. No clone graph fix is
 currently justified. Preserve the corrected reliability test as a regression.
 
-### Phase 2 — actual DPO graphability prototype (next; no engine code first)
+### Phase 2 — transparent MPS scheduling validation: **go, uncapped only**
+
+The performance, scaling, compatibility, and basic lifecycle/fallback gates in §7 are
+green for uncapped MPS. The narrow next implementation is host-side MPS service
+coordination for fork pools. It must require no guest/workload change, use a private
+ownership-aware controller directory, leave active-thread percentage unset, and safely
+fall back to the current per-context path.
+
+This phase is complementary to graphs, not a replacement: the validated N=4 result
+recovers 17.4%; the N=8 result recovers 31.7% and is the best current aggregate point.
+Re-run N=8 on the actual implementation artifact before enabling it by default.
+
+### Phase 3 — actual DPO graphability prototype (next workload-visible step; no engine code first)
 
 Prototype one real training region using PyTorch's explicit `torch.cuda.CUDAGraph`
 contract, which smolvm already forwards:
@@ -341,9 +521,9 @@ If capture fails, first attribute the exact unsupported CUDA/runtime operation. 
 missing graph API to smolvm only when the real workload proves it is required. Do not
 build a general graph-update engine speculatively.
 
-### Phase 3 — fork saturation measurement
+### Phase 4 — graph-enabled fork saturation measurement
 
-After Phase 2 passes, run eager versus graph at N=1 and N=4 first, then N=8/N=16:
+After Phase 3 passes, run eager versus graph at N=1 and N=4 first, then N=8/N=16:
 
 - throughput, step latency, SM utilization, and aggregate VRAM;
 - final losses/parameters;
@@ -354,7 +534,7 @@ This separates removal of the eager-call tax from the independent saturation cei
 The target is to move the N=4 fork result toward native's 20.8k tok/s; A1 proves the
 mechanism but does not guarantee that end-to-end result.
 
-### Phase 4 — productization choice
+### Phase 5 — graph productization choice
 
 If the DPO prototype wins, choose the narrowest useful integration:
 
@@ -368,9 +548,10 @@ transparent `SMOLVM_CUDA_AUTOGRAPH=1` daemon feature is no longer proposed.
 
 ### Separate decision — single-context/multi-stream architecture
 
-Only after graph-enabled saturation data exist should the larger per-clone address
-translation/shared-context project be approved. Graphs reduce API issue overhead; they
-do not by themselves prove or remove a multi-context scheduling ceiling.
+MPS should now be evaluated before approving the larger per-clone address
+translation/shared-context project. It recovers part of the multi-context scheduling
+loss without changing smolvm's per-clone isolation model. Graphs reduce API issue
+overhead; they do not replace either scheduling approach.
 
 ### Explicit non-goals for this work
 
@@ -394,7 +575,9 @@ the current branch tip:
 | `c6ed98b` | reproducible benchmark/probe tooling |
 | `9bc21e1` | the original investigation plan |
 | `cdf7337` | placement no-ops, upgraded pointer probe, and corrected fresh-clone graph matrix |
-| current branch tip | transparent transport/cache no-go results and operation-census tooling |
+| `75e12a1` | plan revised from graph placement, pointer, and clone-reliability results |
+| `4fb3f0b` | transparent transport/cache no-go results and operation-census tooling |
+| this commit | MPS scaling/lifecycle/cap findings, durable result summary, and clone-RAM/sync diagnostics |
 
 The latest validation files are:
 
@@ -408,6 +591,11 @@ The latest validation files are:
 | `bench/run_graph_fresh_trials.sh` | corrected fork-before-release clone matrix |
 | `bench/analyze_oplog.py` | counts quiet/blocking operations by process and operation class |
 | `bench/run_transport_matrix.sh` | paired shared-memory-ring versus socket transport launch-rate harness |
+| `bench/run_mps_matrix.sh` | private-controller, uncapped MPS versus ordinary-context paired harness with guaranteed cleanup |
+| `bench/results/mps-h100-20260725.json` | durable machine-readable MPS performance, correctness, cap, and lifecycle summary |
+| `bench/bench.sh` | benchmark manifests now record MPS pipe directory and active-thread percentage |
+| `crates/smolvm-cuda/src/client.rs` | synchronous-call profiler now retains enough ranked classes to expose low-count barriers hidden by one-time module loads |
+| `src/cuda_host.rs` | opt-in clone-RAM advert trace that exposed the warm-dial/proc-mem ordering bug |
 
 The untracked `demo/*` files belong to separate user work and were not modified.
 Safety snapshots:
@@ -425,9 +613,27 @@ Safety snapshots:
   `~/coord_graph_perf_2/` / `~/coord_graph_reliability_corrected_2/` (corrected clone
   graph results). The unchanged-DPO operation censuses are in
   `~/bench_run/fork_n1_s2_c4_20260725-200836_r1/` (production 1 KiB ring) and
-  `~/bench_run/fork_n1_s2_c4_20260725-202926_r1/` (temporary 4 KiB ring).
+  `~/bench_run/fork_n1_s2_c4_20260725-202926_r1/` (temporary 4 KiB ring). Runtime
+  compile boundary evidence is in
+  `~/bench_run/fork_n1_s2_c4_20260725-212612_r1/`; expanded sync timing is in
+  `~/bench_run/fork_n1_s2_c4_20260725-214633_r1/`; the paired deferred-unmap gate is
+  in the four `~/bench_run/fork_n1_s20_c4_20260725-{220029,220441,220910,221321}_r1/`
+  directories and matching `~/bench/results/*.json` files. Clone-RAM advert and
+  direct-proc-mem evidence is in `~/coord_clone_ram_trace/`,
+  `~/coord_clone_ram_nowarm/`, and
+  `~/bench_run/fork_n1_s{2,20}_c4_20260725-{222720,223210,223633}_r1/`.
+  The paired MPS runs are:
+  `fork_n4_s50_c4_20260725-{224347,224916,225448,230012}_r1`,
+  `fork_n8_s50_c4_20260725-{230633,231305}_r1`, and
+  `fork_n16_s20_c4_20260725-{231950,232655}_r1`. The active-thread sweep is in
+  `fork_n8_s50_c4_20260725-{233715,234319,234922}_r1` (25%, 12%, 33%,
+  respectively), and the native 33%-cap NaN isolation is
+  `native_n1_s2_c4_20260725-235606_r1`. Matching JSON files are under
+  `~/bench/results/`; MPS controller/server logs are under the corresponding
+  `/tmp/smolvm-mps-log-20260725-*` directories.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
-  (harness usage), `bench/RESULTS.md` (generated summary table).
+  (harness usage), `bench/RESULTS.md` (generated summary table), and
+  `bench/results/mps-h100-20260725.json` (the durable summary for this investigation).
 - **Session memory** (cross-conversation continuity, not in this repo):
   `fork-vs-native-benchmark.md`, `cuda-fork-weight-sharing-fix.md`,
   `cuda-clone-procmem-transport.md`.
