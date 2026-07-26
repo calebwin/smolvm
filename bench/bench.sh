@@ -27,6 +27,7 @@
 set -u
 
 ARM=""; N=4; STEPS=20; REPS=1; CPUS=4; COLD=0; BATCH=2; MAXSEQ=256; TIMEOUT=600; SHARE=default; VCPU=""; VMEM=""; WORKLOAD_ARG=""; TAG_ARG=""
+GRPO_WARM_STEPS="${GRPO_WARM_STEPS:-1}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arm) ARM="$2"; shift 2 ;;
@@ -102,25 +103,37 @@ preflight() {
         sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || echo "  (cache drop needs sudo; continuing warm)"
     else
         # Warm both arms identically: page in the model weights once.
-        find "$HOME/hf" -name "*.safetensors" -exec cat {} + > /dev/null 2>&1
+        find "${HF_HOME:-$HOME/hf}" -name "*.safetensors" -exec cat {} + > /dev/null 2>&1
     fi
 }
 
 # Environment manifest: everything that could move a number between runs.
 manifest() {
     python3 - "$@" <<'PY'
-import json, subprocess, sys, os
+import json, subprocess, sys, os, shlex
 def sh(c):
     try: return subprocess.check_output(c, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
     except Exception: return None
+rootfs = os.environ.get(
+    "SMOLVM_AGENT_ROOTFS",
+    os.path.expanduser("~/.local/share/smolvm/agent-rootfs"),
+)
+rootfs_q = shlex.quote(rootfs)
 print(json.dumps({
   "smolvm_version": sh(f"{sys.argv[1]} --version"),
   "smolvm_binary_md5": sh(f"md5sum {sys.argv[1]} | cut -d' ' -f1"),
-  "proto_hash_rootfs": sh("cat ~/.local/share/smolvm/agent-rootfs/usr/local/lib/smolvm-cuda/proto-hash"),
-  "shim_md5": sh("md5sum ~/.local/share/smolvm/agent-rootfs/usr/local/lib/smolvm-cuda/libcudart-shim.so | cut -d' ' -f1"),
+  "agent_rootfs": rootfs,
+  "proto_hash_rootfs": sh(f"cat {rootfs_q}/usr/local/lib/smolvm-cuda/proto-hash"),
+  "shim_md5": sh(f"md5sum {rootfs_q}/usr/local/lib/smolvm-cuda/libcudart-shim.so | cut -d' ' -f1"),
   "driver": sh("nvidia-smi --query-gpu=driver_version --format=csv,noheader"),
   "gpu": sh("nvidia-smi --query-gpu=name --format=csv,noheader"),
   "torch": sh(f"{sys.argv[2]} -c 'import torch;print(torch.__version__)'"),
+  "python": sh(f"{sys.argv[2]} --version"),
+  "unsloth": sh(f"{sys.argv[2]} -c 'import importlib.metadata as m;print(m.version(\"unsloth\"))'"),
+  "trl": sh(f"{sys.argv[2]} -c 'import importlib.metadata as m;print(m.version(\"trl\"))'"),
+  "transformers": sh(f"{sys.argv[2]} -c 'import importlib.metadata as m;print(m.version(\"transformers\"))'"),
+  "bitsandbytes": sh(f"{sys.argv[2]} -c 'import importlib.metadata as m;print(m.version(\"bitsandbytes\"))'"),
+  "pip_freeze_sha256": sh(f"{sys.argv[2]} -m pip freeze | sha256sum | cut -d' ' -f1"),
   "host_cores": os.cpu_count(),
   "host_mem_gb": round(os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES')/1e9),
   "cuda_mps_pipe_directory": os.environ.get("CUDA_MPS_PIPE_DIRECTORY"),
@@ -146,8 +159,9 @@ sample_gpu() {
 # ---------------------------------------------------------------------- arms
 run_native() {
     local CO="$1"
-    export HF_HOME=$HOME/hf HF_HUB_OFFLINE=1 COORD=$CO ARM=native FORK=0 OUTBASE=$CO
+    export HF_HOME="${HF_HOME:-$HOME/hf}" HF_HUB_OFFLINE=1 COORD=$CO ARM=native FORK=0 OUTBASE=$CO
     export STEPS=$STEPS MODEL=$MODEL BATCH=$BATCH MAXSEQ=$MAXSEQ
+    export GRPO_WARM_STEPS=$GRPO_WARM_STEPS
     export PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" TORCHINDUCTOR_COMPILE_THREADS=1
     # Collect the learner PIDs and wait on THOSE only: a bare `wait` would also
     # block on the GPU sampler running in this same shell, which by design does
@@ -170,8 +184,9 @@ run_native() {
 
 run_queue() {
     local CO="$1"
-    export HF_HOME=$HOME/hf HF_HUB_OFFLINE=1 COORD=$CO ARM=queue FORK=0 OUTBASE=$CO
+    export HF_HOME="${HF_HOME:-$HOME/hf}" HF_HUB_OFFLINE=1 COORD=$CO ARM=queue FORK=0 OUTBASE=$CO
     export STEPS=$STEPS MODEL=$MODEL BATCH=$BATCH MAXSEQ=$MAXSEQ QUEUE_JOBS=$N
+    export GRPO_WARM_STEPS=$GRPO_WARM_STEPS
     export PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" TORCHINDUCTOR_COMPILE_THREADS=1
     if [[ "$CPUS" -gt 0 ]]; then
         local nproc_n cores
@@ -223,6 +238,7 @@ run_fork() {
     # weight chunk unshareable.
     local GUEST="${BENCH_GUEST_EXTRA:-} export HF_HOME=/opt/hfcache HF_HUB_OFFLINE=0 COORD=/opt/coord ARM=fork FORK=1 \
 STEPS=$STEPS NSLOTS=$N MODEL=$MODEL OUTBASE=/root BATCH=$BATCH MAXSEQ=$MAXSEQ \
+GRPO_WARM_STEPS=$GRPO_WARM_STEPS \
 PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
 /home/ubuntu/ptwork/bin/python /opt/coord/workload.py 2>>/opt/coord/g.err"
     local vmargs=()
@@ -357,12 +373,14 @@ for f in sorted(glob.glob(f"{co}/learner_*.jsonl")):
             "loss0", "lossN", "reward0", "rewardN", "peak_gb",
             "reward_max", "reward_min", "rollout_tokens", "rollout_sha256",
             "rollout_step_sha256", "rollout_step_rewards",
+            "rollout_step_tokens",
             "initial_parameter_sha256", "parameter_sha256",
             "parameter_count", "parameter_sum", "parameter_abs_sum",
             "parameter_l2", "parameter_max_abs",
             "model_output_sha256", "model_output_sum", "model_output_l2",
             "dataset_sha256", "cpu_rng_sha256", "cuda_rng_sha256",
             "final_cpu_rng_sha256", "final_cuda_rng_sha256",
+            "trainer_init_s", "trainer_train_s", "reward_step_elapsed_s",
             "trainable_grad_tensors",
             "bf16_supported", "device_capability", "model_dtype", "model_snapshot",
             "compile_cache_scoped", "trainable_dtypes",
@@ -373,6 +391,10 @@ rec = {
   "workload_md5": __import__("os").environ.get("WORKLOAD_MD5_RECORD"),
   "cold_cache": bool(int(cold)),
   "mps_mode": __import__("os").environ.get("MPS_MODE_RECORD", "off"),
+  "native_reference_warmup": __import__("os").environ.get(
+      "NATIVE_REFERENCE_WARMUP", "0"
+  ) == "1",
+  "grpo_warm_steps": int(__import__("os").environ.get("GRPO_WARM_STEPS", "1")),
   "cuda_mps_pipe_directory": __import__("os").environ.get(
       "CUDA_MPS_PIPE_DIRECTORY"
   ),

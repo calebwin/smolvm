@@ -38,6 +38,7 @@ FORK = os.environ.get("FORK", "0") == "1"
 LID = os.environ.get("LEARNER_ID", "0")
 OUTBASE = os.environ.get("OUTBASE", "/root")
 QUEUE_JOBS = int(os.environ.get("QUEUE_JOBS", "0"))
+GRPO_WARM_STEPS = int(os.environ.get("GRPO_WARM_STEPS", "1"))
 
 # Never let one native arm inherit Inductor/Unsloth artifacts from an earlier
 # benchmark while a new VM starts from its clean overlay. The golden builds its
@@ -114,6 +115,7 @@ model_runtime = {
     "model_dtype": str(model.dtype),
     "model_snapshot": os.path.basename(MODEL.rstrip("/")),
     "compile_cache_scoped": True,
+    "grpo_warm_steps": GRPO_WARM_STEPS,
     "trainable_dtypes": trainable_dtypes,
 }
 
@@ -292,13 +294,19 @@ def run_grpo(lid, steps, warm_only=False):
     rollout_digest = hashlib.sha256()
     rollout_step_sha256 = []
     rollout_step_rewards = []
+    rollout_step_tokens = []
     rollout_tokens = 0
     reward_values = []
+    train_call_started = None
+    reward_step_elapsed_s = []
 
     def arithmetic_reward(completions, answer, **_kwargs):
         nonlocal rollout_tokens
+        if train_call_started is not None:
+            reward_step_elapsed_s.append(round(time.time() - train_call_started, 6))
         rewards = []
         step_digest = hashlib.sha256()
+        step_tokens = 0
         for completion, expected in zip(completions, answer):
             # Conversational datasets may return a one-message completion.
             if isinstance(completion, list):
@@ -310,9 +318,9 @@ def run_grpo(lid, steps, warm_only=False):
             step_digest.update(struct.pack("<I", len(completion.encode())))
             step_digest.update(completion.encode())
             step_digest.update(b"\0" + str(expected).encode() + b"\0")
-            rollout_tokens += len(
-                tokenizer.encode(completion, add_special_tokens=False)
-            )
+            completion_tokens = len(tokenizer.encode(completion, add_special_tokens=False))
+            rollout_tokens += completion_tokens
+            step_tokens += completion_tokens
             match = re.search(r"-?\d+", completion)
             if match is None:
                 reward = 0.0
@@ -325,6 +333,7 @@ def run_grpo(lid, steps, warm_only=False):
             reward_values.append(reward)
         rollout_step_sha256.append(step_digest.hexdigest())
         rollout_step_rewards.append(round(sum(rewards) / max(1, len(rewards)), 9))
+        rollout_step_tokens.append(step_tokens)
         return rewards
 
     config = GRPOConfig(
@@ -351,6 +360,7 @@ def run_grpo(lid, steps, warm_only=False):
         save_strategy="no",
     )
     FastLanguageModel.for_training(model)
+    trainer_init_started = time.time()
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=arithmetic_reward,
@@ -358,6 +368,7 @@ def run_grpo(lid, steps, warm_only=False):
         train_dataset=dataset,
         processing_class=tokenizer,
     )
+    trainer_init_s = time.time() - trainer_init_started
     if os.environ.get("GRPO_DTYPE_PROBE", "0") == "1":
         record = {
             "event": "trainer",
@@ -368,7 +379,9 @@ def run_grpo(lid, steps, warm_only=False):
         }
         with open(f"{COORD}/grpo_dtype_{os.getpid()}.jsonl", "a") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
+    train_call_started = time.time()
     result = trainer.train()
+    trainer_train_s = time.time() - train_call_started
     final_cpu_rng_sha256 = hashlib.sha256(
         torch.get_rng_state().numpy().tobytes()
     ).hexdigest()
@@ -386,18 +399,22 @@ def run_grpo(lid, steps, warm_only=False):
         "rollout_sha256": rollout_digest.hexdigest(),
         "rollout_step_sha256": rollout_step_sha256,
         "rollout_step_rewards": rollout_step_rewards,
+        "rollout_step_tokens": rollout_step_tokens,
         "rollout_tokens": rollout_tokens,
         "dataset_sha256": dataset_sha256,
         "cpu_rng_sha256": cpu_rng_sha256,
         "cuda_rng_sha256": cuda_rng_sha256,
         "final_cpu_rng_sha256": final_cpu_rng_sha256,
         "final_cuda_rng_sha256": final_cuda_rng_sha256,
+        "trainer_init_s": trainer_init_s,
+        "trainer_train_s": trainer_train_s,
+        "reward_step_elapsed_s": reward_step_elapsed_s,
     }
 
 
 if FORK or QUEUE_JOBS or os.environ.get("NATIVE_REFERENCE_WARMUP", "0") == "1":
     before_warm = trainable_fingerprint()
-    run_grpo("warm", 1, warm_only=True)
+    run_grpo("warm", GRPO_WARM_STEPS, warm_only=True)
     torch.cuda.synchronize()
     after_warm = trainable_fingerprint()
     if before_warm["parameter_sha256"] != after_warm["parameter_sha256"]:
@@ -463,6 +480,7 @@ def run_one_learner(lid):
         rollout_sha256=training["rollout_sha256"],
         rollout_step_sha256=training["rollout_step_sha256"],
         rollout_step_rewards=training["rollout_step_rewards"],
+        rollout_step_tokens=training["rollout_step_tokens"],
         peak_gb=round(peak_gb, 2),
         initial_parameter_sha256=initial_parameters["parameter_sha256"],
         parameter_sha256=parameters["parameter_sha256"],
@@ -476,6 +494,9 @@ def run_one_learner(lid):
         cuda_rng_sha256=training["cuda_rng_sha256"],
         final_cpu_rng_sha256=training["final_cpu_rng_sha256"],
         final_cuda_rng_sha256=training["final_cuda_rng_sha256"],
+        trainer_init_s=round(training["trainer_init_s"], 6),
+        trainer_train_s=round(training["trainer_train_s"], 6),
+        reward_step_elapsed_s=training["reward_step_elapsed_s"],
         **model_runtime,
     )
     print(

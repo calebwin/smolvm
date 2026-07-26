@@ -47,6 +47,9 @@ $T/smolvm-cuda-run --proto-hash > $R/proto-hash
 
 ## Running
 
+For a fresh H100, start with [REPRODUCE_GRPO.md](REPRODUCE_GRPO.md); it pins and
+builds both environments, then produces the complete native/MPS/fork comparison.
+
 ```sh
 ./bench.sh --arm native --n 4 --steps 20 --cpus 4
 ./bench.sh --arm fork   --n 4 --steps 20 --cpus 4 --share on
