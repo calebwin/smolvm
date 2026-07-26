@@ -335,12 +335,17 @@ for f in sorted(glob.glob(f"{co}/learner_*.jsonl")):
         learners.append({k: z.get(k) for k in (
             "lid", "method", "tok_s", "examples_s", "train_s", "step_ms",
             "loss0", "lossN", "reward0", "rewardN", "peak_gb",
+            "reward_max", "reward_min", "rollout_tokens", "rollout_sha256",
+            "rollout_step_sha256", "rollout_step_rewards",
             "initial_parameter_sha256", "parameter_sha256",
             "parameter_count", "parameter_sum", "parameter_abs_sum",
             "parameter_l2", "parameter_max_abs",
             "model_output_sha256", "model_output_sum", "model_output_l2",
             "dataset_sha256", "cpu_rng_sha256", "cuda_rng_sha256",
+            "final_cpu_rng_sha256", "final_cuda_rng_sha256",
             "trainable_grad_tensors",
+            "bf16_supported", "device_capability", "model_dtype", "model_snapshot",
+            "compile_cache_scoped", "trainable_dtypes",
         ) if z.get(k) is not None})
 rec = {
   "arm": arm, "n": int(n), "steps": int(steps), "cpus_per_learner": int(cpus),

@@ -14,6 +14,13 @@ fixes pass real SFT, while exact model-output, RNG, loss, and 40.4-million-param
 digests match fair native controls. SFT remains below native throughput, so this is a
 correctness/reliability candidate rather than a new performance claim (§7).
 
+Unsloth + TRL GRPO is now qualified as a third real workload on Qwen2.5-7B. It
+completes at N=1 and N=4 with exact frozen-policy, initial-state, reward, and RNG
+checks. A two-step pair is byte-exact through the final 40.4-million-value adapter;
+longer stochastic runs show small, bounded remoted numerical variation in sampled
+text while retaining identical reward sequences and final RNG states. GRPO obtains
+the density benefit but does not yet approach native throughput (§7).
+
 ## 1. TL;DR
 
 - The fork pool is now **production-safe for density**: weight sharing was silently
@@ -34,6 +41,14 @@ correctness/reliability candidate rather than a new performance claim (§7).
   exactly. This found and fixed blind cross-process worker attachment, missing
   proc-mem metadata on late attachment, ambiguous tokenless routing, and a broken
   all-private kill switch (§7).
+- **Real Unsloth GRPO is compatible and density-qualified, not throughput-qualified.**
+  The 7B N=4 gate completes 4/4 with 14,515 MiB peak versus native's 29,762 MiB
+  (51.2% less). A two-step N=1 pair has identical rollout bytes and final adapter;
+  at four steps, all reward/RNG sequences match but sampled text can cross a nearby
+  numerical boundary and final adapter bytes need not remain identical. The final
+  cache-scoped N=1 four-step phase takes 56.71 s versus 14.08 s native. An explicit
+  BF16 environment contract is currently required by the installed Unsloth GRPO
+  implementation (§7).
 - **Synthetic explicit CUDA graphs remain fast through the boundary**, but the real
   installed Unsloth training path is not graphable today. A K=500 graph measures
   1.241 µs/op versus native's 1.224, yet forced Inductor graphs contained one op each,
@@ -591,6 +606,45 @@ native adds about 0.459 s/step and the fork about 0.671 s/step (~46% steady tax)
 roughly 14 s additional post-fork fixed cost. This is consistent with a small-op eager
 path remaining materially more latency-sensitive than DPO's N=8 saturation point.
 
+#### SFT parity opportunities and next validation gate
+
+The existing SFT measurements do not yet answer whether smolvm can match **aggregate**
+native throughput at a realistic concurrency and run length. The steady measurement is
+N=1 for 50 steps, while the only N=4 correctness pair runs for two steps and is
+dominated by startup. DPO reached parity only at N=8 under managed MPS, so generalizing
+the short SFT result in either direction would be premature.
+
+The 10→50-step fit also bounds what startup work alone can achieve. Removing the
+entire ~14 s fork intercept would leave approximately 0.671 s/step versus native's
+0.459 s/step: about 68% of native asymptotically. Startup/reconstruction work is worth
+reducing, especially for short jobs, but it cannot by itself produce N=1 parity.
+
+The next pure-smolvm SFT work is therefore ordered as follows:
+
+1. Run source-identical, exact-state-checked SFT for at least 200 steps at N=1, N=4,
+   and N=8 under the existing uncapped managed-MPS policy. Report both aggregate and
+   per-learner throughput; compare only synchronized, same-build pairs. This is the
+   missing test of whether density plus scheduling reaches aggregate parity as it did
+   for DPO.
+2. Collect an SFT-specific operation census and guest/daemon timing profile over the
+   post-warm steady interval. The current ~0.212 s/step residual is consistent with an
+   eager small-operation tax, but its exact SFT call classes have not yet been
+   attributed and must not be inferred solely from DPO.
+3. Phase-time the ~14 s post-fork intercept (worker reconstruction, framework/trainer
+   setup, optimizer state, and first-use library work) and optimize only a component
+   with a measured end-to-end contribution. The live-Trainer snapshot remains an
+   upper-bound diagnostic, not a workload requirement.
+4. If long N=4/N=8 SFT remains below native after those bounded fixes, require an
+   explicit architecture decision for single-context/multi-stream execution with
+   per-clone address translation. This is the principal remaining workload-transparent
+   design lever, but it is unvalidated and changes the isolation model.
+
+These gates distinguish two product claims: aggregate parity may still be attainable
+transparently through concurrency and MPS; per-learner/N=1 parity is not currently
+demonstrated and likely needs the architecture work above or a future capture-safe
+framework path. The installed Unsloth backward remains non-capturable, so graph
+integration is not counted as a transparent near-term SFT opportunity.
+
 The strongest remaining transparent alternate explanation is rejected. The daemon's
 documented `SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0` kill switch was being overwritten by the
 fork preamble; the candidate now keeps explicit `0` authoritative and the harness
@@ -612,6 +666,107 @@ Additional fail-safe behavior is now explicit:
   hit CUDA status 710 and completed 0/1, whereas managed MPS arms are clean. This is
   recorded as a compatibility boundary, not generalized into a new performance
   claim.
+
+### Real Unsloth GRPO qualification
+
+The third workload uses Unsloth 2026.7.3, TRL 0.24.0, Transformers 4.57.6, and
+Qwen2.5-7B 4-bit LoRA. It performs genuine sampled GRPO updates on a deterministic
+arithmetic dataset with four completions per prompt and a dense correctness reward.
+`bench/workload_grpo.py` records the model revision and fixed frozen-policy output,
+initial/final hashes and norms for all 40,370,176 trainable values, dataset and
+CPU/CUDA RNG hashes, per-step rollout hashes/rewards, final RNG hashes, and actual
+generated-token throughput. The native and fork arms execute the same file.
+
+#### Installed-framework precision contract
+
+The first golden failed before forking in Unsloth's fused LoRA forward:
+
+`self and mat2 must have the same dtype, but got Half and Float`
+
+The diagnostic established all of the following instead of attributing it to CUDA
+remoting:
+
+- the VM reports H100 capability 9.0 and BF16 support correctly;
+- `GRPOConfig` and Accelerator both report BF16, and the first fused-LoRA call has
+  BF16 activations/autocast plus FP32 adapters in both native and VM;
+- a later generated GRPO-loss region silently selects FP16 because installed Unsloth
+  reads `ACCELERATE_MIXED_PRECISION` and defaults it to `fp16`, independently of
+  `GRPOConfig(bf16=True)`;
+- `UNSLOTH_COMPILE_DISABLE=1` fails identically, so this is not an Inductor-only bug.
+
+The qualification workload now sets `ACCELERATE_MIXED_PRECISION=bf16` before importing
+Unsloth and explicitly loads the quantized policy with BF16 compute, matching its
+declared trainer configuration in both arms. This is an installed-framework/runtime
+contract, not a smolvm-only mathematical workaround. It does mean arbitrary GRPO
+workloads that request BF16 only through `GRPOConfig` are **not yet transparently
+compatible** with this exact installed stack; smolvm must not claim otherwise or
+inject a framework-specific variable silently.
+
+#### Correctness, stochastic equivalence, and density
+
+The first Qwen2.5-7B N=1, two-step fair pair passed the strongest exact gate:
+
+| arm | measured train | peak GPU memory | rollout | final adapter |
+|---|---:|---:|---|---|
+| native | 11.55 s | 7,443 MiB | reference | reference |
+| fork + managed MPS | 27.52 s | 9,406 MiB | byte-identical | byte-identical |
+
+The model snapshot, frozen-policy output, initial adapter, dataset, initial CPU/CUDA
+RNG, rewards, sampled completion bytes, and final adapter SHA-256 all match. The clone
+reports `shared=260 private=162` and no daemon operation errors.
+
+Longer stochastic execution requires a more appropriate equivalence rule than blindly
+requiring byte-identical sampled text forever. In the final-source, compiler-cache-
+scoped four-step N=1 pair:
+
+- rollout steps 1, 2, and 4 match byte-for-byte; step 3 samples different text with
+  the same reward;
+- every per-step reward and both final CPU/CUDA RNG hashes match;
+- adapter L2 is 32.329819064 native versus 32.329778662 fork (about 1.25 ppm apart),
+  though final adapter SHA-256 differs;
+- native under its own private external MPS controller remains byte-identical to
+  ordinary native, so MPS does not explain the difference.
+
+The N=4 gate completes 4/4 in both arms. Every learner matches its native model output,
+initial state, reward sequence, and final RNG state; two learners retain exact rollout
+and final-adapter bytes, while two cross sampled-text boundaries during training. The
+density result is material:
+
+| arm | completion | aggregate rollout tok/s | peak GPU memory |
+|---|---:|---:|---:|
+| native | 4/4 | 28 | 29,762 MiB |
+| fork + managed MPS | 4/4 | 9 | **14,515 MiB** |
+
+That is 51.2% less peak memory. The short four-step throughput is directional only:
+this N=4 pair predates explicit per-run compiler-cache scoping and is dominated by
+trainer/compile setup, so it is not a steady-state ratio.
+
+An all-private N=1 control positively reports `shared=0 private=422`, takes 56.82 s
+versus the final shared control's 56.71 s, and increases peak memory from 9,408 to
+14,608 MiB. Its rollout sequence and final adapter match the shared control exactly.
+Imported read-only weights therefore cause neither the GRPO throughput gap nor the
+observed numerical boundary crossing.
+
+#### GRPO performance verdict and next gate
+
+GRPO compatibility and density are **go**, but native-parity performance is **not
+demonstrated**. The final byte-identical workload and per-run cache policy measure an
+N=1 four-step phase of 14.08 s native versus 56.71 s fork. An earlier 10-step pair is
+retained only as correctness evidence: native fell from 63.86 to 33.76 s on an
+artifact-reusing repeat while a new VM began from a clean overlay, so using 98.82 s
+fork against either number would be an invalid performance ratio.
+
+Before changing GRPO or proposing a new optimization:
+
+1. run long N=4 and N=8 pairs with the final per-run compiler-cache isolation;
+2. record aggregate and per-learner rates separately from golden load/compilation;
+3. compare adapter deltas with a defined numeric tolerance and reward distributions,
+   while retaining exact RNG and per-step rollout evidence;
+4. collect a GRPO-specific steady operation/timing census if the long pair remains
+   below native.
+
+The durable machine-readable evidence and exclusions are in
+`bench/results/grpo-h100-20260726.json`.
 
 ### Remaining pure-smolvm questions
 
@@ -643,6 +798,11 @@ untested transport tweak:
    must not be generalized to every training method. The remaining transparent
    architectural lever is the explicitly undecided single-context/per-clone-address-
    translation design; the current Unsloth backward remains non-capturable.
+6. **Treat GRPO parity as independently open.** Qwen2.5-7B completes at N=1/N=4 and
+   retains exact rewards/RNG with bounded sampled-trajectory variation, but the final
+   short N=1 phase is 56.71 versus 14.08 s and the N=4 result is startup-dominated.
+   Run the long cache-scoped concurrency gate before attributing its residual to the
+   same operation mix as SFT or DPO.
 
 ### Unchanged-source runtime activation (category 2, diagnostic only)
 
@@ -770,6 +930,8 @@ legacy shared-context mode cannot validate it.
 Branch: `cuda-graph-capture-investigation`, forked from `a31810e` and merged with
 `origin/main` through `4ba25f7`. The SFT qualification/fork-safety change described
 below passed its final local and H100 release gates on immutable binary `18d33faa…`.
+The GRPO qualification reuses that same binary and changes only benchmark and
+documentation artifacts.
 
 The investigation and validation work is preserved in the following commits and at
 the current branch tip:
@@ -785,7 +947,8 @@ the current branch tip:
 | `0c98808` | MPS scaling/lifecycle/cap findings, durable result summary, and clone-RAM/sync diagnostics |
 | `5201032` | managed-MPS implementation, immutable-candidate parity result, and real-DPO graph no-go |
 | `55cf22d` | release qualification, owned-path cleanup/collision hardening, and fail-loud fork benchmark retries |
-| current change | multi-process lineage routing; atomic late-attach live-RAM metadata; fail-closed tokenless routing; sharing kill-switch fix; generalized real-workload harness; SFT qualification and in-Trainer placement probe |
+| `900414c` | multi-process lineage routing; atomic late-attach live-RAM metadata; fail-closed tokenless routing; sharing kill-switch fix; generalized real-workload harness; SFT qualification and in-Trainer placement probe |
+| current change | real Qwen2.5-7B GRPO qualification, precision-contract diagnosis, exact stochastic-state checks, density/performance controls, and the SFT parity roadmap |
 
 The latest validation files are:
 
@@ -802,10 +965,12 @@ The latest validation files are:
 | `bench/run_mps_matrix.sh` | private-controller, uncapped MPS versus ordinary-context paired harness with guaranteed cleanup |
 | `bench/results/mps-h100-20260725.json` | durable machine-readable MPS performance, correctness, cap, and lifecycle summary |
 | `bench/results/mps-managed-h100-20260726.json` | managed-candidate N=4/N=8/native comparison and compiler/explicit-graph verdicts |
-| `bench/bench.sh` | benchmark manifests record external/managed/off MPS mode; fork errors are retained/retried before synchronized release |
+| `bench/bench.sh` | benchmark manifests record external/managed/off MPS mode; fork errors are retained/retried before synchronized release; GRPO rollout/reward/RNG/model fields are retained |
 | `bench/workload_dpo.py` | opt-in forced-compiler and explicit fixed-region graph diagnostics |
 | `bench/workload_sft.py` | real Unsloth/TRL SFT qualification with exact adapter, model-output, dataset, and RNG fingerprints |
 | `bench/workload_sft_resume.py` | diagnostic fork-from-live-Trainer placement upper bound |
+| `bench/workload_grpo.py` | real sampled Unsloth/TRL GRPO qualification with exact model/adapter/RNG state and per-step rollout/reward fingerprints |
+| `bench/results/grpo-h100-20260726.json` | durable H100 GRPO precision, correctness, density, isolation-control, exclusion, and next-gate summary |
 | `src/cuda_daemon.rs` | managed private MPS policy, ownership supervisor, bounded path cleanup/collision refusal, fallback, and tests |
 | `src/main.rs` | hidden MPS supervisor process entry point |
 | `crates/smolvm-cuda/src/client.rs` | synchronous-call profiler now retains enough ranked classes to expose low-count barriers hidden by one-time module loads |
@@ -871,12 +1036,28 @@ Safety snapshots:
   Final immutable-candidate smokes are
   `fork_dpo_final_candidate_n1_s4_c2_20260726-055615_r1` and
   `fork_sft_final_candidate_n1_s2_c2_20260726-060007_r1`, both on binary
-  `18d33faae5fa996822e07cf1d407576f`.
+  `18d33faae5fa996822e07cf1d407576f`. Real-GRPO evidence uses that same binary.
+  The BF16 precision-contract failures are
+  `fork_grpo_05b_bf16_fork_n1_s1_c2_20260726-062321_r1` and
+  `fork_grpo_05b_nocompile_fork_n1_s1_c2_20260726-062640_r1`; dtype probes are
+  `native_grpo_dtype_native_n1_s1_c2_20260726-063046_r1` and
+  `fork_grpo_dtype_error_fork_n1_s1_c2_20260726-063756_r1`. The exact N=1
+  two-step pair is `native_grpo_7b_ref_n1_s2_c2_20260726-064646_r1` /
+  `fork_grpo_7b_fork_n1_s2_c2_20260726-064808_r1`. The final-source,
+  compiler-cache-scoped four-step pair is
+  `native_grpo_7b_scoped_ref_n1_s4_c2_20260726-072220_r1` /
+  `fork_grpo_7b_scoped_fork_n1_s4_c2_20260726-072309_r1`. The N=4 density gate is
+  `native_grpo_7b_n4_ref_n4_s4_c2_20260726-071458_r1` /
+  `fork_grpo_7b_n4_fork_n4_s4_c2_20260726-071610_r1`; native-MPS and all-private
+  controls are `native_grpo_7b_steps_native_mps_n1_s4_c2_20260726-070826_r1` and
+  `fork_grpo_7b_steps_private_n1_s4_c2_20260726-070958_r1`. Matching raw JSON is
+  under `~/bench/results/`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus
   `bench/results/mps-managed-h100-20260726.json` (durable prototype and managed
-  candidate summaries).
+  candidate summaries), and `bench/results/grpo-h100-20260726.json` (durable real
+  GRPO qualification and exclusions).
 - **Session memory** (cross-conversation continuity, not in this repo):
   `fork-vs-native-benchmark.md`, `cuda-fork-weight-sharing-fix.md`,
   `cuda-clone-procmem-transport.md`.

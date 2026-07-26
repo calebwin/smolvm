@@ -48,8 +48,20 @@ $T/smolvm-cuda-run --proto-hash > $R/proto-hash
 ```sh
 ./bench.sh --arm native --n 4 --steps 20 --cpus 4
 ./bench.sh --arm fork   --n 4 --steps 20 --cpus 4 --share on
+./bench.sh --arm native --n 4 --steps 200 --cpus 2 --batch 1 \
+  --workload workload_grpo.py --tag grpo-reference
+./bench.sh --arm fork --n 4 --steps 200 --cpus 2 --batch 1 \
+  --workload workload_grpo.py --tag grpo
 ./summarize.py                    # median + spread per (arm, N, batch), and the ratio
 ```
+
+`workload_grpo.py` is the real sampled-GRPO qualification workload. It records
+the frozen model and adapter state, per-step rollout/reward digests, final RNG
+state, and generated-token throughput. Its installed Unsloth 2026.7.3 stack
+requires `ACCELERATE_MIXED_PRECISION=bf16` to agree with
+`GRPOConfig(bf16=True)`; the workload establishes that contract before importing
+Unsloth in both arms. This is a framework requirement for this workload, not a
+smolvm-wide environment injection.
 
 Flags that exist because leaving them out produces misleading numbers:
 

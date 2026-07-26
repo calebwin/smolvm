@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "date_utc": "2026-07-26",
+  "host": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "driver": "570.148.08",
+    "host_cores": 26,
+    "torch": "2.7.0+cu126",
+    "transformers": "4.57.6",
+    "trl": "0.24.0",
+    "unsloth": "2026.7.3"
+  },
+  "candidate": {
+    "smolvm_version": "1.6.13",
+    "binary_md5": "18d33faae5fa996822e07cf1d407576f",
+    "benchmark_harness_md5": "10bf1a614d790f6de6c6b736b840ffbb",
+    "final_workload_md5": "48dc0de2ece8e4fbe670d04adcbe486c",
+    "model": "unsloth/Qwen2.5-7B-bnb-4bit",
+    "model_snapshot": "8664e5c8c25614048aec0b89415a5986053fde5c",
+    "mode": "per-clone workers with private managed uncapped NVIDIA MPS"
+  },
+  "framework_precision_contract": {
+    "initial_result": "golden GRPO warm step failed before fork with FP16/FP32 LoRA addmm mismatch",
+    "error": "self and mat2 must have the same dtype, but got Half and Float",
+    "diagnostic": "GRPOConfig and Accelerator reported BF16, but Unsloth's generated inner loss autocast defaulted to FP16 when ACCELERATE_MIXED_PRECISION was absent",
+    "compile_disabled_control": "same failure; not an Inductor-only problem",
+    "resolution": "set ACCELERATE_MIXED_PRECISION=bf16 before importing Unsloth, matching GRPOConfig(bf16=True) and the explicit BF16 model loader",
+    "classification": "installed-framework precision contract; required in both benchmark arms, not a fork-only numerical workaround",
+    "failed_runs": [
+      "/home/ubuntu/bench_run/fork_grpo_05b_bf16_fork_n1_s1_c2_20260726-062321_r1",
+      "/home/ubuntu/bench_run/fork_grpo_05b_nocompile_fork_n1_s1_c2_20260726-062640_r1"
+    ],
+    "dtype_probe_runs": [
+      "/home/ubuntu/bench_run/native_grpo_dtype_native_n1_s1_c2_20260726-063046_r1",
+      "/home/ubuntu/bench_run/fork_grpo_dtype_error_fork_n1_s1_c2_20260726-063756_r1"
+    ]
+  },
+  "n1_two_step_exact_pair": {
+    "native_result": "/home/ubuntu/bench/results/native_grpo_7b_ref_n1_s2_c2_20260726-064646_r1.json",
+    "fork_result": "/home/ubuntu/bench/results/fork_grpo_7b_fork_n1_s2_c2_20260726-064808_r1.json",
+    "native_train_s": 11.55,
+    "fork_train_s": 27.52,
+    "native_peak_gpu_mib": 7443,
+    "fork_peak_gpu_mib": 9406,
+    "shared_private_ranges": "260/162",
+    "exact_matches": [
+      "model snapshot and frozen-policy output",
+      "initial adapter",
+      "dataset and initial CPU/CUDA RNG",
+      "sampled rollout bytes",
+      "final 40,370,176-value adapter"
+    ],
+    "completion": "1/1 in both arms"
+  },
+  "final_source_n1_four_step_pair": {
+    "native_result": "/home/ubuntu/bench/results/native_grpo_7b_scoped_ref_n1_s4_c2_20260726-072220_r1.json",
+    "fork_result": "/home/ubuntu/bench/results/fork_grpo_7b_scoped_fork_n1_s4_c2_20260726-072309_r1.json",
+    "compiler_caches_scoped_per_run": true,
+    "native_train_s": 14.08,
+    "fork_train_s": 56.71,
+    "native_step_ms": 3520,
+    "fork_step_ms": 14177,
+    "native_peak_gpu_mib": 7441,
+    "fork_peak_gpu_mib": 9408,
+    "rollout_step_byte_matches": [true, true, false, true],
+    "rollout_step_rewards_match": true,
+    "initial_and_final_rng_match": true,
+    "native_parameter_l2": 32.329819064,
+    "fork_parameter_l2": 32.329778662,
+    "final_parameter_sha256_match": false,
+    "interpretation": "bounded remoted numeric variation changes a sampled string at one step but not its reward or RNG advancement; no evidence of state corruption"
+  },
+  "n4_four_step_gate": {
+    "native_result": "/home/ubuntu/bench/results/native_grpo_7b_n4_ref_n4_s4_c2_20260726-071458_r1.json",
+    "fork_result": "/home/ubuntu/bench/results/fork_grpo_7b_n4_fork_n4_s4_c2_20260726-071610_r1.json",
+    "completion": "4/4 in both arms",
+    "native_agg_rollout_tok_s": 28,
+    "fork_agg_rollout_tok_s": 9,
+    "native_peak_gpu_mib": 29762,
+    "fork_peak_gpu_mib": 14515,
+    "gpu_memory_reduction_percent": 51.23,
+    "exact_full_trajectory_and_final_adapter_learners": 2,
+    "learners_with_sampled_text_divergence": 2,
+    "reward_sequences_match_per_learner": "4/4",
+    "final_rng_states_match_per_learner": "4/4",
+    "daemon_operation_errors": 0,
+    "performance_qualification": "directional only; this pair predates per-run compiler-cache scoping and is too short to establish steady throughput"
+  },
+  "isolation_controls": {
+    "native_external_mps": {
+      "result": "/home/ubuntu/bench/results/native_grpo_7b_steps_native_mps_n1_s4_c2_20260726-070826_r1.json",
+      "verdict": "byte-identical to ordinary native; MPS does not explain the rollout difference"
+    },
+    "fork_all_private": {
+      "result": "/home/ubuntu/bench/results/fork_grpo_7b_steps_private_n1_s4_c2_20260726-070958_r1.json",
+      "sharing_verdict": "shared=0 private=422",
+      "train_s": 56.82,
+      "peak_gpu_mib": 14608,
+      "shared_control_train_s": 56.71,
+      "shared_control_peak_gpu_mib": 9408,
+      "rollout_and_final_adapter_match_shared_control": true,
+      "verdict": "imported read-only weights are neither the throughput limiter nor the numeric-variation cause"
+    }
+  },
+  "excluded_performance_observations": {
+    "n1_ten_step_native_first_train_s": 63.86,
+    "n1_ten_step_native_repeat_train_s": 33.76,
+    "n1_ten_step_fork_train_s": 98.82,
+    "reason": "the native repeat reused host compiler artifacts while a new VM golden started from a clean overlay; these runs remain correctness evidence but not a fair throughput ratio"
+  },
+  "verdict": {
+    "compatibility": "go with the explicit installed-framework BF16 precision contract",
+    "density": "go; N=4 uses 51.23% less peak GPU memory",
+    "correctness": "go for bounded stochastic training semantics; exact at two steps and exact rewards/RNG at longer gates, with small remoted numeric trajectory variation documented",
+    "throughput_parity": "not demonstrated",
+    "next_gate": "long source-identical N=4/N=8 pairs with per-run compiler caches, plus parameter-delta tolerance rather than an inappropriate bitwise requirement for sampled RL"
+  }
+}
