@@ -46,13 +46,15 @@ common=(
 )
 
 echo "CONTROL: MPS off"
-env -u CUDA_MPS_PIPE_DIRECTORY \
+env SMOLVM_CUDA_MPS=0 \
+    -u CUDA_MPS_PIPE_DIRECTORY \
     -u CUDA_MPS_LOG_DIRECTORY \
     -u CUDA_MPS_ACTIVE_THREAD_PERCENTAGE \
     "$BENCH_DIR/bench.sh" "${common[@]}"
 
 export CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE"
 export CUDA_MPS_LOG_DIRECTORY="$MPS_LOG"
+export SMOLVM_CUDA_MPS=0
 unset CUDA_MPS_ACTIVE_THREAD_PERCENTAGE
 nvidia-cuda-mps-control -d
 mps_started=1

@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "date_utc": "2026-07-26",
+  "host": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "driver": "570.148.08",
+    "host_cores": 26,
+    "torch": "2.7.0+cu126"
+  },
+  "candidate": {
+    "smolvm_version": "1.6.13",
+    "binary_md5": "e1d7b6d123b81fd1d3b41eea59d515fc",
+    "mode": "private managed uncapped NVIDIA MPS",
+    "policy": "automatic for SMOLVM_CUDA_FORK_WORKERS; SMOLVM_CUDA_MPS=0 disables",
+    "rollback_binary_md5": "ce03abdbac926d4bc8c48d03e9878bbc"
+  },
+  "lifecycle": {
+    "private_pipe": "/tmp/smolvm-mps-<uid>-<daemon-pid>",
+    "external_pipe_is_never_owned": true,
+    "daemon_sigterm_cleanup": "pass",
+    "controller_start_failure_fallback": "pass",
+    "pipe_cleanup": "pass",
+    "active_thread_percentage": "unset"
+  },
+  "managed_mps_runs": [
+    {
+      "result": "/home/ubuntu/bench/results/fork_n4_s50_c4_20260726-002110_r1.json",
+      "n": 4,
+      "steps": 50,
+      "vcpus_per_vm": 4,
+      "agg_tok_s": 15489,
+      "peak_gpu_mib": 16891,
+      "completion": "4/4",
+      "shared_private_ranges": "260/148",
+      "loss_endpoints": [
+        [0.6119, 0.0186],
+        [0.6126, 0.0167],
+        [0.6172, 0.0182],
+        [0.6188, 0.0209]
+      ]
+    },
+    {
+      "result": "/home/ubuntu/bench/results/fork_n8_s50_c4_20260726-002620_r1.json",
+      "n": 8,
+      "steps": 50,
+      "vcpus_per_vm": 2,
+      "agg_tok_s": 22088,
+      "peak_gpu_mib": 26281,
+      "completion": "8/8",
+      "shared_private_ranges": "260/148",
+      "per_learner_tok_s_range": [2680, 2924],
+      "loss_endpoints_match_native_per_learner": true
+    }
+  ],
+  "same_n_native_control": {
+    "result": "/home/ubuntu/bench/results/native_n8_s50_c2_20260726-003233_r1.json",
+    "n": 8,
+    "steps": 50,
+    "cpus_per_learner": 2,
+    "agg_tok_s": 21865,
+    "peak_gpu_mib": 60740,
+    "completion": "8/8"
+  },
+  "managed_mps_vs_native_n8": {
+    "throughput_delta_percent": 1.02,
+    "gpu_memory_reduction_percent": 56.73,
+    "gpu_memory_ratio_native_over_smolvm": 2.31,
+    "verdict": "same-N throughput parity/exceed gate passed"
+  },
+  "known_independent_reliability_observation": {
+    "run": "/home/ubuntu/bench_run/fork_n4_s50_c4_20260726-001437_r1",
+    "result": "3/4 clones existed and trained; bench-c0 was never created",
+    "attribution": "pre-existing high-fan-out clone-start issue, before CUDA/MPS execution"
+  },
+  "dpo_cuda_graph_probes": {
+    "forced_inductor_regional": {
+      "result": "/home/ubuntu/bench/results/fork_n1_s2_c4_20260726-003739_r1.json",
+      "capture_begin_end": 32,
+      "graph_instantiate": 32,
+      "graph_launch": 31,
+      "ops_per_graph": 1,
+      "clone_boundary_ops": 116382,
+      "eager_clone_boundary_ops": 116409,
+      "verdict": "no-go: real graphs, but no material coalescing"
+    },
+    "forced_fullgraph": {
+      "run": "/home/ubuntu/bench_run/fork_n1_s2_c4_20260726-004224_r1",
+      "error": "torch._dynamo.exc.Unsupported: PeftModel_fast_forward is intentionally marked skipped",
+      "graph_launch": 0,
+      "verdict": "no-go"
+    },
+    "explicit_training_region": {
+      "native_eager_control": "/home/ubuntu/bench_run/native_n1_s3_c4_20260726-010017_r1",
+      "preprocessing_blockers_moved_outside_capture": [
+        "trl.trainer.utils.flush_left GPU-to-host boolean decision",
+        "Transformers attention-mask torch.all GPU-to-host decision"
+      ],
+      "direct_forward_backward_capture": {
+        "run": "/home/ubuntu/bench_run/native_n1_s3_c4_20260726-005922_r1",
+        "region_time_s_eager": 0.936913,
+        "region_time_s_graph": 0.321035,
+        "result": "NaN on replay step 2; invalid"
+      },
+      "training_specific_graph_wrapper": {
+        "runs": [
+          "/home/ubuntu/bench_run/native_n1_s3_c4_20260726-010356_r1",
+          "/home/ubuntu/bench_run/native_n1_s3_c4_20260726-010504_r1",
+          "/home/ubuntu/bench_run/native_n1_s3_c4_20260726-010600_r1"
+        ],
+        "error": "CUDA operation would make the legacy stream depend on a capturing blocking stream",
+        "checkpointing_disabled": true,
+        "unsloth_compile_disabled_arm": true,
+        "verdict": "no-go for installed Unsloth backward path"
+      }
+    }
+  }
+}

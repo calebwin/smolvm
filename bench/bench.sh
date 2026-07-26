@@ -250,7 +250,14 @@ for rep in $(seq 1 "$REPS"); do
     WALL=$(echo "$T1 - $T0" | bc)
     GOLD=""; [[ -f "$CO/.t_golden" ]] && GOLD=$(echo "$(cat "$CO/.t_golden") - $T0" | bc)
     FORKED=""; [[ -f "$CO/.t_forked" ]] && FORKED=$(echo "$(cat "$CO/.t_forked") - $(cat "$CO/.t_golden")" | bc)
-    VCPU_RECORD="$VCPU" VMEM_RECORD="$VMEM" FW_RECORD="${BENCH_FORK_WORKERS:-1}" SHARE_RECORD="$SHARE" SHARED_RANGES="$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null | grep -o 'shared=[0-9]*' | tail -1 | cut -d= -f2)" BATCH_RECORD="$BATCH" MAXSEQ_RECORD="$MAXSEQ" ALLOC_CONF_RECORD="$ALLOC_CONF" SW_RECORD="${SMOLVM_CUDA_FORK_SHARE_WEIGHTS:-unset}" python3 - "$CO" "$RESULTS/$RUNID.json" "$ARM" "$N" "$STEPS" "$CPUS" "$COLD" "$WALL" "${GOLD:-null}" "${FORKED:-null}" "$(cat "$PEAK" 2>/dev/null || echo 0)" "$MF" <<'PY'
+    MPS_MODE_RECORD=off
+    if sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null \
+        | grep -q 'private uncapped NVIDIA MPS active'; then
+        MPS_MODE_RECORD=managed-uncapped
+    elif [[ -n "${CUDA_MPS_PIPE_DIRECTORY:-}" ]]; then
+        MPS_MODE_RECORD=external
+    fi
+    VCPU_RECORD="$VCPU" VMEM_RECORD="$VMEM" FW_RECORD="${BENCH_FORK_WORKERS:-1}" SHARE_RECORD="$SHARE" SHARED_RANGES="$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null | grep -o 'shared=[0-9]*' | tail -1 | cut -d= -f2)" BATCH_RECORD="$BATCH" MAXSEQ_RECORD="$MAXSEQ" ALLOC_CONF_RECORD="$ALLOC_CONF" SW_RECORD="${SMOLVM_CUDA_FORK_SHARE_WEIGHTS:-unset}" MPS_MODE_RECORD="$MPS_MODE_RECORD" python3 - "$CO" "$RESULTS/$RUNID.json" "$ARM" "$N" "$STEPS" "$CPUS" "$COLD" "$WALL" "${GOLD:-null}" "${FORKED:-null}" "$(cat "$PEAK" 2>/dev/null || echo 0)" "$MF" <<'PY'
 import sys, json, glob
 co, out, arm, n, steps, cpus, cold, wall, gold, forked, peak, mf = sys.argv[1:13]
 learners = []
@@ -264,6 +271,7 @@ for f in sorted(glob.glob(f"{co}/learner_*.jsonl")):
 rec = {
   "arm": arm, "n": int(n), "steps": int(steps), "cpus_per_learner": int(cpus),
   "cold_cache": bool(int(cold)),
+  "mps_mode": __import__("os").environ.get("MPS_MODE_RECORD", "off"),
   "cuda_mps_pipe_directory": __import__("os").environ.get(
       "CUDA_MPS_PIPE_DIRECTORY"
   ),
@@ -289,7 +297,7 @@ rec = {
   "env": json.loads(mf),
 }
 json.dump(rec, open(out, "w"), indent=2)
-print(f"  wall={rec['wall_s']}s done={rec['learners_done']}/{n} agg_tok_s={rec['agg_tok_s']} peak_gpu={rec['peak_gpu_mib']}MiB" + (f" golden_load={rec['golden_load_s']}s" if rec["golden_load_s"] else "") + (f" mps={rec['cuda_mps_active_thread_percentage'] or 'uncapped'}" if rec["cuda_mps_pipe_directory"] else " mps=off"))
+print(f"  wall={rec['wall_s']}s done={rec['learners_done']}/{n} agg_tok_s={rec['agg_tok_s']} peak_gpu={rec['peak_gpu_mib']}MiB" + (f" golden_load={rec['golden_load_s']}s" if rec["golden_load_s"] else "") + f" mps={rec['mps_mode']}")
 print(f"  -> {out}")
 PY
 done
