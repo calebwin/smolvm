@@ -198,7 +198,37 @@ PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
     [[ -f "$CO/golden_ready" ]] || { echo "GOLDEN-LOAD-FAILED"; return 1; }
     tgold=$(date +%s.%N); echo "$tgold" > "$CO/.t_golden"
     for c in $(seq 0 $((N-1))); do
-        $S machine fork --golden bench-g --name bench-c$c --share-weights >/dev/null 2>&1
+        # Fork startup has occasionally failed transiently under high fan-out.
+        # Never discard that failure and then wait the full learner timeout for
+        # a clone that does not exist. Retry an absent clone twice, retain every
+        # attempt's output, and fail the run before releasing `go` if it still
+        # cannot be created.
+        local fork_log="$CO/fork-c$c.log" fork_ok=0 attempt
+        : > "$fork_log"
+        for attempt in 1 2 3; do
+            echo "attempt $attempt" >> "$fork_log"
+            if $S machine fork --golden bench-g --name bench-c$c --share-weights \
+                >> "$fork_log" 2>&1; then
+                fork_ok=1
+                break
+            fi
+            # Do not retry over a partially created machine. Preserve it and
+            # fail so the product state can be inspected rather than hidden.
+            if $S machine list 2>/dev/null \
+                | awk -v name="bench-c$c" '$1 == name { found=1 } END { exit !found }'; then
+                echo "fork command failed but machine exists; refusing blind retry" >> "$fork_log"
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$fork_ok" != "1" ]]; then
+            echo "FORK-FAILED: bench-c$c (see $fork_log)"
+            tail -n 20 "$fork_log"
+            $S machine rm --name bench-g --cascade >/dev/null 2>&1
+            pkill -f "smolvm _cuda-daemo[n]" 2>/dev/null
+            pkill -f "_cuda-clone-worke[r]" 2>/dev/null
+            return 1
+        fi
     done
     echo "$(date +%s.%N)" > "$CO/.t_forked"
     touch "$CO/go"
@@ -210,6 +240,7 @@ PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
     check_share_mode "$CO"
     $S machine rm --name bench-g --cascade >/dev/null 2>&1
     pkill -f "smolvm _cuda-daemo[n]" 2>/dev/null; pkill -f "_cuda-clone-worke[r]" 2>/dev/null
+    return 0
 }
 
 # The daemon logs "M2: shared weight ranges shared=<n> private=<m>" per clone.
@@ -244,7 +275,11 @@ for rep in $(seq 1 "$REPS"); do
     sample_gpu "$PEAK" "$STOP" &
     SAMPLER=$!
     T0=$(date +%s.%N)
-    if [[ "$ARM" == "native" ]]; then run_native "$CO"; else run_fork "$CO"; fi
+    if [[ "$ARM" == "native" ]]; then
+        run_native "$CO" || { touch "$STOP"; wait "$SAMPLER" 2>/dev/null; exit 1; }
+    else
+        run_fork "$CO" || { touch "$STOP"; wait "$SAMPLER" 2>/dev/null; exit 1; }
+    fi
     T1=$(date +%s.%N)
     touch "$STOP"; wait $SAMPLER 2>/dev/null
     WALL=$(echo "$T1 - $T0" | bc)

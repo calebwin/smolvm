@@ -58,6 +58,57 @@ struct MpsOwnership {
     _lifecycle: UnixStream,
 }
 
+/// Remove only the controller artifacts that NVIDIA may create inside
+/// smolvm's private, PID-scoped directories. Directory removal is deliberately
+/// non-recursive: an unexpected entry is preserved instead of being deleted.
+#[cfg(target_os = "linux")]
+fn cleanup_private_mps_paths() {
+    if let Some(pipe) = std::env::var_os("CUDA_MPS_PIPE_DIRECTORY") {
+        let pipe = PathBuf::from(pipe);
+        for name in [
+            "control",
+            "control_privileged",
+            "control_lock",
+            "log",
+            "nvidia-cuda-mps-control.pid",
+        ] {
+            let _ = std::fs::remove_file(pipe.join(name));
+        }
+        let _ = std::fs::remove_dir(pipe);
+    }
+
+    if let Some(logs) = std::env::var_os("CUDA_MPS_LOG_DIRECTORY") {
+        let logs = PathBuf::from(logs);
+        for name in ["control.log", "server.log"] {
+            let _ = std::fs::remove_file(logs.join(name));
+        }
+        let _ = std::fs::remove_dir(logs);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_mps_paths(pipe: &Path, log_root: &Path, logs: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(log_root)?;
+
+    // Refuse a PID-path collision instead of adopting or cleaning an existing
+    // directory. That keeps the ownership guarantee true even after PID reuse.
+    std::fs::create_dir(pipe)?;
+    if let Err(e) = std::fs::create_dir(logs) {
+        let _ = std::fs::remove_dir(pipe);
+        return Err(e);
+    }
+
+    use std::os::unix::fs::PermissionsExt as _;
+    for dir in [pipe, logs] {
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            let _ = std::fs::remove_dir(logs);
+            let _ = std::fs::remove_dir(pipe);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Start a private, uncapped NVIDIA MPS controller before this process loads
 /// libcuda. Failure is deliberately non-fatal: with no live controller the
 /// NVIDIA driver uses ordinary contexts, which is the existing safe path.
@@ -88,17 +139,14 @@ fn start_managed_mps(sock: &Path) -> Option<MpsOwnership> {
         .unwrap_or_else(|| Path::new("/tmp"))
         .join("cuda-mps-logs");
     let log_dir = log_root.join(pid.to_string());
-    for dir in [&pipe_dir, &log_dir] {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(
-                path = %dir.display(),
-                error = %e,
-                "cuda-daemon: cannot create private MPS directory; using ordinary contexts"
-            );
-            return None;
-        }
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Err(e) = create_private_mps_paths(&pipe_dir, &log_root, &log_dir) {
+        tracing::warn!(
+            pipe = %pipe_dir.display(),
+            logs = %log_dir.display(),
+            error = %e,
+            "cuda-daemon: cannot create private MPS directories; using ordinary contexts"
+        );
+        return None;
     }
 
     // This is an internal daemon subcommand at single-threaded startup, before
@@ -114,6 +162,7 @@ fn start_managed_mps(sock: &Path) -> Option<MpsOwnership> {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(error = %e, "cuda-daemon: MPS lifecycle channel failed");
+            cleanup_private_mps_paths();
             unsafe {
                 std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
                 std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
@@ -130,6 +179,7 @@ fn start_managed_mps(sock: &Path) -> Option<MpsOwnership> {
         Ok(exe) => exe,
         Err(e) => {
             tracing::warn!(error = %e, "cuda-daemon: cannot locate MPS supervisor");
+            cleanup_private_mps_paths();
             unsafe {
                 std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
                 std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
@@ -161,6 +211,7 @@ fn start_managed_mps(sock: &Path) -> Option<MpsOwnership> {
             error = %e,
             "cuda-daemon: cannot spawn MPS supervisor; using ordinary contexts"
         );
+        cleanup_private_mps_paths();
         unsafe {
             std::env::remove_var("CUDA_MPS_PIPE_DIRECTORY");
             std::env::remove_var("CUDA_MPS_LOG_DIRECTORY");
@@ -211,6 +262,7 @@ pub fn run_mps_supervisor(fd: i32) -> io::Result<()> {
         .is_ok_and(|status| status.success());
     let _ = lifecycle.write_all(&[u8::from(started)]);
     if !started {
+        cleanup_private_mps_paths();
         return Ok(());
     }
 
@@ -229,15 +281,10 @@ pub fn run_mps_supervisor(fd: i32) -> io::Result<()> {
     }
     let _ = stop.wait();
 
-    // The NVIDIA controller leaves these three exact nodes behind even after a
-    // graceful quit. Remove only our private, PID-scoped directory contents.
-    if let Some(pipe) = std::env::var_os("CUDA_MPS_PIPE_DIRECTORY") {
-        let pipe = PathBuf::from(pipe);
-        for name in ["control", "control_privileged", "control_lock"] {
-            let _ = std::fs::remove_file(pipe.join(name));
-        }
-        let _ = std::fs::remove_dir(pipe);
-    }
+    // NVIDIA leaves control nodes behind after a graceful quit. It also keeps
+    // per-controller logs that would otherwise accumulate across daemon
+    // restarts, so reclaim both private PID-scoped directories.
+    cleanup_private_mps_paths();
     Ok(())
 }
 
@@ -2551,7 +2598,8 @@ impl Drop for FileLock {
 
 #[cfg(all(test, target_os = "linux"))]
 mod mps_tests {
-    use super::mps_enabled;
+    use super::{create_private_mps_paths, mps_enabled};
+    use std::io;
 
     #[test]
     fn mps_defaults_to_fork_worker_pools() {
@@ -2567,5 +2615,44 @@ mod mps_tests {
         for on in ["1", "on", "TRUE", " yes ", "force"] {
             assert!(mps_enabled(Some(on), false), "{on}");
         }
+    }
+
+    #[test]
+    fn private_mps_paths_are_new_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe = tmp.path().join("pipe");
+        let log_root = tmp.path().join("log-root");
+        let logs = log_root.join("123");
+
+        create_private_mps_paths(&pipe, &log_root, &logs).unwrap();
+
+        assert!(pipe.is_dir());
+        assert!(logs.is_dir());
+        assert_eq!(
+            std::fs::metadata(&pipe).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&logs).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn private_mps_path_collision_is_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pipe = tmp.path().join("pipe");
+        let log_root = tmp.path().join("log-root");
+        let logs = log_root.join("123");
+        std::fs::create_dir(&pipe).unwrap();
+        std::fs::write(pipe.join("owner-sentinel"), b"keep").unwrap();
+
+        let error = create_private_mps_paths(&pipe, &log_root, &logs).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(pipe.join("owner-sentinel")).unwrap(), b"keep");
+        assert!(!logs.exists());
     }
 }

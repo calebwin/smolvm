@@ -9,9 +9,12 @@
   },
   "candidate": {
     "smolvm_version": "1.6.13",
-    "binary_md5": "e1d7b6d123b81fd1d3b41eea59d515fc",
+    "binary_md5": "889f76f3d72d84f7e565154084902392",
     "mode": "private managed uncapped NVIDIA MPS",
     "policy": "automatic for SMOLVM_CUDA_FORK_WORKERS; SMOLVM_CUDA_MPS=0 disables",
+    "benchmark_harness_md5": "2366e46d48e98989118fef9400afeb85",
+    "workload_md5": "45f41578128a58173755940274ef2221",
+    "initial_validated_binary_md5": "e1d7b6d123b81fd1d3b41eea59d515fc",
     "rollback_binary_md5": "ce03abdbac926d4bc8c48d03e9878bbc"
   },
   "lifecycle": {
@@ -19,7 +22,12 @@
     "external_pipe_is_never_owned": true,
     "daemon_sigterm_cleanup": "pass",
     "controller_start_failure_fallback": "pass",
+    "controller_start_failure_cleanup": "pass",
+    "pid_path_collision_fallback": "pass",
+    "foreign_collision_sentinel_preserved": "pass",
+    "explicit_opt_out": "pass",
     "pipe_cleanup": "pass",
+    "pid_log_cleanup": "pass",
     "active_thread_percentage": "unset"
   },
   "managed_mps_runs": [
@@ -32,6 +40,7 @@
       "peak_gpu_mib": 16891,
       "completion": "4/4",
       "shared_private_ranges": "260/148",
+      "binary_md5": "e1d7b6d123b81fd1d3b41eea59d515fc",
       "loss_endpoints": [
         [0.6119, 0.0186],
         [0.6126, 0.0167],
@@ -49,6 +58,36 @@
       "completion": "8/8",
       "shared_private_ranges": "260/148",
       "per_learner_tok_s_range": [2680, 2924],
+      "binary_md5": "e1d7b6d123b81fd1d3b41eea59d515fc",
+      "loss_endpoints_match_native_per_learner": true
+    },
+    {
+      "result": "/home/ubuntu/bench/results/fork_n8_s50_c2_20260726-013610_r1.json",
+      "n": 8,
+      "steps": 50,
+      "vcpus_per_vm": 2,
+      "agg_tok_s": 23015,
+      "peak_gpu_mib": 26281,
+      "completion": "8/8",
+      "shared_private_ranges": "260/148",
+      "per_learner_tok_s_range": [2739, 2965],
+      "binary_md5": "b5fddf23a520ecd2cd4102637170e181",
+      "mps_clients": "daemon plus 8 clone workers",
+      "loss_endpoints_match_native_per_learner": true
+    },
+    {
+      "result": "/home/ubuntu/bench/results/fork_n8_s50_c2_20260726-020902_r1.json",
+      "n": 8,
+      "steps": 50,
+      "vcpus_per_vm": 2,
+      "agg_tok_s": 23195,
+      "peak_gpu_mib": 26281,
+      "completion": "8/8",
+      "shared_private_ranges": "260/148",
+      "per_learner_tok_s_range": [2826, 3026],
+      "binary_md5": "889f76f3d72d84f7e565154084902392",
+      "fork_attempts": "8 first attempts; no retries or errors",
+      "mps_clients": "daemon plus 8 clone workers",
       "loss_endpoints_match_native_per_learner": true
     }
   ],
@@ -62,16 +101,33 @@
     "completion": "8/8"
   },
   "managed_mps_vs_native_n8": {
-    "throughput_delta_percent": 1.02,
+    "qualified_managed_agg_tok_s": [22088, 23015, 23195],
+    "conservative_throughput_delta_percent": 1.02,
+    "final_candidate_throughput_delta_percent": 6.08,
     "gpu_memory_reduction_percent": 56.73,
     "gpu_memory_ratio_native_over_smolvm": 2.31,
-    "verdict": "same-N throughput parity/exceed gate passed"
+    "verdict": "same-N throughput parity/exceed gate passed on every qualified managed run"
   },
-  "known_independent_reliability_observation": {
-    "run": "/home/ubuntu/bench_run/fork_n4_s50_c4_20260726-001437_r1",
-    "result": "3/4 clones existed and trained; bench-c0 was never created",
-    "attribution": "pre-existing high-fan-out clone-start issue, before CUDA/MPS execution"
-  },
+  "qualification_incidents": [
+    {
+      "run": "/home/ubuntu/bench_run/fork_n4_s50_c4_20260726-001437_r1",
+      "result": "3/4 clones existed and trained; bench-c0 was never created",
+      "attribution": "pre-existing high-fan-out clone-start issue, before CUDA/MPS execution"
+    },
+    {
+      "run": "/home/ubuntu/bench_run/fork_n8_s50_c2_20260726-015002_r1",
+      "reported_agg_tok_s": 25848,
+      "verdict": "excluded: seven learners were released before the missing eighth clone was recovered, so concurrency was staggered",
+      "harness_fix": "retain per-clone fork output, retry only an absent clone, and fail before releasing the synchronized barrier"
+    },
+    {
+      "run": "/home/ubuntu/bench_run/fork_n8_s50_c2_20260726-020224_r1",
+      "raw_agg_tok_s": 22611,
+      "completion": "8/8 synchronized; exact losses; 8 first-attempt forks",
+      "verdict": "not used in the formal comparison because a cleanup pkill status prevented JSON emission",
+      "harness_fix": "run_fork now returns success explicitly after teardown"
+    }
+  ],
   "dpo_cuda_graph_probes": {
     "forced_inductor_regional": {
       "result": "/home/ubuntu/bench/results/fork_n1_s2_c4_20260726-003739_r1.json",

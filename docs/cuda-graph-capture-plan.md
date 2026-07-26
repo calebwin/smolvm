@@ -1,10 +1,11 @@
 # CUDA fork-pool throughput investigation & graph-capture plan
 
-Status: the transparent MPS optimization is implemented and validated on the H100.
-At the N=8 throughput point, managed smolvm is **1.0% faster than the fair same-N
-native control while using 56.7% less GPU memory**. Transparent daemon-side
-auto-capture remains a no-go, and the installed Unsloth DPO backward path is now also
-proven non-capturable by an explicit workload-level prototype (§6/§8).
+Status: the transparent MPS optimization is implemented and release-qualified on the
+H100. At the N=8 throughput point, the final managed-smolvm artifact is **6.1% faster
+than the fair same-N native control while using 56.7% less GPU memory**. All three
+qualified managed N=8 runs exceed native; the slowest is still +1.0%. Transparent
+daemon-side auto-capture remains a no-go, and the installed Unsloth DPO backward path
+is also proven non-capturable by an explicit workload-level prototype (§6/§8).
 
 ## 1. TL;DR
 
@@ -13,11 +14,12 @@ proven non-capturable by an explicit workload-level prototype (§6/§8).
   loudly in one clone instead of corrupting every sibling silently. Shipped in
   [#741](https://github.com/smol-machines/smolvm/pull/741) and
   [#742](https://github.com/smol-machines/smolvm/pull/742) (both merged).
-- **The same-N throughput target is reached at N=8.** The managed-MPS candidate
-  measured **22,088 tok/s** versus **21,865 tok/s native** with the same two CPU cores
-  per learner (+1.0%), while using **26,281 versus 60,740 MiB** of GPU memory
-  (56.7% less). All 8/8 learners completed and every learner's loss endpoints matched
-  native exactly (§5/§7).
+- **The same-N throughput target is reached at N=8 and survives repeat
+  qualification.** Managed artifacts measured **22,088, 23,015, and 23,195 tok/s**
+  versus **21,865 tok/s native** with the same two CPU cores per learner (+1.0% to
+  +6.1%), while using **26,281 versus 60,740 MiB** of GPU memory (56.7% less). Every
+  qualified run completed 8/8 and every learner's loss endpoints matched native
+  exactly (§5/§7).
 - **Synthetic explicit CUDA graphs remain fast through the boundary**, but the real
   installed Unsloth training path is not graphable today. A K=500 graph measures
   1.241 µs/op versus native's 1.224, yet forced Inductor graphs contained one op each,
@@ -49,16 +51,16 @@ proven non-capturable by an explicit workload-level prototype (§6/§8).
   illegal dependency from the legacy stream to the capture stream (§6/§8).
 - Managed uncapped MPS is now implemented below the workload: a private PID-scoped
   controller, ownership supervisor, crash/TERM cleanup, external-controller
-  non-ownership, explicit opt-out, and ordinary-context fallback. The deployed
-  candidate reproduced the earlier external-MPS N=4 result and passed N=8 against a
-  fair native control (§7).
+  non-ownership, explicit opt-out, and ordinary-context fallback. Release gates also
+  prove failed-start cleanup and preservation of a colliding foreign PID path. The
+  deployed candidate reproduced the earlier external-MPS N=4 result and repeatedly
+  passed N=8 against a fair native control (§7).
 - The old ~13.7k "hard ceiling" is superseded: the current paired N=8 control reached
   17,152 and uncapped MPS reached **22,597**. That directly validates multi-context
   scheduling as a material limiter. A full single-context/multi-stream redesign is now
   lower priority than productizing the much narrower MPS path (§5).
-- The investigation diagnostics and transparent transport results are committed on
-  the investigation branch; the latest MPS/lifecycle findings and clone-RAM tracing
-  are in the current working tree (§9).
+- The investigation diagnostics, transparent transport results, implementation, and
+  release evidence are preserved on the investigation branch (§9).
 
 ## 2. Shipped (merged)
 
@@ -198,21 +200,36 @@ the original sweep, despite matching its documented configuration. Therefore the
 same-build paired arms should be used for the MPS decision. MPS addresses inter-context
 scheduling; explicit graphs address the independent eager operation-issue tax.
 
-The implemented, ownership-managed candidate was then built and deployed as immutable
+The implemented, ownership-managed candidate was first built and deployed as immutable
 binary `e1d7b6d123b81fd1d3b41eea59d515fc`. Its N=4 confirmation measured **15,489
 tok/s**, within 0.04% of the prior best external-MPS arm (15,495), with 4/4 completion,
-`shared=260 private=148`, and the same four loss endpoints. At N=8 with two vCPUs per
-VM it measured:
+`shared=260 private=148`, and the same four loss endpoints. N=8 was then repeated
+across rebuilds and daemon/controller restarts:
 
-| arm (same candidate build) | aggregate tok/s | completion | peak GPU memory |
+| arm / immutable binary | aggregate tok/s | completion | peak GPU memory |
 |---|---:|---:|---:|
-| smolvm, managed uncapped MPS | **22,088** | 8/8 | **26,281 MiB** |
+| managed MPS, initial (`e1d7b6d1…`) | **22,088** | 8/8 | **26,281 MiB** |
+| managed MPS, post-main merge (`b5fddf23…`) | **23,015** | 8/8 | **26,281 MiB** |
+| managed MPS, final (`889f76f3…`) | **23,195** | 8/8 | **26,281 MiB** |
 | native, two CPU cores/learner | 21,865 | 8/8 | 60,740 MiB |
 
-This is **+1.0% throughput versus native at the same N and CPU allocation**, with
-**56.7% less GPU memory** (2.31x native/smolvm memory ratio). Per-learner native and
-smolvm loss endpoints match exactly. This is the first configuration that passes the
-stated parity/exceed target without changing the workload.
+The final artifact is **+6.1% throughput versus native at the same N and CPU
+allocation**; even the slowest qualified managed run is +1.0%. GPU memory is
+**56.7% lower** (2.31x native/smolvm memory ratio). Per-learner native and smolvm loss
+endpoints match exactly in every qualified run. The final run used byte-identical
+checked-in harness/workload files, all eight forks succeeded on their first recorded
+attempt, and live MPS control listed the daemon plus all eight workers under one
+server.
+
+Two qualification incidents are explicitly excluded from that comparison. In
+`fork_n8_s50_c2_20260726-015002_r1`, seven learners were released before a missing
+clone was manually recovered; its reported 25,848 tok/s is invalid because concurrency
+was staggered. The harness now retains each fork command's output, retries only when no
+partial machine exists, and fails before the synchronized release if creation still
+fails. In `fork_n8_s50_c2_20260726-020224_r1`, all eight first-attempt forks completed
+synchronously at 22,611 tok/s with exact losses, but a successful teardown's final
+`pkill` status prevented JSON emission; `run_fork` now returns success explicitly.
+Neither incident contributes to the qualified result set.
 
 The N=16 density pair (20 steps, so compared only within its pair) completed 16/16 and
 improved 12,552→14,915 tok/s (**+18.8%**) at essentially unchanged peak memory
@@ -423,21 +440,25 @@ This is now implemented for Linux/NVIDIA fork-worker pools:
 1. `SMOLVM_CUDA_FORK_WORKERS` enables a private uncapped controller automatically;
    `SMOLVM_CUDA_MPS=0` disables it and `SMOLVM_CUDA_MPS=1` explicitly enables it.
 2. The daemon creates a mode-0700, UID/daemon-PID-scoped pipe directory and a private
-   log directory before loading CUDA. Clone workers inherit the endpoint.
+   log directory before loading CUDA. Both must be newly created: a PID-path collision
+   falls back without adopting, deleting, or changing the existing path. Clone workers
+   inherit the endpoint.
 3. A hidden supervisor lives in a separate process group, owns the controller only
    when its start succeeds, watches a kernel lifecycle channel, and sends `quit` after
-   daemon EOF even for daemon crash/SIGKILL. Graceful TERM and pipe cleanup passed on
-   the H100.
+   daemon EOF even for daemon crash/SIGKILL. It removes only NVIDIA's known nodes and
+   the private PID log directory. Graceful TERM, pipe cleanup, and log cleanup passed
+   on the H100.
 4. An ambient `CUDA_MPS_PIPE_DIRECTORY` is treated as externally owned: smolvm uses it
    but never starts, stops, or removes it. Controller-start failure clears the private
-   environment and falls back to ordinary contexts.
+   environment, cleans the directories it created, and keeps the CUDA daemon available
+   on ordinary contexts.
 5. Active-thread percentage remains unset. The 33% native isolation failure proves
    that tuning is not generically transparent.
 
 The immutable-candidate confirmation and fair native comparison are recorded in §5
 and `bench/results/mps-managed-h100-20260726.json`.
 
-The first lifecycle/fallback probe is green:
+Lifecycle/fallback qualification is green:
 
 - a second controller start against the same private pipe directory fails explicitly
   with `An instance of this daemon is already running`;
@@ -446,11 +467,19 @@ The first lifecycle/fallback probe is green:
 - a real CUDA tensor operation succeeds with both a nonexistent controller directory
   and the stale post-crash directory, demonstrating ordinary CUDA fallback instead of
   a hang or initialization failure;
-- graceful `quit` removes both controller and server processes; all performance arms
-  also returned the GPU to 0 MiB.
+- forced controller-start failure leaves the daemon socket live, removes its private
+  PID pipe/log directories, and uses ordinary contexts;
+- a pre-existing daemon-PID pipe path causes fallback while its foreign sentinel
+  remains byte-identical;
+- `SMOLVM_CUDA_MPS=0` keeps the fork-worker daemon live without creating a controller
+  path;
+- an external controller remains queryable after the smolvm daemon exits and stops
+  only when the external owner sends `quit`;
+- graceful managed shutdown removes controller/server processes and its private
+  pipe/PID-log paths; all performance arms also returned the GPU to 0 MiB.
 
-The ownership supervisor and safe fallback described above are in the current
-candidate. No global/system-wide MPS controller is mutated.
+These gates were rerun on final immutable binary
+`889f76f3d72d84f7e565154084902392`. No global/system-wide MPS controller is mutated.
 
 ### Unchanged DPO operation census
 
@@ -483,18 +512,21 @@ ordered work can only move that wait to the next consumer.
 
 ### Remaining pure-smolvm questions
 
-The per-operation transport questions and the MPS policy/lifecycle gates are now
-bounded. The managed candidate reaches native throughput at N=8. Remaining work is
-therefore product hardening or a separate architecture project, not another untested
-transport tweak:
+The per-operation transport questions and MPS policy/lifecycle gates are now bounded.
+The managed candidate repeatedly exceeds native throughput at N=8. Remaining work is
+a separate architecture project or independent reliability follow-up, not another
+untested transport tweak:
 
-1. **Longer/repeated release qualification.** Repeat managed N=8 across process and
-   daemon restarts, and add a deterministic-algorithm numerical arm. The current
-   same-build N=8 endpoints match native exactly, while older repeated DPO controls
-   show that cross-run stochastic variation is possible.
-2. **Clone-start reliability.** One N=4 attempt created only 3/4 machines before any
-   CUDA/MPS work; the immediate retry was 4/4. Track this independently from the
-   performance feature.
+1. **Repeated release qualification is complete.** Three manifest-backed managed N=8
+   runs across rebuilds/controller restarts measured 22,088–23,195 tok/s, all 8/8 with
+   native-matching per-learner endpoints. The final binary also produced a separate
+   synchronized raw 22,611 tok/s run before the harness bookkeeping fix.
+2. **Track clone-start reliability independently.** One N=4 and one N=8 attempt
+   initially lacked a clone before CUDA/MPS work. The N=8 clone succeeded on explicit
+   retry, but the old harness had discarded the original error. It now logs every
+   attempt, retries only a wholly absent clone, and refuses to release the workload
+   barrier otherwise. Both final synchronized N=8 executions created all eight clones
+   on their first attempt.
 3. **Single-context/multi-stream redesign only by explicit decision.** It is the
    remaining architectural way to seek a higher ceiling below the workload, but it
    requires per-clone address translation and changes the isolation design. The legacy
@@ -547,14 +579,14 @@ Current cudart capture/instantiate/launch forwarding works in fresh isolated clo
 contexts and retains exact results in the synthetic graph probe. No clone graph fix is
 currently justified. Preserve the corrected reliability test as a regression.
 
-### Phase 2 — transparent MPS scheduling: **implemented, go**
+### Phase 2 — transparent MPS scheduling: **release-qualified, go**
 
 The private ownership-aware controller, supervisor, opt-out, external-controller
 non-ownership, uncapped policy, and ordinary-context fallback are implemented. H100
-lifecycle tests are green. The actual candidate reproduced N=4 and measured 22,088
-tok/s at N=8 versus 21,865 native with 56.7% less GPU memory. Preserve the N=8 arm as
-a release regression and add repeated restart/deterministic qualification before
-merging.
+lifecycle, failed-start cleanup, collision-preservation, and external-ownership tests
+are green. Managed N=8 measured 22,088–23,195 tok/s across three qualified runs versus
+21,865 native with 56.7% less GPU memory. Preserve the byte-pinned N=8 arm as a release
+regression; no workload change or injection is required.
 
 ### Phase 3 — actual DPO graphability prototype: **complete, no-go for current Unsloth**
 
@@ -614,7 +646,8 @@ legacy shared-context mode cannot validate it.
 
 ## 9. Current repo state
 
-Branch: `cuda-graph-capture-investigation`, based on `a31810e`.
+Branch: `cuda-graph-capture-investigation`, forked from `a31810e` and merged with
+`origin/main` through `4ba25f7`.
 
 The investigation and validation work is preserved in the following commits and at
 the current branch tip:
@@ -628,7 +661,8 @@ the current branch tip:
 | `75e12a1` | plan revised from graph placement, pointer, and clone-reliability results |
 | `4fb3f0b` | transparent transport/cache no-go results and operation-census tooling |
 | `0c98808` | MPS scaling/lifecycle/cap findings, durable result summary, and clone-RAM/sync diagnostics |
-| current change | managed-MPS implementation, immutable-candidate parity result, and real-DPO graph no-go |
+| `5201032` | managed-MPS implementation, immutable-candidate parity result, and real-DPO graph no-go |
+| current change | release qualification, owned-path cleanup/collision hardening, and fail-loud fork benchmark retries |
 
 The latest validation files are:
 
@@ -645,9 +679,9 @@ The latest validation files are:
 | `bench/run_mps_matrix.sh` | private-controller, uncapped MPS versus ordinary-context paired harness with guaranteed cleanup |
 | `bench/results/mps-h100-20260725.json` | durable machine-readable MPS performance, correctness, cap, and lifecycle summary |
 | `bench/results/mps-managed-h100-20260726.json` | managed-candidate N=4/N=8/native comparison and compiler/explicit-graph verdicts |
-| `bench/bench.sh` | benchmark manifests record external/managed/off MPS mode |
+| `bench/bench.sh` | benchmark manifests record external/managed/off MPS mode; fork errors are retained/retried before synchronized release |
 | `bench/workload_dpo.py` | opt-in forced-compiler and explicit fixed-region graph diagnostics |
-| `src/cuda_daemon.rs` | managed private MPS policy, ownership supervisor, fallback, and tests |
+| `src/cuda_daemon.rs` | managed private MPS policy, ownership supervisor, bounded path cleanup/collision refusal, fallback, and tests |
 | `src/main.rs` | hidden MPS supervisor process entry point |
 | `crates/smolvm-cuda/src/client.rs` | synchronous-call profiler now retains enough ranked classes to expose low-count barriers hidden by one-time module loads |
 | `src/cuda_host.rs` | opt-in clone-RAM advert trace that exposed the warm-dial/proc-mem ordering bug |
@@ -687,8 +721,12 @@ Safety snapshots:
   `~/bench/results/`; MPS controller/server logs are under the corresponding
   `/tmp/smolvm-mps-log-20260725-*` directories. Managed-candidate results are
   `fork_n4_s50_c4_20260726-002110_r1`,
-  `fork_n8_s50_c4_20260726-002620_r1`, and the fair native control
-  `native_n8_s50_c2_20260726-003233_r1`. The one-op forced-compiler graph run is
+  `fork_n8_s50_c4_20260726-002620_r1`,
+  `fork_n8_s50_c2_20260726-013610_r1`, and final release result
+  `fork_n8_s50_c2_20260726-020902_r1`; the fair native control is
+  `native_n8_s50_c2_20260726-003233_r1`. Excluded staggered qualification is under
+  `fork_n8_s50_c2_20260726-015002_r1`, and the synchronized raw-only harness-status
+  run is `fork_n8_s50_c2_20260726-020224_r1`. The one-op forced-compiler graph run is
   `fork_n1_s2_c4_20260726-003739_r1`; fullgraph rejection is in
   `fork_n1_s2_c4_20260726-004224_r1/g.err`; explicit graphability attempts are the
   native N=1 runs from `20260726-005207` through `20260726-010600`.
