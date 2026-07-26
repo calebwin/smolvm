@@ -7,6 +7,13 @@ qualified managed N=8 runs exceed native; the slowest is still +1.0%. Transparen
 daemon-side auto-capture remains a no-go, and the installed Unsloth DPO backward path
 is also proven non-capturable by an explicit workload-level prototype (§6/§8).
 
+Broader Unsloth SFT qualification is now complete at N=1 and N=4. It exposed two
+fork-safety bugs not exercised by DPO: a VM can contain several independent CUDA
+process lineages, and a late-attached channel needs the clone's live-RAM advert. Both
+fixes pass real SFT, while exact model-output, RNG, loss, and 40.4-million-parameter
+digests match fair native controls. SFT remains below native throughput, so this is a
+correctness/reliability candidate rather than a new performance claim (§7).
+
 ## 1. TL;DR
 
 - The fork pool is now **production-safe for density**: weight sharing was silently
@@ -20,6 +27,13 @@ is also proven non-capturable by an explicit workload-level prototype (§6/§8).
   +6.1%), while using **26,281 versus 60,740 MiB** of GPU memory (56.7% less). Every
   qualified run completed 8/8 and every learner's loss endpoints matched native
   exactly (§5/§7).
+- **Real Unsloth SFT is now a qualified second workload.** A normal N=4 fork run
+  completed 4/4 while correctly creating eight workers (trainer + preprocessing
+  lineage per clone), with no CUDA errors and 19,025 MiB peak versus native's 29,762
+  MiB. Every learner's final adapter digest and losses matched a fair native control
+  exactly. This found and fixed blind cross-process worker attachment, missing
+  proc-mem metadata on late attachment, ambiguous tokenless routing, and a broken
+  all-private kill switch (§7).
 - **Synthetic explicit CUDA graphs remain fast through the boundary**, but the real
   installed Unsloth training path is not graphable today. A K=500 graph measures
   1.241 µs/op versus native's 1.224, yet forced Inductor graphs contained one op each,
@@ -34,6 +48,13 @@ is also proven non-capturable by an explicit workload-level prototype (§6/§8).
   launch rate, 4 KiB records remove 1,126 blocking launches but regress DPO throughput,
   an exact TMA-descriptor cache hits ~89% without an end-to-end win, deferred VMM
   unmaps only move the wait, and direct clone-RAM copies regress throughput (§7).
+- **Weight sharing is not the SFT speed limiter.** A valid all-private in-Trainer
+  control measured 241 tok/s versus 246 shared while increasing peak VRAM from about
+  11.1 to 16.3 GiB. A later snapshot inside a live Trainer improves 10-step SFT
+  187→246 tok/s and 50-step SFT reaches 537 tok/s, but native remains 1,052/1,103.
+  Exact final adapter bytes match in every fair pair. The residual is a steady eager
+  execution/context cost, not reconstruction corruption or imported-weight access
+  (§7).
 - **NVIDIA MPS is the first validated workload-transparent speed lever.** At N=4,
   two 50-step controls measured 12,905 / 13,058 aggregate tok/s and two MPS runs
   measured 14,993 / 15,495: a **17.4% median gain**, 4/4 completion, the same
@@ -510,6 +531,88 @@ The deferred-unmap paired result above is the important interpretation: synchron
 wall time is not automatically removable wall time. A barrier that waits on required
 ordered work can only move that wait to the next consumer.
 
+### Real Unsloth SFT qualification and the remaining throughput gap
+
+The original release work used real Unsloth DPO. A second workload now exercises
+Unsloth + TRL `SFTTrainer`, Qwen2.5-7B 4-bit LoRA, the 8-bit AdamW optimizer,
+gradient checkpointing, dataset preprocessing, and multiple CUDA-using processes in
+one VM. `bench/workload_sft.py` runs unchanged in native and fork arms and records
+exact SHA-256 digests of all 40,370,176 trainable values plus deterministic CPU-side
+norms, dataset and RNG digests, loss endpoints, and throughput.
+
+The first real fork attempt found that the daemon assumed one CUDA process per VM.
+Unsloth preprocessing created a second process-scoped golden layout; the daemon
+attached the trainer to that worker, reconstructed zero maps, and crashed it. The
+candidate now attaches across lineage tokens only when both tokens refer to the same
+process-scoped `GoldenLayout`. A normal N=4 run subsequently created exactly eight
+workers (tokens 1 and 3 for each of four clone IDs) and completed cleanly:
+
+| arm | N | steps | aggregate tok/s | peak GPU memory | completion |
+|---|---:|---:|---:|---:|---:|
+| native, same one-step reference setup | 4 | 2 | **931** | 29,762 MiB | 4/4 |
+| smolvm fork + managed MPS | 4 | 2 | 143 | **19,025 MiB** | 4/4 |
+
+Every learner matched its same-LID native reference exactly: initial adapter digest,
+processed-dataset digest, CPU and CUDA RNG digests, both loss endpoints, final adapter
+digest, sum, absolute sum, and L2 norm. The weight-bearing worker reported
+`shared=260 private=169`; the preprocessing worker correctly had zero maps. The
+benchmark now records the maximum shared verdict instead of incorrectly reporting
+the zero-map worker that happened to log last.
+
+The same investigation found a second independent reliability bug. An eagerly
+spawned worker predates the real connection's `/proc/<pid>/mem` advert, so a
+late-attached channel lacked access to the clone's live COW RAM. The control channel
+now sends the accepted fd and proc-mem advert in one `SOCK_SEQPACKET` message. The
+first prototype retained a one-byte receive iovec and truncated every advert; an
+end-to-end fd+metadata test reproduced that exact live failure before the corrected
+version was deployed. On the H100, the corrected attach path reduced GPA-copy errors
+from 13 to zero and advanced to the expected read-only safety fault in an intentionally
+too-early snapshot. The ordinary warmed SFT and unchanged DPO regression both pass.
+
+Numerical equivalence required a fair control. Native without the golden's one-step
+safe-point setup produced a different, but deterministic, final adapter. The clone
+matched the golden exactly, and dataset/RNG/initial-adapter state matched native.
+When native executed the same setup, every checked field—including fixed model-output
+and final adapter SHA-256—matched the fork exactly. The apparent discrepancy was a
+control mismatch, not clone corruption.
+
+SFT performance does not yet match native:
+
+| placement | steps | native tok/s | fork tok/s | fork/native | exact final state |
+|---|---:|---:|---:|---:|---|
+| rebuild `SFTTrainer` after safe point | 10 | 741 | 187 | 25.2% | yes |
+| fork from callback inside live Trainer | 10 | 1,052 | 246 | 23.4% | yes |
+| fork from callback inside live Trainer | 50 | 1,103 | 537 | 48.7% | yes |
+
+The in-Trainer placement is a diagnostic upper-bound prototype, not a proposed
+source requirement. It removes a second Trainer construction and improves the
+10-step fork rate by 31.6%, but it does not close the steady gap. From 10→50 steps,
+native adds about 0.459 s/step and the fork about 0.671 s/step (~46% steady tax), with
+roughly 14 s additional post-fork fixed cost. This is consistent with a small-op eager
+path remaining materially more latency-sensitive than DPO's N=8 saturation point.
+
+The strongest remaining transparent alternate explanation is rejected. The daemon's
+documented `SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0` kill switch was being overwritten by the
+fork preamble; the candidate now keeps explicit `0` authoritative and the harness
+scopes that policy to the daemon/worker rather than the VM. A valid all-private
+10-step continuation completed at 241 tok/s versus 246 shared, with identical loss and
+final adapter SHA-256, while peak memory increased from about 11.1 to 16.3 GiB.
+Imported read-only weight mappings therefore buy density without causing the SFT
+throughput gap.
+
+Additional fail-safe behavior is now explicit:
+
+- a tokenless channel attaches only when exactly one live worker exists for the
+  clone; several workers make it fail closed instead of guessing a process;
+- malformed late-attach metadata closes the received fd rather than leaking it;
+- snapshotting before trainer setup remains unsupported without GPU-write COW: a
+  diagnostic no-warm arm correctly faults on a shared read-only base chunk rather
+  than silently corrupting siblings;
+- managed MPS is currently required for this SFT fork path: an N=1 no-MPS isolation
+  hit CUDA status 710 and completed 0/1, whereas managed MPS arms are clean. This is
+  recorded as a compatibility boundary, not generalized into a new performance
+  claim.
+
 ### Remaining pure-smolvm questions
 
 The per-operation transport questions and MPS policy/lifecycle gates are now bounded.
@@ -534,6 +637,12 @@ untested transport tweak:
 4. **No speculative barrier suppression.** Required D2H consumers, cheap stream sync,
    deferred-unmap equivalence, and slower direct proc-mem copies leave no proven
    safely removable material class.
+5. **Treat SFT parity as a new workload-specific performance project.** Correctness,
+   later snapshot placement, and sharing/private controls are closed. The 50-step
+   continuation still measures 537 versus 1,103 tok/s native, so DPO's N=8 parity
+   must not be generalized to every training method. The remaining transparent
+   architectural lever is the explicitly undecided single-context/per-clone-address-
+   translation design; the current Unsloth backward remains non-capturable.
 
 ### Unchanged-source runtime activation (category 2, diagnostic only)
 
@@ -587,6 +696,18 @@ lifecycle, failed-start cleanup, collision-preservation, and external-ownership 
 are green. Managed N=8 measured 22,088–23,195 tok/s across three qualified runs versus
 21,865 native with 56.7% less GPU memory. Preserve the byte-pinned N=8 arm as a release
 regression; no workload change or injection is required.
+
+### Phase 2b — multi-process fork routing and attachment: **candidate, go**
+
+Real Unsloth SFT exposed and now passes the process-lineage routing and live-RAM
+attachment fixes described in §7. Unit gates cover process lineage, atomic fd+advert
+delivery, tokenless ambiguity, and the sharing kill switch. H100 gates cover normal
+SFT at N=1/N=4, exact fair-native state, in-Trainer resume at 10/50 steps, private
+copy mode, and unchanged DPO regression. Final immutable binary
+`18d33faae5fa996822e07cf1d407576f` passed both final smokes: DPO 1/1 at 40 tok/s,
+`shared=260 private=160`, and SFT 1/1 at 45 tok/s with two correctly separated
+workers, `shared=260 private=169`, exact qualified adapter digest, and zero operation
+errors. Keep these changes separate from any claim that SFT throughput is solved.
 
 ### Phase 3 — actual DPO graphability prototype: **complete, no-go for current Unsloth**
 
@@ -647,7 +768,8 @@ legacy shared-context mode cannot validate it.
 ## 9. Current repo state
 
 Branch: `cuda-graph-capture-investigation`, forked from `a31810e` and merged with
-`origin/main` through `4ba25f7`.
+`origin/main` through `4ba25f7`. The SFT qualification/fork-safety change described
+below passed its final local and H100 release gates on immutable binary `18d33faa…`.
 
 The investigation and validation work is preserved in the following commits and at
 the current branch tip:
@@ -662,7 +784,8 @@ the current branch tip:
 | `4fb3f0b` | transparent transport/cache no-go results and operation-census tooling |
 | `0c98808` | MPS scaling/lifecycle/cap findings, durable result summary, and clone-RAM/sync diagnostics |
 | `5201032` | managed-MPS implementation, immutable-candidate parity result, and real-DPO graph no-go |
-| current change | release qualification, owned-path cleanup/collision hardening, and fail-loud fork benchmark retries |
+| `55cf22d` | release qualification, owned-path cleanup/collision hardening, and fail-loud fork benchmark retries |
+| current change | multi-process lineage routing; atomic late-attach live-RAM metadata; fail-closed tokenless routing; sharing kill-switch fix; generalized real-workload harness; SFT qualification and in-Trainer placement probe |
 
 The latest validation files are:
 
@@ -681,6 +804,8 @@ The latest validation files are:
 | `bench/results/mps-managed-h100-20260726.json` | managed-candidate N=4/N=8/native comparison and compiler/explicit-graph verdicts |
 | `bench/bench.sh` | benchmark manifests record external/managed/off MPS mode; fork errors are retained/retried before synchronized release |
 | `bench/workload_dpo.py` | opt-in forced-compiler and explicit fixed-region graph diagnostics |
+| `bench/workload_sft.py` | real Unsloth/TRL SFT qualification with exact adapter, model-output, dataset, and RNG fingerprints |
+| `bench/workload_sft_resume.py` | diagnostic fork-from-live-Trainer placement upper bound |
 | `src/cuda_daemon.rs` | managed private MPS policy, ownership supervisor, bounded path cleanup/collision refusal, fallback, and tests |
 | `src/main.rs` | hidden MPS supervisor process entry point |
 | `crates/smolvm-cuda/src/client.rs` | synchronous-call profiler now retains enough ranked classes to expose low-count barriers hidden by one-time module loads |
@@ -730,6 +855,23 @@ Safety snapshots:
   `fork_n1_s2_c4_20260726-003739_r1`; fullgraph rejection is in
   `fork_n1_s2_c4_20260726-004224_r1/g.err`; explicit graphability attempts are the
   native N=1 runs from `20260726-005207` through `20260726-010600`.
+  Real-SFT evidence is under `~/bench_run/` and matching `~/bench/results/`:
+  `native_sft_fingerprint_n1_s2_c2_20260726-042503_r1` plus its exact repeat,
+  `fork_sft_divergence_probe_n1_s2_c2_20260726-044117_r1` and fair control
+  `native_sft_reference_warmup_n1_s2_c2_20260726-044526_r1`, N=4 pair
+  `fork_sft_multilineage_n4_n4_s2_c2_20260726-044630_r1` /
+  `native_sft_multilineage_n4_reference_n4_s2_c2_20260726-045034_r1`, ordinary
+  10-step pair `native_sft_profile_reference_n1_s10_c2_20260726-045132_r1` /
+  `fork_sft_profile_n1_s10_c2_20260726-045207_r1`, live-Trainer 10-step pair
+  `native_sft_resume_reference_n1_s10_c2_20260726-045945_r1` /
+  `fork_sft_resume_n1_s10_c2_20260726-050018_r1`, live-Trainer 50-step pair
+  `native_sft_resume50_reference_n1_s50_c2_20260726-050401_r1` /
+  `fork_sft_resume50_n1_s50_c2_20260726-050452_r1`, and the valid all-private
+  gate `fork_sft_private_reconnect_probe_n1_s10_c2_20260726-054605_r1`.
+  Final immutable-candidate smokes are
+  `fork_dpo_final_candidate_n1_s4_c2_20260726-055615_r1` and
+  `fork_sft_final_candidate_n1_s2_c2_20260726-060007_r1`, both on binary
+  `18d33faae5fa996822e07cf1d407576f`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus

@@ -5,7 +5,7 @@
 #   fork   — one smolvm golden VM loads the base once, then N --share-weights
 #            clones, CUDA remoted to the host daemon
 #
-# Both arms run the identical workload file (workload_dpo.py) with identical
+# Both arms run the identical workload file (workload_dpo.py by default) with identical
 # STEPS/BATCH/MAXSEQ/MODEL/seed, and are measured identically (wall clock from
 # t0 to last learner done, 1 Hz nvidia-smi peak sampling, per-learner tok/s from
 # the workload's own JSONL). Results append to results/<run-id>.json.
@@ -21,9 +21,10 @@
 #
 # Usage: ./bench.sh --arm native|fork --n 4 [--steps 20] [--reps 3] [--cpus 4]
 #        [--cold] [--share on|off|default] [--batch 2] [--maxseq 256]
+#        [--workload workload_sft.py] [--tag sft]
 set -u
 
-ARM=""; N=4; STEPS=20; REPS=1; CPUS=4; COLD=0; BATCH=2; MAXSEQ=256; TIMEOUT=600; SHARE=default; VCPU=""; VMEM=""
+ARM=""; N=4; STEPS=20; REPS=1; CPUS=4; COLD=0; BATCH=2; MAXSEQ=256; TIMEOUT=600; SHARE=default; VCPU=""; VMEM=""; WORKLOAD_ARG=""; TAG_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arm) ARM="$2"; shift 2 ;;
@@ -35,6 +36,8 @@ while [[ $# -gt 0 ]]; do
         --batch) BATCH="$2"; shift 2 ;;
         --maxseq) MAXSEQ="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --workload) WORKLOAD_ARG="$2"; shift 2 ;;
+        --tag) TAG_ARG="$2"; shift 2 ;;
         # on|off|default — sets SMOLVM_CUDA_FORK_SHARE_WEIGHTS for the run and
         # VERIFIES the daemon actually honoured it (see check_share_mode).
         --share) SHARE="$2"; shift 2 ;;
@@ -52,7 +55,15 @@ done
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS="$BENCH_DIR/results"; mkdir -p "$RESULTS"
-WORKLOAD="$BENCH_DIR/workload_dpo.py"
+WORKLOAD="${WORKLOAD_ARG:-${BENCH_WORKLOAD:-$BENCH_DIR/workload_dpo.py}}"
+[[ "$WORKLOAD" = /* ]] || WORKLOAD="$BENCH_DIR/$WORKLOAD"
+[[ -f "$WORKLOAD" ]] || { echo "workload not found: $WORKLOAD"; exit 2; }
+WORKLOAD_TAG="${TAG_ARG:-$(basename "$WORKLOAD" .py)}"
+WORKLOAD_TAG="${WORKLOAD_TAG#workload_}"
+[[ "$WORKLOAD_TAG" =~ ^[a-zA-Z0-9_-]+$ ]] || {
+    echo "bad workload tag: $WORKLOAD_TAG"; exit 2;
+}
+WORKLOAD_MD5="$(md5sum "$WORKLOAD" | awk '{print $1}')"
 MODEL="${MODEL:-unsloth/Qwen2.5-7B-bnb-4bit}"
 PY_VENV="${PY_VENV:-$HOME/ptwork/bin/python}"
 S="${SMOLVM:-$HOME/smolvm/smolvm}"
@@ -144,9 +155,9 @@ run_native() {
             local nproc_n cores
             nproc_n=$(nproc)
             cores=$(python3 -c "print(','.join(str(($i*$CPUS+k) % $nproc_n) for k in range($CPUS)))")
-            LEARNER_ID=$i taskset -c "$cores" "$PY_VENV" "$CO/dpo_train.py" > "$CO/o$i.log" 2>"$CO/e$i.log" &
+            LEARNER_ID=$i taskset -c "$cores" "$PY_VENV" "$CO/workload.py" > "$CO/o$i.log" 2>"$CO/e$i.log" &
         else
-            LEARNER_ID=$i "$PY_VENV" "$CO/dpo_train.py" > "$CO/o$i.log" 2>"$CO/e$i.log" &
+            LEARNER_ID=$i "$PY_VENV" "$CO/workload.py" > "$CO/o$i.log" 2>"$CO/e$i.log" &
         fi
         pids+=($!)
     done
@@ -159,10 +170,11 @@ run_fork() {
     # silently runs the wrong configuration is worse than no arm at all (this
     # bit me — a "copy mode" control that actually shared, because the variable
     # never reached the daemon). check_share_mode below proves what ran.
+    local share_setting=""
     case "$SHARE" in
-        on)  export SMOLVM_CUDA_FORK_SHARE_WEIGHTS=1 ;;
-        off) export SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0 ;;
-        default) unset SMOLVM_CUDA_FORK_SHARE_WEIGHTS ;;
+        on)  share_setting=1 ;;
+        off) share_setting=0 ;;
+        default) ;;
         *) echo "bad --share: $SHARE (want on|off|default)"; exit 2 ;;
     esac
     # CONTEXT MODE. Default (workers=1) gives each clone its own CUDA context,
@@ -173,6 +185,12 @@ run_fork() {
     # idle. Native cannot do this at all: separate processes = separate
     # contexts (absent MPS).
     local daemon_env=(SMOLVM_CUDA_DAEMON_IDLE_SECS=0 RUST_LOG=warn,smolvm::cuda_daemon=info)
+    # This is daemon/worker policy, not guest or VMM policy. Leaking the
+    # all-private kill switch through machine create/fork can perturb clone
+    # reconnect before a worker exists, making the control time out without
+    # measuring either sharing mode.
+    [[ -n "$share_setting" ]] \
+        && daemon_env+=(SMOLVM_CUDA_FORK_SHARE_WEIGHTS="$share_setting")
     if [[ "${BENCH_FORK_WORKERS:-1}" == "1" ]]; then
         daemon_env+=(SMOLVM_CUDA_FORK_WORKERS=1 SMOLVM_CUDA_FORK_ISOLATE=1)
     fi
@@ -186,7 +204,7 @@ run_fork() {
     local GUEST="${BENCH_GUEST_EXTRA:-} export HF_HOME=/opt/hfcache HF_HUB_OFFLINE=0 COORD=/opt/coord ARM=fork FORK=1 \
 STEPS=$STEPS NSLOTS=$N MODEL=$MODEL OUTBASE=/root BATCH=$BATCH MAXSEQ=$MAXSEQ \
 PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
-/home/ubuntu/ptwork/bin/python /opt/coord/dpo_train.py 2>>/opt/coord/g.err"
+/home/ubuntu/ptwork/bin/python /opt/coord/workload.py 2>>/opt/coord/g.err"
     local vmargs=()
     [[ -n "$VCPU" ]] && vmargs+=(--cpus "$VCPU")
     [[ -n "$VMEM" ]] && vmargs+=(--mem "$VMEM")
@@ -237,10 +255,11 @@ PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF TORCHINDUCTOR_COMPILE_THREADS=1; \
         [[ $(date +%s) -ge $deadline ]] && { echo "  TIMEOUT after ${TIMEOUT}s (learners still unfinished)"; break; }
         sleep 2
     done
-    check_share_mode "$CO"
+    local share_mode_ok=1
+    check_share_mode "$CO" || share_mode_ok=0
     $S machine rm --name bench-g --cascade >/dev/null 2>&1
     pkill -f "smolvm _cuda-daemo[n]" 2>/dev/null; pkill -f "_cuda-clone-worke[r]" 2>/dev/null
-    return 0
+    [[ "$share_mode_ok" == "1" ]]
 }
 
 # The daemon logs "M2: shared weight ranges shared=<n> private=<m>" per clone.
@@ -253,23 +272,33 @@ check_share_mode() {
     # escapes before matching -- a plain grep silently finds nothing and the
     # check reports "<none>" for every run, which is how this guard first
     # shipped broken.
+    # A workload may have several CUDA processes and therefore several clone
+    # workers (Unsloth SFT has a preprocessing process with zero VMM maps).
+    # Report the weight-bearing worker, not whichever worker logged last.
     line=$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null \
-           | grep -o "shared=[0-9]* private=[0-9]*" | tail -1)
+           | grep -o "shared=[0-9]* private=[0-9]*" \
+           | awk -F'[= ]+' 'NR == 1 || $2 > max { max=$2; line=$0 } END { print line }')
     shared=$(echo "$line" | sed -E "s/shared=([0-9]*).*/\1/")
     echo "  share-mode requested=$SHARE  daemon reported: ${line:-<none>}"
-    if [[ "$SHARE" == "off" && "${shared:-0}" -gt 0 ]]; then
+    if [[ -z "$line" ]]; then
+        echo "  !! CONTROL FAILED: daemon emitted no sharing verdict"
+        return 1
+    elif [[ "$SHARE" == "off" && "${shared:-0}" -gt 0 ]]; then
         echo "  !! CONTROL FAILED: asked for copy mode but the daemon shared $shared ranges"
+        return 1
     elif [[ "$SHARE" == "on" && "${shared:-0}" -eq 0 ]]; then
         echo "  !! SHARING DID NOT ENGAGE: asked to share but the daemon shared 0 ranges"
+        return 1
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------------- driver
 MF=$(manifest "$S" "$PY_VENV")
 for rep in $(seq 1 "$REPS"); do
-    RUNID="${ARM}_n${N}_s${STEPS}_c${CPUS}_$(date +%Y%m%d-%H%M%S)_r${rep}"
-    CO="$HOME/bench_run/$RUNID"; rm -rf "$CO"; mkdir -p "$CO"; cp "$WORKLOAD" "$CO/dpo_train.py"
-    echo "=== $RUNID (arm=$ARM n=$N steps=$STEPS cpus=$CPUS cold=$COLD) ==="
+    RUNID="${ARM}_${WORKLOAD_TAG}_n${N}_s${STEPS}_c${CPUS}_$(date +%Y%m%d-%H%M%S)_r${rep}"
+    CO="$HOME/bench_run/$RUNID"; rm -rf "$CO"; mkdir -p "$CO"; cp "$WORKLOAD" "$CO/workload.py"
+    echo "=== $RUNID (arm=$ARM workload=$WORKLOAD_TAG n=$N steps=$STEPS cpus=$CPUS cold=$COLD) ==="
     preflight
     STOP="$CO/.stop"; PEAK="$CO/.peak"; rm -f "$STOP"
     sample_gpu "$PEAK" "$STOP" &
@@ -292,7 +321,8 @@ for rep in $(seq 1 "$REPS"); do
     elif [[ -n "${CUDA_MPS_PIPE_DIRECTORY:-}" ]]; then
         MPS_MODE_RECORD=external
     fi
-    VCPU_RECORD="$VCPU" VMEM_RECORD="$VMEM" FW_RECORD="${BENCH_FORK_WORKERS:-1}" SHARE_RECORD="$SHARE" SHARED_RANGES="$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null | grep -o 'shared=[0-9]*' | tail -1 | cut -d= -f2)" BATCH_RECORD="$BATCH" MAXSEQ_RECORD="$MAXSEQ" ALLOC_CONF_RECORD="$ALLOC_CONF" SW_RECORD="${SMOLVM_CUDA_FORK_SHARE_WEIGHTS:-unset}" MPS_MODE_RECORD="$MPS_MODE_RECORD" python3 - "$CO" "$RESULTS/$RUNID.json" "$ARM" "$N" "$STEPS" "$CPUS" "$COLD" "$WALL" "${GOLD:-null}" "${FORKED:-null}" "$(cat "$PEAK" 2>/dev/null || echo 0)" "$MF" <<'PY'
+    case "$SHARE" in on) SW_RECORD_VALUE=1 ;; off) SW_RECORD_VALUE=0 ;; *) SW_RECORD_VALUE=unset ;; esac
+    VCPU_RECORD="$VCPU" VMEM_RECORD="$VMEM" FW_RECORD="${BENCH_FORK_WORKERS:-1}" SHARE_RECORD="$SHARE" SHARED_RANGES="$(sed -e 's/\x1b\[[0-9;]*m//g' "$CO/daemon.log" 2>/dev/null | grep -o 'shared=[0-9]*' | cut -d= -f2 | sort -nr | head -1)" BATCH_RECORD="$BATCH" MAXSEQ_RECORD="$MAXSEQ" ALLOC_CONF_RECORD="$ALLOC_CONF" SW_RECORD="$SW_RECORD_VALUE" MPS_MODE_RECORD="$MPS_MODE_RECORD" WORKLOAD_RECORD="$WORKLOAD_TAG" WORKLOAD_MD5_RECORD="$WORKLOAD_MD5" python3 - "$CO" "$RESULTS/$RUNID.json" "$ARM" "$N" "$STEPS" "$CPUS" "$COLD" "$WALL" "${GOLD:-null}" "${FORKED:-null}" "$(cat "$PEAK" 2>/dev/null || echo 0)" "$MF" <<'PY'
 import sys, json, glob
 co, out, arm, n, steps, cpus, cold, wall, gold, forked, peak, mf = sys.argv[1:13]
 learners = []
@@ -302,9 +332,20 @@ for f in sorted(glob.glob(f"{co}/learner_*.jsonl")):
         e = json.loads(line); d[e["event"]] = e
     if "done" in d:
         z = d["done"]
-        learners.append({k: z.get(k) for k in ("lid","tok_s","train_s","step_ms","loss0","lossN","peak_gb")})
+        learners.append({k: z.get(k) for k in (
+            "lid", "method", "tok_s", "examples_s", "train_s", "step_ms",
+            "loss0", "lossN", "reward0", "rewardN", "peak_gb",
+            "initial_parameter_sha256", "parameter_sha256",
+            "parameter_count", "parameter_sum", "parameter_abs_sum",
+            "parameter_l2", "parameter_max_abs",
+            "model_output_sha256", "model_output_sum", "model_output_l2",
+            "dataset_sha256", "cpu_rng_sha256", "cuda_rng_sha256",
+            "trainable_grad_tensors",
+        ) if z.get(k) is not None})
 rec = {
   "arm": arm, "n": int(n), "steps": int(steps), "cpus_per_learner": int(cpus),
+  "workload": __import__("os").environ.get("WORKLOAD_RECORD", "dpo"),
+  "workload_md5": __import__("os").environ.get("WORKLOAD_MD5_RECORD"),
   "cold_cache": bool(int(cold)),
   "mps_mode": __import__("os").environ.get("MPS_MODE_RECORD", "off"),
   "cuda_mps_pipe_directory": __import__("os").environ.get(
