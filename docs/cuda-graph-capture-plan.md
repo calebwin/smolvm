@@ -53,6 +53,13 @@ rather than misreporting its extra generated tokens as speed (§7).
   explicit quality gate; its larger token count is excluded from performance claims.
   The installed Unsloth stack still requires its explicit BF16 environment contract
   in both native and fork arms (§7).
+- **Forked GRPO also beats a production-style resident-base queue.** Eight
+  source-identical 200-step jobs finish 41.3% sooner, with 1.70x jobs/hour, 2.38x
+  effective rollout-token throughput, and 2.34x learner-step throughput. This is
+  direct evidence for rollouts generated inside independent trainer forks; a
+  rollout-only worker fleet and a fused concurrent multi-adapter trainer remain
+  separate, untested baselines. The queue uses 7,443 MiB versus the fork pool's
+  21,479 MiB (§7).
 - **Synthetic explicit CUDA graphs remain fast through the boundary**, but the real
   installed Unsloth training path is not graphable today. A K=500 graph measures
   1.241 µs/op versus native's 1.224, yet forced Inductor graphs contained one op each,
@@ -783,6 +790,55 @@ two have healthy reward/adapter endpoints and one fails this quality gate; perfo
 and density were otherwise stable. This is a stochastic-quality reliability signal,
 not evidence of memory corruption, and release claims use only gate-passing runs.
 
+#### Production hot-base queue comparison
+
+The native N-process baseline above is not the strongest alternative used by a
+fine-tuning service. A second control models a production LoRA queue: one native
+process loads and prewarms the base once, retains its compiled kernels and fixed-shape
+LoRA allocation, then trains eight jobs sequentially. Before each job it restores the
+same initial adapter and post-warmup CPU/CUDA RNG state, creates a fresh
+`GRPOTrainer` and optimizer, and fingerprints the final adapter before resetting the
+slot. This is an optimistic homogeneous queue—there is no repeated model load and no
+adapter artifact upload.
+
+The queue and fork executions use the same workload hash
+`ae61dbd5d2672921475b1d9336ef7b4d`, model snapshot, batch 1, 200 steps, and 16 total
+CPU cores (16 for the queue; eight two-vCPU forks):
+
+| arm | completion | end-to-end wall | jobs/hour | effective rollout tok/s | learner-steps/s | peak GPU memory |
+|---|---:|---:|---:|---:|---:|---:|
+| resident-base queue | 8/8 | 1,279.61 s | 22.507 | 31.433 | 1.286 | **7,443 MiB** |
+| fork + managed MPS | 8/8 | **751.16 s** | **38.341** | **74.870** | **3.015** | 21,479 MiB |
+
+Against the queue, smolvm finishes the eight-job batch 41.3% sooner, provides 1.70x
+jobs/hour, 2.38x effective rollout-token throughput, and 2.34x completed-step
+throughput. It spends 2.89x the peak VRAM (13.71 GiB more) because eight private
+adapter/optimizer/CUDA states are live concurrently. An individual queued learner is
+faster—the median train time is 154.70 s versus 489.33 s per fork—but the other seven
+jobs wait. The benefit is concurrent batch completion and lower queue latency, not a
+faster learner.
+
+The source-identical comparison passes every quality gate: exact model output,
+initial adapter, dataset, initial CPU/CUDA RNG, final CPU RNG, and parameter count;
+maximum reward-mean delta 0.011319 (limit 0.02); maximum final parameter-L2 relative
+delta 0.0002173 (limit 0.001). This establishes value over a sequential hot-base
+queue when GPU memory is available and one GRPO learner leaves compute idle. It does
+**not** establish superiority over a fused concurrent multi-adapter trainer or
+several hot queues co-located under MPS; those remain separate application-aware
+baselines.
+
+Because each GRPO fork generates its own sampled completions, the measured 2.38x
+effective token-rate gain directly covers rollouts embedded in independent trainer
+processes. It does not yet cover a dedicated rollout-only fleet. The promising
+rollout topology is to snapshot each policy checkpoint, fork read-only inference
+workers, and keep RNG, environment state, and KV cache private; its open question is
+how much sharing and startup latency survive repeated policy refreshes.
+
+Durable evidence is in
+`bench/results/queue_grpo-queue-rngfixed-long200_n8_s200_c16_20260726-184329_r1.json`,
+`bench/results/fork_grpo-fork-vsqueue-final-long200_n8_s200_c2_20260726-190515_r1.json`,
+and `bench/results/grpo-queue-vs-fork-h100-20260726.json`.
+
 A GRPO operation census explains why it benefits from concurrency: an N=1 profile
 (one golden warmup plus 20 learner steps) emitted 2.68 million proxy operations,
 dominated by 721,806 quiet kernel launches and at least 1.62 million library calls. The
@@ -1005,7 +1061,7 @@ the current branch tip:
 | `55cf22d` | release qualification, owned-path cleanup/collision hardening, and fail-loud fork benchmark retries |
 | `900414c` | multi-process lineage routing; atomic late-attach live-RAM metadata; fail-closed tokenless routing; sharing kill-switch fix; generalized real-workload harness; SFT qualification and in-Trainer placement probe |
 | `05c0e37` | initial real Qwen2.5-7B GRPO qualification, precision-contract diagnosis, exact stochastic-state checks, density controls, and the SFT parity roadmap |
-| current change | long N=8 GRPO throughput/quality qualification, tail-aware metrics and automated gate, request-ring capacity result, and final cross-workload release evidence |
+| current change | long N=8 GRPO throughput/quality qualification, resident-base queue comparison, tail-aware metrics and automated gate, request-ring capacity result, and final cross-workload release evidence |
 
 The latest validation files are:
 
@@ -1022,13 +1078,14 @@ The latest validation files are:
 | `bench/run_mps_matrix.sh` | private-controller, uncapped MPS versus ordinary-context paired harness with guaranteed cleanup |
 | `bench/results/mps-h100-20260725.json` | durable machine-readable MPS performance, correctness, cap, and lifecycle summary |
 | `bench/results/mps-managed-h100-20260726.json` | managed-candidate N=4/N=8/native comparison and compiler/explicit-graph verdicts |
-| `bench/bench.sh` | benchmark manifests record external/managed/off MPS mode; fork errors are retained/retried before synchronized release; GRPO rollout/reward/RNG/model fields are retained |
+| `bench/bench.sh` | native/fork/resident-queue harness; benchmark manifests record MPS mode; fork errors are retained/retried before synchronized release; GRPO rollout/reward/RNG/model fields are retained |
 | `bench/workload_dpo.py` | opt-in forced-compiler and explicit fixed-region graph diagnostics |
 | `bench/workload_sft.py` | real Unsloth/TRL SFT qualification with exact adapter, model-output, dataset, and RNG fingerprints |
 | `bench/workload_sft_resume.py` | diagnostic fork-from-live-Trainer placement upper bound |
-| `bench/workload_grpo.py` | real sampled Unsloth/TRL GRPO qualification with exact model/adapter/RNG state and per-step rollout/reward fingerprints |
-| `bench/compare_grpo.py` | source-identity, deterministic-setup, reward/adapter-quality, tail-throughput, completed-step, and density release gate |
+| `bench/workload_grpo.py` | real sampled Unsloth/TRL GRPO qualification plus a resident-base queue control with exact adapter/RNG reset and per-step rollout/reward fingerprints |
+| `bench/compare_grpo.py` | source-identity, deterministic-setup, reward/adapter-quality, queue-aware effective throughput, completed-step, and density release gate |
 | `bench/results/grpo-h100-20260726.json` | durable H100 GRPO precision, correctness, density, isolation-control, exclusion, and next-gate summary |
+| `bench/results/grpo-queue-vs-fork-h100-20260726.json` | source-identical resident-base queue versus concurrent-fork quality and performance verdict |
 | `src/cuda_daemon.rs` | managed private MPS policy, ownership supervisor, bounded path cleanup/collision refusal, fallback, and tests |
 | `src/main.rs` | hidden MPS supervisor process entry point |
 | `crates/smolvm-cuda/src/client.rs` | synchronous-call profiler now retains enough ranked classes to expose low-count barriers hidden by one-time module loads |
@@ -1119,6 +1176,9 @@ Safety snapshots:
   ring-full events. The source-identical 128-page capacity run is
   `fork_grpo-ring128-n8-b1-release_n8_s200_c2_20260726-101846_r1`; the excluded batch-2
   compatibility run is `fork_grpo-ring128-n8-release_n8_s200_c2_20260726-095756_r1`.
+  The production hot-base comparison is
+  `queue_grpo-queue-rngfixed-long200_n8_s200_c16_20260726-184329_r1` /
+  `fork_grpo-fork-vsqueue-final-long200_n8_s200_c2_20260726-190515_r1`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus

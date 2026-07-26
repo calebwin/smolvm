@@ -10,6 +10,7 @@ import faulthandler
 faulthandler.enable()
 
 import glob
+import gc
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ ARM = os.environ.get("ARM", "?")
 FORK = os.environ.get("FORK", "0") == "1"
 LID = os.environ.get("LEARNER_ID", "0")
 OUTBASE = os.environ.get("OUTBASE", "/root")
+QUEUE_JOBS = int(os.environ.get("QUEUE_JOBS", "0"))
 
 # Never let one native arm inherit Inductor/Unsloth artifacts from an earlier
 # benchmark while a new VM starts from its clean overlay. The golden builds its
@@ -393,7 +395,7 @@ def run_grpo(lid, steps, warm_only=False):
     }
 
 
-if FORK or os.environ.get("NATIVE_REFERENCE_WARMUP", "0") == "1":
+if FORK or QUEUE_JOBS or os.environ.get("NATIVE_REFERENCE_WARMUP", "0") == "1":
     before_warm = trainable_fingerprint()
     run_grpo("warm", 1, warm_only=True)
     torch.cuda.synchronize()
@@ -422,62 +424,97 @@ if FORK:
         raise RuntimeError("no learner slot available")
     LID = str(claimed)
 
-LID = str(LID)
-initial_parameters = trainable_fingerprint()
-emit(
-    LID,
-    event="ready",
-    load_ms=round(load_ms),
-    initial_parameter_sha256=initial_parameters["parameter_sha256"],
-    **model_runtime,
-)
-train_started = time.time()
-training = run_grpo(LID, STEPS)
-torch.cuda.synchronize()
-duration = time.time() - train_started
+def run_one_learner(lid):
+    lid = str(lid)
+    initial_parameters = trainable_fingerprint()
+    emit(
+        lid,
+        event="ready",
+        load_ms=round(load_ms),
+        initial_parameter_sha256=initial_parameters["parameter_sha256"],
+        **model_runtime,
+    )
+    torch.cuda.reset_peak_memory_stats()
+    train_started = time.time()
+    training = run_grpo(lid, STEPS)
+    torch.cuda.synchronize()
+    duration = time.time() - train_started
 
-parameters = trainable_fingerprint()
-rewards = training["rewards"]
-losses = training["losses"]
-reward0 = sum(rewards[: min(2, len(rewards))]) / max(1, min(2, len(rewards)))
-rewardN = sum(rewards[-min(2, len(rewards)) :]) / max(1, min(2, len(rewards)))
-emit(
-    LID,
-    event="done",
-    train_s=round(duration, 2),
-    tok_s=round(training["rollout_tokens"] / duration),
-    step_ms=round(duration / STEPS * 1000),
-    steps=STEPS,
-    loss0=round(losses[0], 6),
-    lossN=round(losses[-1], 6),
-    reward0=round(reward0, 6),
-    rewardN=round(rewardN, 6),
-    reward_max=round(max(rewards), 6),
-    reward_min=round(min(rewards), 6),
-    rollout_tokens=training["rollout_tokens"],
-    rollout_sha256=training["rollout_sha256"],
-    rollout_step_sha256=training["rollout_step_sha256"],
-    rollout_step_rewards=training["rollout_step_rewards"],
-    peak_gb=round(torch.cuda.max_memory_allocated() / 1e9, 2),
-    initial_parameter_sha256=initial_parameters["parameter_sha256"],
-    parameter_sha256=parameters["parameter_sha256"],
-    parameter_count=parameters["parameter_count"],
-    parameter_sum=round(parameters["parameter_sum"], 9),
-    parameter_abs_sum=round(parameters["parameter_abs_sum"], 9),
-    parameter_l2=round(parameters["parameter_l2"], 9),
-    parameter_max_abs=round(parameters["parameter_max_abs"], 9),
-    dataset_sha256=training["dataset_sha256"],
-    cpu_rng_sha256=training["cpu_rng_sha256"],
-    cuda_rng_sha256=training["cuda_rng_sha256"],
-    final_cpu_rng_sha256=training["final_cpu_rng_sha256"],
-    final_cuda_rng_sha256=training["final_cuda_rng_sha256"],
-    **model_runtime,
-)
-print(
-    f"GRPO LEARNER {LID} [{ARM}] DONE load={load_ms:.0f}ms "
-    f"loss {losses[0]:.6f}->{losses[-1]:.6f} "
-    f"reward {reward0:.3f}->{rewardN:.3f} "
-    f"rollout_tok/s={training['rollout_tokens'] / duration:.0f} "
-    f"peak={torch.cuda.max_memory_allocated() / 1e9:.1f}GB",
-    flush=True,
-)
+    parameters = trainable_fingerprint()
+    rewards = training["rewards"]
+    losses = training["losses"]
+    reward0 = sum(rewards[: min(2, len(rewards))]) / max(1, min(2, len(rewards)))
+    rewardN = sum(rewards[-min(2, len(rewards)) :]) / max(1, min(2, len(rewards)))
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    emit(
+        lid,
+        event="done",
+        train_s=round(duration, 2),
+        tok_s=round(training["rollout_tokens"] / duration),
+        step_ms=round(duration / STEPS * 1000),
+        steps=STEPS,
+        loss0=round(losses[0], 6),
+        lossN=round(losses[-1], 6),
+        reward0=round(reward0, 6),
+        rewardN=round(rewardN, 6),
+        reward_max=round(max(rewards), 6),
+        reward_min=round(min(rewards), 6),
+        rollout_tokens=training["rollout_tokens"],
+        rollout_sha256=training["rollout_sha256"],
+        rollout_step_sha256=training["rollout_step_sha256"],
+        rollout_step_rewards=training["rollout_step_rewards"],
+        peak_gb=round(peak_gb, 2),
+        initial_parameter_sha256=initial_parameters["parameter_sha256"],
+        parameter_sha256=parameters["parameter_sha256"],
+        parameter_count=parameters["parameter_count"],
+        parameter_sum=round(parameters["parameter_sum"], 9),
+        parameter_abs_sum=round(parameters["parameter_abs_sum"], 9),
+        parameter_l2=round(parameters["parameter_l2"], 9),
+        parameter_max_abs=round(parameters["parameter_max_abs"], 9),
+        dataset_sha256=training["dataset_sha256"],
+        cpu_rng_sha256=training["cpu_rng_sha256"],
+        cuda_rng_sha256=training["cuda_rng_sha256"],
+        final_cpu_rng_sha256=training["final_cpu_rng_sha256"],
+        final_cuda_rng_sha256=training["final_cuda_rng_sha256"],
+        **model_runtime,
+    )
+    print(
+        f"GRPO LEARNER {lid} [{ARM}] DONE load={load_ms:.0f}ms "
+        f"loss {losses[0]:.6f}->{losses[-1]:.6f} "
+        f"reward {reward0:.3f}->{rewardN:.3f} "
+        f"rollout_tok/s={training['rollout_tokens'] / duration:.0f} "
+        f"peak={peak_gb:.1f}GB",
+        flush=True,
+    )
+
+
+if QUEUE_JOBS:
+    if FORK:
+        raise RuntimeError("QUEUE_JOBS is a native resident-base control")
+    # This is the strongest homogeneous queued baseline: the quantized base,
+    # compiled kernels, and fixed-shape LoRA allocation stay resident. Each job
+    # gets the exact same initial adapter values and a fresh Trainer/optimizer;
+    # its final adapter is fingerprinted before the slot is reset for the next
+    # queued job.
+    initial_trainable = {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    expected_initial = trainable_fingerprint()["parameter_sha256"]
+    initial_cpu_rng = torch.get_rng_state().clone()
+    initial_cuda_rng = [state.clone() for state in torch.cuda.get_rng_state_all()]
+    for queued_lid in range(QUEUE_JOBS):
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    parameter.copy_(initial_trainable[name])
+        if trainable_fingerprint()["parameter_sha256"] != expected_initial:
+            raise RuntimeError(f"queued learner {queued_lid} adapter reset failed")
+        torch.set_rng_state(initial_cpu_rng)
+        torch.cuda.set_rng_state_all(initial_cuda_rng)
+        run_one_learner(queued_lid)
+        gc.collect()
+        torch.cuda.empty_cache()
+else:
+    run_one_learner(LID)

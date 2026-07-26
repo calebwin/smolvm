@@ -1,11 +1,13 @@
 #!/bin/bash
-# Reproducible A/B: the SAME post-training workload run two ways on one GPU.
+# Reproducible comparison: the SAME post-training workload run three ways on one GPU.
 #
 #   native — N learner processes on bare metal, each loading its own base
 #   fork   — one smolvm golden VM loads the base once, then N --share-weights
 #            clones, CUDA remoted to the host daemon
+#   queue  — one native process keeps the base and compiled kernels resident,
+#            then resets and trains N independent LoRA jobs sequentially
 #
-# Both arms run the identical workload file (workload_dpo.py by default) with identical
+# All arms run the identical workload file (workload_dpo.py by default) with identical
 # STEPS/BATCH/MAXSEQ/MODEL/seed, and are measured identically (wall clock from
 # t0 to last learner done, 1 Hz nvidia-smi peak sampling, per-learner tok/s from
 # the workload's own JSONL). Results append to results/<run-id>.json.
@@ -19,7 +21,7 @@
 #   --reps R   repeat R times; summarize.py reports the median and the spread
 #              (the golden load is known to be bimodal ~15s vs ~156s)
 #
-# Usage: ./bench.sh --arm native|fork --n 4 [--steps 20] [--reps 3] [--cpus 4]
+# Usage: ./bench.sh --arm native|fork|queue --n 4 [--steps 20] [--reps 3] [--cpus 4]
 #        [--cold] [--share on|off|default] [--batch 2] [--maxseq 256]
 #        [--workload workload_sft.py] [--tag sft]
 set -u
@@ -51,7 +53,9 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
 done
-[[ "$ARM" == "native" || "$ARM" == "fork" ]] || { echo "need --arm native|fork"; exit 2; }
+[[ "$ARM" == "native" || "$ARM" == "fork" || "$ARM" == "queue" ]] || {
+    echo "need --arm native|fork|queue"; exit 2;
+}
 
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS="$BENCH_DIR/results"; mkdir -p "$RESULTS"
@@ -162,6 +166,22 @@ run_native() {
         pids+=($!)
     done
     wait "${pids[@]}"
+}
+
+run_queue() {
+    local CO="$1"
+    export HF_HOME=$HOME/hf HF_HUB_OFFLINE=1 COORD=$CO ARM=queue FORK=0 OUTBASE=$CO
+    export STEPS=$STEPS MODEL=$MODEL BATCH=$BATCH MAXSEQ=$MAXSEQ QUEUE_JOBS=$N
+    export PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF" TORCHINDUCTOR_COMPILE_THREADS=1
+    if [[ "$CPUS" -gt 0 ]]; then
+        local nproc_n cores
+        nproc_n=$(nproc)
+        cores=$(python3 -c "print(','.join(str(k) for k in range(min($CPUS, $nproc_n))))")
+        LEARNER_ID=0 taskset -c "$cores" "$PY_VENV" "$CO/workload.py" \
+            > "$CO/o0.log" 2> "$CO/e0.log"
+    else
+        LEARNER_ID=0 "$PY_VENV" "$CO/workload.py" > "$CO/o0.log" 2> "$CO/e0.log"
+    fi
 }
 
 run_fork() {
@@ -304,11 +324,11 @@ for rep in $(seq 1 "$REPS"); do
     sample_gpu "$PEAK" "$STOP" &
     SAMPLER=$!
     T0=$(date +%s.%N)
-    if [[ "$ARM" == "native" ]]; then
-        run_native "$CO" || { touch "$STOP"; wait "$SAMPLER" 2>/dev/null; exit 1; }
-    else
-        run_fork "$CO" || { touch "$STOP"; wait "$SAMPLER" 2>/dev/null; exit 1; }
-    fi
+    case "$ARM" in
+        native) run_native "$CO" ;;
+        queue)  run_queue "$CO" ;;
+        fork)   run_fork "$CO" ;;
+    esac || { touch "$STOP"; wait "$SAMPLER" 2>/dev/null; exit 1; }
     T1=$(date +%s.%N)
     touch "$STOP"; wait $SAMPLER 2>/dev/null
     WALL=$(echo "$T1 - $T0" | bc)
@@ -384,7 +404,11 @@ if rollout_timed:
         l["rollout_tokens"] / l["train_s"] for l in rollout_timed
     ), 3)
 if timed:
-    rec["train_tail_s"] = max(l["train_s"] for l in timed)
+    rec["train_tail_s"] = (
+        sum(l["train_s"] for l in timed)
+        if arm == "queue"
+        else max(l["train_s"] for l in timed)
+    )
     rec["aggregate_step_s"] = round(
         sum(int(l.get("steps") or steps) for l in timed) / rec["train_tail_s"], 3
     )
@@ -392,6 +416,9 @@ if rollout_timed and len(rollout_timed) == len(timed):
     rec["tail_agg_tok_s"] = round(
         sum(l["rollout_tokens"] for l in rollout_timed) / rec["train_tail_s"], 3
     )
+if arm == "queue" and "tail_agg_tok_s" in rec:
+    rec["exact_agg_tok_s"] = rec["tail_agg_tok_s"]
+    rec["agg_tok_s"] = round(rec["tail_agg_tok_s"])
 json.dump(rec, open(out, "w"), indent=2)
 tail_metrics = ""
 for key in ("exact_agg_tok_s", "tail_agg_tok_s", "aggregate_step_s"):

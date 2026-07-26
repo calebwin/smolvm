@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare source-identical native/fork GRPO qualification results.
+"""Compare source-identical native-or-queue/fork GRPO qualification results.
 
 Sampled RL should not be required to stay bit-identical after tiny numerical
 differences cross a token boundary. This gate keeps deterministic setup exact,
@@ -31,7 +31,13 @@ def performance(result):
         for learner in learners
     ):
         return None
-    tail_s = max(learner["train_s"] for learner in learners)
+    # Concurrent arms complete when their slowest learner completes. A
+    # resident-base queue runs the learners sequentially, so its effective
+    # training interval is the sum instead of the maximum.
+    if result.get("arm") == "queue":
+        tail_s = sum(learner["train_s"] for learner in learners)
+    else:
+        tail_s = max(learner["train_s"] for learner in learners)
     tokens = sum(learner["rollout_tokens"] for learner in learners)
     if tokens <= 0 or result.get("peak_gpu_mib", 0) <= 0:
         return None
@@ -45,28 +51,35 @@ def performance(result):
         )
         / tail_s,
         "tail_train_s": tail_s,
+        "wall_s": result.get("wall_s"),
+        "jobs_per_hour": (
+            result["n"] * 3600 / result["wall_s"]
+            if result.get("wall_s", 0) > 0
+            else None
+        ),
         "peak_gpu_mib": result["peak_gpu_mib"],
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("native")
+    parser.add_argument("reference")
     parser.add_argument("fork")
     parser.add_argument("--max-reward-mean-delta", type=float, default=0.02)
     parser.add_argument("--max-parameter-l2-relative", type=float, default=0.001)
     args = parser.parse_args()
 
-    native = load(args.native)
+    native = load(args.reference)
     fork = load(args.fork)
     failures = []
 
     for key in ("n", "steps", "workload_md5", "batch", "maxseq"):
         if native.get(key) != fork.get(key):
             failures.append(f"{key} differs: {native.get(key)!r} != {fork.get(key)!r}")
-    if native.get("arm") != "native" or fork.get("arm") != "fork":
-        failures.append("inputs are not ordered native then fork")
-    for label, result in (("native", native), ("fork", fork)):
+    if native.get("arm") not in ("native", "queue") or fork.get("arm") != "fork":
+        failures.append("inputs are not ordered native-or-queue then fork")
+    reference_label = native.get("arm", "reference")
+    for label, result in ((reference_label, native), ("fork", fork)):
         if result.get("learners_done") != result.get("learners_expected"):
             failures.append(
                 f"{label} incomplete: {result.get('learners_done')}/"
@@ -149,7 +162,7 @@ def main():
                     left == right
                     for left, right in zip(reference_rewards, candidate_rewards)
                 ),
-                "reward_mean_native": reference_mean,
+                "reward_mean_reference": reference_mean,
                 "reward_mean_fork": candidate_mean,
                 "reward_mean_delta": reward_mean_delta,
                 "parameter_l2_relative_delta": parameter_l2_relative,
@@ -171,6 +184,10 @@ def main():
             / native_performance["aggregate_step_s"],
             "peak_gpu_memory": fork_performance["peak_gpu_mib"]
             / native_performance["peak_gpu_mib"],
+            "end_to_end_speedup": native_performance["wall_s"]
+            / fork_performance["wall_s"],
+            "jobs_per_hour": fork_performance["jobs_per_hour"]
+            / native_performance["jobs_per_hour"],
         }
     summary = {
         "passed": not failures,
@@ -179,7 +196,8 @@ def main():
             "max_reward_mean_delta": args.max_reward_mean_delta,
             "max_parameter_l2_relative": args.max_parameter_l2_relative,
         },
-        "native": native_performance,
+        "reference_arm": reference_label,
+        "reference": native_performance,
         "fork": fork_performance,
         "ratios": ratios,
         "learners": learner_summaries,
