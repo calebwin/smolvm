@@ -1764,15 +1764,59 @@ impl AgentClient {
         &mut self,
         guest_path: &str,
         local_path: &std::path::Path,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<u64> {
-        use std::io::Write;
         const FILE_READ_TIMEOUT: Duration = Duration::from_secs(600);
 
         let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
         self.send_raw(&AgentRequest::FileRead {
             path: guest_path.to_string(),
         })?;
+
+        self.receive_data_stream_to_path(
+            local_path,
+            file_transfer_max_total(),
+            "read file",
+            on_progress,
+        )
+    }
+
+    /// Stream a guest directory as a tar archive directly to a local path.
+    ///
+    /// The archive is never materialized in the guest, so callers can export a
+    /// merged filesystem even when it is larger than the guest scratch disk.
+    pub fn export_directory_to_path<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        on_progress: F,
+    ) -> Result<u64> {
+        const DIRECTORY_EXPORT_TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _timeout_guard = self.set_extended_read_timeout(DIRECTORY_EXPORT_TIMEOUT)?;
+        self.send_raw(&AgentRequest::ExportDirectory {
+            path: guest_path.to_string(),
+        })?;
+
+        // Provisioned environments routinely exceed the general 4 GiB file
+        // copy limit. Keep the established pack-export default while still
+        // bounding a compromised or buggy guest stream.
+        let cap = std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
+            .ok()
+            .and_then(|s| crate::util::parse_size_bytes(s.trim()).ok())
+            .unwrap_or(64 << 30);
+        self.receive_data_stream_to_path(local_path, cap, "export directory", on_progress)
+    }
+
+    /// Receive a `DataChunk` stream into a local file with bounded total size.
+    fn receive_data_stream_to_path<F: FnMut(u64)>(
+        &mut self,
+        local_path: &std::path::Path,
+        cap: u64,
+        operation: &str,
+        mut on_progress: F,
+    ) -> Result<u64> {
+        use std::io::Write;
 
         let mut file = std::fs::File::create(local_path).map_err(|e| {
             Error::agent(
@@ -1782,7 +1826,6 @@ impl AgentClient {
         })?;
 
         let mut total = 0u64;
-        let cap = file_transfer_max_total();
         loop {
             match self.recv_raw()? {
                 AgentResponse::DataChunk { data, done } => {
@@ -1790,7 +1833,7 @@ impl AgentClient {
                     if next_total > cap {
                         let _ = std::fs::remove_file(local_path);
                         return Err(Error::agent(
-                            "read file",
+                            operation,
                             format!(
                                 "guest streamed {} bytes, exceeding the {} byte cap",
                                 next_total, cap
@@ -1811,11 +1854,11 @@ impl AgentClient {
                 }
                 AgentResponse::Error { message, .. } => {
                     let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent("read file", message));
+                    return Err(Error::agent(operation, message));
                 }
                 _ => {
                     let _ = std::fs::remove_file(local_path);
-                    return Err(Error::agent("read file", "unexpected response"));
+                    return Err(Error::agent(operation, "unexpected response"));
                 }
             }
         }

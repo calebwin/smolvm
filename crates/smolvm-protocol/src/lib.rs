@@ -306,6 +306,16 @@ pub enum AgentRequest {
         layer_index: usize,
     },
 
+    /// Export a guest directory as a tar archive.
+    ///
+    /// Used by `pack create --from-vm` to stream a mounted, flattened rootfs
+    /// directly to the host without materializing a second copy on the guest's
+    /// scratch disk.
+    ExportDirectory {
+        /// Absolute directory path inside the guest.
+        path: String,
+    },
+
     /// Execute a command directly in the VM (not in a container).
     ///
     /// This runs the command in the agent's Alpine rootfs without any
@@ -591,6 +601,8 @@ impl AgentRequest {
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
+            // The path can reveal workload data, so log only the variant.
+            AgentRequest::ExportDirectory { .. } => "ExportDirectory".into(),
             AgentRequest::VmExec { .. } => "VmExec".into(),
             AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
             AgentRequest::Stdin { .. } => "Stdin".into(),
@@ -722,8 +734,8 @@ pub enum AgentResponse {
     ///
     /// Used by every streaming download direction: the agent sends
     /// one or more `DataChunk` responses in sequence, with `done: true`
-    /// on the final chunk. Current producers: `ExportLayer` and
-    /// `FileRead`.
+    /// on the final chunk. Current producers: `ExportLayer`,
+    /// `ExportDirectory`, and `FileRead`.
     ///
     /// Payload size per chunk should stay under
     /// [`LAYER_CHUNK_SIZE`] so the encoded frame (~1.33× after

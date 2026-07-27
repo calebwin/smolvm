@@ -1926,6 +1926,14 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // Handle directory exports with the same bounded chunked stream as
+        // image layers. This is used by from-VM packing for a mounted merged
+        // rootfs, avoiding a temporary tar on the guest disk.
+        if let AgentRequest::ExportDirectory { ref path } = request {
+            handle_streaming_export_directory(stream, path)?;
+            continue;
+        }
+
         // Handle FileRead with chunked streaming (replaces the old
         // single-shot FileData path that capped files at ~16 MiB).
         if let AgentRequest::FileRead { ref path } = request {
@@ -2215,9 +2223,9 @@ fn handle_request(
             error_codes::INVALID_REQUEST,
         ),
 
-        AgentRequest::ExportLayer { .. } => {
-            // Streaming export is handled by handle_streaming_export_layer
-            AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
+        AgentRequest::ExportLayer { .. } | AgentRequest::ExportDirectory { .. } => {
+            // Streaming exports are handled at the connection level.
+            AgentResponse::error("export not handled here", error_codes::INTERNAL_ERROR)
         }
 
         AgentRequest::FileWrite { path, data, mode } => handle_file_write(&path, &data, mode),
@@ -2813,6 +2821,27 @@ fn send_data_chunks<R: Read>(
     error_context: &str,
     error_code: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    send_data_chunks_until_eof(stream, reader, chunk_size, error_context, error_code)?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: vec![],
+            done: true,
+        },
+    )?;
+    Ok(())
+}
+
+/// Stream all data frames but leave the final success/error response to the
+/// caller. Tar producers use this so a non-zero child exit cannot be reported
+/// as a successful archive merely because stdout reached EOF first.
+fn send_data_chunks_until_eof<R: Read>(
+    stream: &mut impl Write,
+    reader: &mut R,
+    chunk_size: usize,
+    error_context: &str,
+    error_code: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; chunk_size];
     loop {
         // Fill as much of the buffer as possible in one chunk.
@@ -2836,14 +2865,7 @@ fn send_data_chunks<R: Read>(
         }
 
         if pending == 0 {
-            // EOF — emit the terminator frame.
-            send_response(
-                stream,
-                &AgentResponse::DataChunk {
-                    data: vec![],
-                    done: true,
-                },
-            )?;
+            // EOF — the caller decides whether this is a successful end.
             return Ok(());
         }
 
@@ -5340,10 +5362,41 @@ fn handle_streaming_export_layer(
         }
     };
 
+    stream_tar_directory(stream, &layer_dir)
+}
+
+/// Handle a generic directory export with chunked streaming.
+fn handle_streaming_export_directory(
+    stream: &mut impl Write,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
+    info!("exporting directory (streamed)");
+
+    let directory = std::path::Path::new(path);
+    if !directory.is_absolute() || !directory.is_dir() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                "export directory must be an existing absolute directory",
+                error_codes::EXPORT_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    stream_tar_directory(stream, directory)
+}
+
+/// Pipe a directory through tar and report success only after tar exits zero.
+fn stream_tar_directory(
+    stream: &mut impl Write,
+    directory: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Pipe tar stdout directly — no temp file on disk.
     let mut child = match std::process::Command::new("tar")
         .args(["-cf", "-", "-C"])
-        .arg(&layer_dir)
+        .arg(directory)
         .arg(".")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -5364,8 +5417,8 @@ fn handle_streaming_export_layer(
 
     let mut stdout = child.stdout.take().unwrap();
 
-    // Shared streaming path — same helper used by FileRead.
-    let result = send_data_chunks(
+    // Defer the terminal success frame until tar's exit status is known.
+    let result = send_data_chunks_until_eof(
         stream,
         &mut stdout,
         LAYER_CHUNK_SIZE,
@@ -5376,9 +5429,28 @@ fn handle_streaming_export_layer(
     // response; we still need to clean up the tar subprocess.
     if result.is_err() {
         let _ = child.kill();
+        let _ = child.wait();
+        return result;
     }
-    let _ = child.wait();
-    result
+    let status = child.wait()?;
+    if !status.success() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("tar exited with status {}", status),
+                error_codes::EXPORT_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: vec![],
+            done: true,
+        },
+    )?;
+    Ok(())
 }
 
 /// Handle storage status request.

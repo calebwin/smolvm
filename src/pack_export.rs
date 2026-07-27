@@ -29,6 +29,9 @@ use smolvm_pack::format::{PackManifest, PackMode};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+const EXPORT_SCRATCH_HEADROOM_GIB: u64 = 10;
+
 /// Options for a from-VM export.
 #[derive(Debug, Default, Clone)]
 pub struct FromVmExportOptions {
@@ -179,6 +182,7 @@ impl ExportVm {
         vm_name: &str,
         source_vm_dir: &Path,
         packed_layers_dir: Option<PathBuf>,
+        staged_layer_bytes: u64,
         network: bool,
     ) -> crate::Result<Self> {
         let (storage_disk, storage_fmt) = resolve_disk_image(source_vm_dir, STORAGE_DISK_FILENAME);
@@ -205,9 +209,16 @@ impl ExportVm {
                 .as_nanos()
         );
         let data_dir = vm_data_dir(&scratch_name);
+        let source_allocated_bytes = allocated_file_bytes(&storage_disk)?;
+        let scratch_storage_gib =
+            export_scratch_storage_gib(source_allocated_bytes, staged_layer_bytes);
 
-        println!("Starting agent VM to export machine state...");
-        let manager = AgentManager::for_vm(&scratch_name)?;
+        println!(
+            "Starting agent VM to export machine state ({} GiB scratch)...",
+            scratch_storage_gib
+        );
+        let manager =
+            AgentManager::for_vm_with_sizes(&scratch_name, Some(scratch_storage_gib), None)?;
         let features = LaunchFeatures {
             extra_disks: vec![(storage_disk, false, storage_fmt)],
             packed_layers_dir,
@@ -231,7 +242,7 @@ impl ExportVm {
                 cuda: false,
                 gpu_vram_mib: None,
                 rosetta: false,
-                storage_gib: None,
+                storage_gib: Some(scratch_storage_gib),
                 overlay_gib: None,
                 allowed_cidrs: None,
             },
@@ -285,6 +296,61 @@ impl Drop for ExportVm {
     }
 }
 
+/// Size the export VM for the one working copy it must hold. The source
+/// machine's storage disk remains attached separately, and the flattened tar
+/// streams directly to the host, so neither belongs in this capacity twice.
+fn export_scratch_storage_gib(source_allocated_bytes: u64, staged_layer_bytes: u64) -> u64 {
+    let working_bytes = source_allocated_bytes.max(staged_layer_bytes);
+    let working_gib = working_bytes
+        .saturating_add(BYTES_PER_GIB - 1)
+        .checked_div(BYTES_PER_GIB)
+        .unwrap_or(u64::MAX);
+    working_gib
+        .saturating_add(EXPORT_SCRATCH_HEADROOM_GIB)
+        .max(crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+}
+
+/// Return physical host bytes for a sparse source disk. Registry-sourced
+/// machines already hold their extracted image layers in this disk, so its
+/// allocated size is a conservative estimate of the helper's pull workspace.
+fn allocated_file_bytes(path: &Path) -> crate::Result<u64> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| Error::agent("size export source disk", e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(metadata.blocks().saturating_mul(512))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(metadata.len())
+    }
+}
+
+/// Sum logical file sizes without following symlinks. Imported artifact
+/// layers are copied file-for-file into the helper, so apparent bytes are the
+/// relevant capacity measure (rather than the host filesystem's block usage).
+fn directory_apparent_bytes(path: &Path) -> crate::Result<u64> {
+    fn walk(path: &Path) -> std::io::Result<u64> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Ok(metadata.len());
+        }
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            total = total.saturating_add(walk(&entry?.path())?);
+        }
+        Ok(total)
+    }
+
+    walk(path).map_err(|e| {
+        Error::agent(
+            "size imported layer for export",
+            format!("{}: {}", path.display(), e),
+        )
+    })
+}
+
 /// Registry-image machine: pull the base image inside the helper VM (layers
 /// extract to its local disk), then flatten base layers + the machine's
 /// persistent container overlay into a single exported layer.
@@ -295,7 +361,7 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<()> {
-    let export_vm = ExportVm::start(vm_name, vm_dir, None, true)?;
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, 0, true)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -345,7 +411,16 @@ fn export_flattened_from_artifact_sourced(
         )
     })?;
 
-    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir.clone()), false)?;
+    let staged_layer_bytes = layer_ids.iter().try_fold(0u64, |total, id| {
+        directory_apparent_bytes(&pack_content_dir.join(id)).map(|size| total.saturating_add(size))
+    })?;
+    let export_vm = ExportVm::start(
+        vm_name,
+        vm_dir,
+        Some(pack_content_dir.clone()),
+        staged_layer_bytes,
+        false,
+    )?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -422,10 +497,10 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source
-/// machine's persistent container overlay on top, tar the merged view, and
-/// register the stream as the pack's single layer. The overlay mount applies
-/// whiteouts/opaque markers exactly as the runtime would, so the flattened
-/// tree is byte-equivalent to what the machine's container saw.
+/// machine's persistent container overlay on top, stream the merged view to
+/// the host, and register it as the pack's single layer. The overlay mount
+/// applies whiteouts/opaque markers exactly as the runtime would, so the
+/// flattened tree is byte-equivalent to what the machine's container saw.
 fn flatten_and_export(
     collector: &mut AssetCollector,
     client: &mut AgentClient,
@@ -444,27 +519,21 @@ fn flatten_and_export(
         "Flattening {} layer(s) + container overlay...",
         lowers.len()
     );
-    let script = format!(
-        "set -e\n\
-         low='{base_chain}'\n\
-         n={n}\n\
-         if [ -d '{upper}' ] && [ -n \"$(ls -A '{upper}' 2>/dev/null)\" ]; then\n\
-           low=\"{upper}:$low\"; n=$((n+1))\n\
-         fi\n\
-         if [ \"$n\" -eq 1 ]; then\n\
-           tar cf /storage/flat-export.tar -C \"${{low%%:*}}\" .\n\
-         else\n\
-           mkdir -p /tmp/flatview\n\
-           mount -t overlay overlay -o lowerdir=\"$low\" /tmp/flatview\n\
-           tar cf /storage/flat-export.tar -C /tmp/flatview .\n\
-           umount /tmp/flatview\n\
-         fi\n\
-         echo FLAT_OK\n",
-        n = lowers.len(),
-    );
+    let script = "set -e\n\
+                  low=\"$SMOLVM_EXPORT_LOWERS\"\n\
+                  upper=\"$SMOLVM_EXPORT_UPPER\"\n\
+                  if [ -d \"$upper\" ] && [ -n \"$(ls -A \"$upper\" 2>/dev/null)\" ]; then\n\
+                    low=\"$upper:$low\"\n\
+                  fi\n\
+                  mkdir -p /tmp/flatview\n\
+                  mount -t overlay overlay -o lowerdir=\"$low\" /tmp/flatview\n\
+                  echo FLAT_OK\n";
     let (exit_code, stdout, stderr) = client.vm_exec(
-        vec!["sh".to_string(), "-c".to_string(), script],
-        vec![],
+        vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+        vec![
+            ("SMOLVM_EXPORT_LOWERS".to_string(), base_chain),
+            ("SMOLVM_EXPORT_UPPER".to_string(), upper),
+        ],
         None,
         None,
         None,
@@ -481,15 +550,38 @@ fn flatten_and_export(
         ));
     }
 
-    // Stream the flattened tar to disk (never buffered whole in memory), then
-    // content-address it. Stage in the layers dir so the final rename is
-    // atomic on the same filesystem.
+    // Stream the mounted merged directory directly to host staging, then
+    // content-address it. No second image-sized copy is created in the helper.
     let tmp_file = collector
         .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
         .with_file_name("flat-export.tmp");
-    let total = client
-        .read_file_to_path("/storage/flat-export.tar", &tmp_file, |_| {})
-        .map_err(|e| Error::agent("export flattened layer", e.to_string()))?;
+    let export_result = client
+        .export_directory_to_path("/tmp/flatview", &tmp_file, |_| {})
+        .map_err(|e| Error::agent("export flattened layer", e.to_string()));
+
+    // Always detach the overlay before the helper shuts down. Preserve the
+    // export error if both operations fail because it is the actionable cause.
+    let cleanup_result = client.vm_exec(
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "umount /tmp/flatview".to_string(),
+        ],
+        vec![],
+        None,
+        None,
+        None,
+    );
+    let total = export_result?;
+    match cleanup_result {
+        Ok((0, _, _)) => {}
+        Ok((code, _, stderr)) => warn!(
+            exit_code = code,
+            stderr = %String::from_utf8_lossy(&stderr),
+            "failed to unmount pack export view"
+        ),
+        Err(e) => warn!(error = %e, "failed to unmount pack export view"),
+    }
     if total == 0 {
         let _ = std::fs::remove_file(&tmp_file);
         return Err(Error::agent(
@@ -633,4 +725,50 @@ fn read_qcow2_virtual_size(path: &Path) -> crate::Result<u64> {
         ));
     }
     Ok(u64::from_be_bytes(header[24..32].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_scratch_size_has_floor_headroom_and_rounds_up() {
+        assert_eq!(export_scratch_storage_gib(0, 0), 20);
+        assert_eq!(export_scratch_storage_gib(15 * BYTES_PER_GIB, 0), 25);
+        assert_eq!(export_scratch_storage_gib(0, 15 * BYTES_PER_GIB + 1), 26);
+    }
+
+    #[test]
+    fn export_scratch_size_uses_larger_workspace_estimate() {
+        assert_eq!(
+            export_scratch_storage_gib(8 * BYTES_PER_GIB, 31 * BYTES_PER_GIB),
+            41
+        );
+        assert_eq!(
+            export_scratch_storage_gib(42 * BYTES_PER_GIB, 12 * BYTES_PER_GIB),
+            52
+        );
+    }
+
+    #[test]
+    fn apparent_directory_size_recurses_without_following_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(temp.path().join("one"), vec![1u8; 7]).unwrap();
+        std::fs::write(nested.join("two"), vec![2u8; 11]).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(temp.path().join("one"), nested.join("link")).unwrap();
+
+        let expected = 18
+            + if cfg!(unix) {
+                std::fs::symlink_metadata(nested.join("link"))
+                    .unwrap()
+                    .len()
+            } else {
+                0
+            };
+        assert_eq!(directory_apparent_bytes(temp.path()).unwrap(), expected);
+    }
 }
