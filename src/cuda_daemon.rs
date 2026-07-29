@@ -2785,6 +2785,14 @@ fn metadata_layout_waiters(
 
 #[cfg(unix)]
 fn retain_metadata_layout_for_clone(token: u64, clone_id: u64, vm_pid: u32) -> bool {
+    // A frozen memory-bearing layout is also held strongly by the metadata
+    // cache after golden eviction, but its ordinary-allocation handoff has
+    // already moved into host_snapshot_cache. Do not reclassify that layout as
+    // a metadata-only helper: completing the resulting waiter set would drop
+    // the module/function/handle metadata needed by later pool replacements.
+    if cached_host_snapshot(token).is_some() {
+        return false;
+    }
     let mut waiters = metadata_layout_waiters().lock().unwrap();
     if !smolvm_cuda::host::cache_metadata_only_layout(token) {
         return false;
@@ -4292,6 +4300,29 @@ mod mps_tests {
         assert!(!host_snapshot_reconstructable(0, 0));
         assert!(host_snapshot_reconstructable(1, 0));
         assert!(host_snapshot_reconstructable(0, 1));
+    }
+
+    #[test]
+    fn frozen_memory_layout_is_not_reclassified_as_metadata_only() {
+        let token = u64::MAX - 41;
+        super::host_snapshot_cache().lock().unwrap().insert(
+            token,
+            Arc::new(super::CachedHostSnapshot {
+                layout: String::new(),
+                device: 0,
+                fds: Vec::new(),
+                host_bytes: 1,
+                golden_pid: std::sync::atomic::AtomicU32::new(0),
+            }),
+        );
+
+        assert!(!super::retain_metadata_layout_for_clone(token, 7, 11));
+        assert!(!super::metadata_layout_waiters()
+            .lock()
+            .unwrap()
+            .contains_key(&token));
+
+        super::host_snapshot_cache().lock().unwrap().remove(&token);
     }
 
     #[test]
