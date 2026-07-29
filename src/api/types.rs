@@ -505,6 +505,10 @@ pub struct CreateMachineRequest {
     /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
     #[serde(default)]
     pub cuda: bool,
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies CUDA; arbitrary eager CUDA calls are not captured.
+    #[serde(default)]
+    pub auto_graph: bool,
     /// Workload entrypoint. With `cmd`, overrides the image's (or the
     /// `.smolmachine` artifact's) own entrypoint+cmd, matching the CLI's
     /// `machine create -- <command>` precedence. Empty = use the image's.
