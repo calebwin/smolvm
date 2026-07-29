@@ -367,10 +367,14 @@ struct Session {
     /// daemon, so one long-lived daemon can serve machines with different
     /// capacity policies.
     vram_limit_bytes: Option<u64>,
-    /// Number of forked workers the golden is expected to produce. The host
-    /// exposes a fair share of physical VRAM across the frozen golden and all
-    /// requested workers before frameworks size caches during initialization.
+    /// Number of forked workers the golden is expected to produce. Goldens get
+    /// the density-oriented load budget; workers get a fair share for private
+    /// post-fork growth before frameworks size caches during initialization.
     fork_pool_size: Option<u32>,
+    /// Whether this connection belongs to a fork clone. A golden needs enough
+    /// logical capacity to load the shared base model before it forks; only
+    /// clones should divide private growth across the whole pool.
+    fork_clone: bool,
     next_id: u64,
     modules: HashMap<u64, u64>,
     functions: HashMap<u64, u64>,
@@ -2006,6 +2010,8 @@ pub struct ServeOptions {
     pub vram_limit_bytes: Option<u64>,
     /// Number of runnable fork clones expected from this golden.
     pub fork_pool_size: Option<u32>,
+    /// Whether this connection belongs to a fork clone.
+    pub fork_clone: bool,
 }
 
 impl ServeOptions {
@@ -2026,9 +2032,11 @@ impl ServeOptions {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&v| v > 0);
+        let fork_clone = std::env::var_os("SMOLVM_CUDA_CLONE_LAYOUT").is_some();
         Self {
             vram_limit_bytes,
             fork_pool_size,
+            fork_clone,
         }
     }
 }
@@ -2048,6 +2056,7 @@ pub fn serve_with_options<S: Read + Write>(
     let mut sess = Session {
         vram_limit_bytes: options.vram_limit_bytes,
         fork_pool_size: options.fork_pool_size,
+        fork_clone: options.fork_clone,
         ..Session::default()
     };
     let r = serve_inner(stream, backend, &mut sess);
@@ -2612,7 +2621,14 @@ fn env_vram_limit() -> u64 {
 const FORK_POOL_HEADROOM_PERCENT: u64 = 10;
 const DEFAULT_FORK_DENSITY_SLOTS: u64 = 8;
 
-fn pool_vram_limit(total: u64, fork_pool_size: u32) -> u64 {
+fn pool_vram_limit(total: u64, fork_pool_size: u32, fork_clone: bool) -> u64 {
+    let density_limit = total / DEFAULT_FORK_DENSITY_SLOTS;
+    if !fork_clone {
+        // The golden must first load the complete shareable base model. Its
+        // resident allocation is frozen and shared rather than multiplied by
+        // the number of workers, so dividing it by the pool size is incorrect.
+        return density_limit;
+    }
     let sessions = u64::from(fork_pool_size).saturating_add(1);
     let fair_share = total
         .saturating_mul(100 - FORK_POOL_HEADROOM_PERCENT)
@@ -2624,7 +2640,7 @@ fn pool_vram_limit(total: u64, fork_pool_size: u32) -> u64 {
     // and graph set that later becomes expensive or unreliable to reconstruct.
     // Preserve the validated density-oriented default while still shrinking
     // further when the requested pool itself needs a smaller fair share.
-    fair_share.min(total / DEFAULT_FORK_DENSITY_SLOTS)
+    fair_share.min(density_limit)
 }
 
 fn session_vram_limit(sess: &Session, physical_total: u64) -> u64 {
@@ -2632,7 +2648,7 @@ fn session_vram_limit(sess: &Session, physical_total: u64) -> u64 {
         .or_else(|| {
             sess.fork_pool_size
                 .filter(|&n| n > 0)
-                .map(|n| pool_vram_limit(physical_total, n))
+                .map(|n| pool_vram_limit(physical_total, n, sess.fork_clone))
         })
         .unwrap_or_else(env_vram_limit)
 }
@@ -3224,7 +3240,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                             0
                         };
                         let total = b.device_total_mem(device)?;
-                        sess.vram_limit_bytes = Some(pool_vram_limit(total, pool_size));
+                        sess.vram_limit_bytes =
+                            Some(pool_vram_limit(total, pool_size, sess.fork_clone));
                     }
                 }
                 Ok(Response::Handle(token))
@@ -4706,10 +4723,18 @@ mod tests {
     use std::io::{Read, Write};
 
     #[test]
-    fn fork_pool_budget_includes_frozen_golden_and_headroom() {
+    fn golden_capacity_can_load_the_shared_model_at_high_fanout() {
         let gib = 1024_u64 * 1024 * 1024;
-        assert_eq!(pool_vram_limit(80 * gib, 2), 10 * gib);
-        assert_eq!(pool_vram_limit(80 * gib, 7), 9 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 2, false), 10 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 24, false), 10 * gib);
+    }
+
+    #[test]
+    fn clone_capacity_reserves_pool_headroom() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(pool_vram_limit(80 * gib, 2, true), 10 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 7, true), 9 * gib);
+        assert_eq!(pool_vram_limit(80 * gib, 24, true), 72 * gib / 25);
     }
 
     #[test]
@@ -4717,7 +4742,8 @@ mod tests {
         let gib = 1024_u64 * 1024 * 1024;
         let sess = Session {
             vram_limit_bytes: Some(10 * gib),
-            fork_pool_size: Some(2),
+            fork_pool_size: Some(24),
+            fork_clone: true,
             ..Session::default()
         };
         assert_eq!(session_vram_limit(&sess, 80 * gib), 10 * gib);
@@ -4731,7 +4757,7 @@ mod tests {
         };
         let mut backend = CpuBackend::default();
         let physical_total = backend.device_total_mem(0).unwrap();
-        let expected = pool_vram_limit(physical_total, 2);
+        let expected = pool_vram_limit(physical_total, 2, false);
 
         let (status, _) = dispatch(
             &mut sess,
@@ -4754,11 +4780,12 @@ mod tests {
     fn fork_pool_budget_is_advertised_and_enforced() {
         let mut sess = Session {
             fork_pool_size: Some(2),
+            fork_clone: true,
             ..Session::default()
         };
         let mut backend = CpuBackend::default();
         let physical_total = backend.device_total_mem(0).unwrap();
-        let expected = pool_vram_limit(physical_total, 2);
+        let expected = pool_vram_limit(physical_total, 2, true);
 
         let (status, response) = dispatch(
             &mut sess,

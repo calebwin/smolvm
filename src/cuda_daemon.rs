@@ -593,13 +593,13 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                         // remote clone VM's proxy) route to a worker or
                                         // are rejected; a golden's reconnect (token, no
                                         // preamble) falls through to in-daemon serving.
-                                        let policy = consume_policy_preamble(s.as_raw_fd());
+                                        let mut policy = consume_policy_preamble(s.as_raw_fd());
                                         let rdir = consume_ring_dir_preamble(s.as_raw_fd());
                                         if route_clone_connection(
                                             s.as_raw_fd(),
                                             rdir.as_deref(),
                                             None,
-                                            policy,
+                                            &mut policy,
                                         ) {
                                             drop(s); // worker owns it / rejected
                                             continue;
@@ -644,12 +644,16 @@ pub fn run(sock: &Path) -> io::Result<()> {
                 #[cfg(unix)]
                 let (guest_ram, ring_dir, policy) = {
                     use std::os::unix::io::AsRawFd;
-                    let policy = consume_policy_preamble(stream.as_raw_fd());
+                    let mut policy = consume_policy_preamble(stream.as_raw_fd());
                     let ram = consume_ram_preamble(stream.as_raw_fd());
                     let rdir = consume_ring_dir_preamble(stream.as_raw_fd());
                     let procmem = consume_procmem_preamble(stream.as_raw_fd());
-                    if route_clone_connection(stream.as_raw_fd(), rdir.as_deref(), procmem, policy)
-                    {
+                    if route_clone_connection(
+                        stream.as_raw_fd(),
+                        rdir.as_deref(),
+                        procmem,
+                        &mut policy,
+                    ) {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
@@ -754,6 +758,7 @@ fn consume_policy_preamble(fd: std::os::unix::io::RawFd) -> ServeOptions {
     ServeOptions {
         vram_limit_bytes: (limit > 0).then_some(limit),
         fork_pool_size: (pool > 0).then_some(pool),
+        fork_clone: false,
     }
 }
 
@@ -2309,11 +2314,15 @@ fn route_clone_connection(
     fd: std::os::unix::io::RawFd,
     ring_dir: Option<&str>,
     procmem: Option<ProcMemAdvert>,
-    options: ServeOptions,
+    options: &mut ServeOptions,
 ) -> bool {
     let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
+    // Shared-context clones fall through to ordinary serving, while isolated
+    // clones route into a worker process. Both need a per-clone private-growth
+    // budget rather than the golden's model-load budget.
+    options.fork_clone = true;
     // The preamble must always be stripped, but a warm-dial connection must
     // not bypass the worker-mode gate below. Previously the warm branch spawned
     // a Path-3 worker unconditionally, so `SMOLVM_CUDA_FORK_WORKERS` unset still
@@ -2383,7 +2392,7 @@ fn route_clone_connection(
             share_weights,
             ring_dir,
             procmem.clone(),
-            options,
+            *options,
         ) {
             Ok((pid, ctrl)) => {
                 reg.insert((*token, clone_id), (pid, ctrl));
@@ -2547,7 +2556,14 @@ fn route_clone_connection(
             }
         }
     }
-    match spawn_clone_worker(fd, token, share_weights, ring_dir, procmem.clone(), options) {
+    match spawn_clone_worker(
+        fd,
+        token,
+        share_weights,
+        ring_dir,
+        procmem.clone(),
+        *options,
+    ) {
         Ok((pid, ctrl)) => {
             reg.insert((token, clone_id), (pid, ctrl));
             complete_metadata_layout_waiter(token, clone_id);
@@ -3300,6 +3316,7 @@ mod mps_tests {
         let policy = super::consume_policy_preamble(reader.as_raw_fd());
         assert_eq!(policy.vram_limit_bytes, Some(10_u64 * 1024 * 1024 * 1024));
         assert_eq!(policy.fork_pool_size, Some(2));
+        assert!(!policy.fork_clone);
     }
 
     #[test]
