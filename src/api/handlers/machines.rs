@@ -727,7 +727,7 @@ pub async fn create_machine(
         memory_mb: Some(mem),
         network: Some(network),
         gpu: Some(req.gpu),
-        cuda: Some(req.cuda),
+        cuda: Some(req.cuda || req.auto_graph),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: normalized_cidrs,
@@ -741,6 +741,10 @@ pub async fn create_machine(
     // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
     crate::api::handlers::validate_request_env(&req.env)?;
+    let mut workload_env = merge_request_env(env, &req.env);
+    if req.auto_graph {
+        crate::util::enable_cuda_auto_graph_env(&mut workload_env);
+    }
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
@@ -770,7 +774,7 @@ pub async fn create_machine(
         source_smolmachine,
         entrypoint,
         cmd,
-        env: merge_request_env(env, &req.env),
+        env: workload_env,
         workdir: req.workdir.clone().or(workdir),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
@@ -2409,6 +2413,7 @@ mod tests {
             network: false,
             gpu: false,
             cuda: false,
+            auto_graph: false,
             entrypoint: vec![],
             cmd: vec![],
             docker_socket: false,
@@ -2471,6 +2476,52 @@ mod tests {
         assert_eq!(req.env[0].name, "FOO");
         assert_eq!(req.env[0].value, "bar");
         assert_eq!(req.workdir.as_deref(), Some("/app"));
+    }
+
+    #[test]
+    fn create_request_auto_graph_is_opt_in() {
+        let enabled: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "autoGraph": true
+        }))
+        .unwrap();
+        assert!(enabled.auto_graph);
+
+        let defaulted: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm"
+        }))
+        .unwrap();
+        assert!(!defaulted.auto_graph);
+    }
+
+    #[test]
+    fn auto_graph_policy_overrides_conflicting_request_env() {
+        let mut env = merge_request_env(
+            vec![(
+                crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
+                "0".to_string(),
+            )],
+            &[crate::api::types::EnvVar {
+                name: crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
+                value: "0".to_string(),
+            }],
+        );
+
+        crate::util::enable_cuda_auto_graph_env(&mut env);
+
+        assert_eq!(
+            env,
+            vec![
+                (
+                    crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
+                    "1".to_string()
+                ),
+                (
+                    crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
+                    "1".to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -531,6 +531,11 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Hardware")]
     pub cuda: bool,
 
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long, help_heading = "Hardware")]
+    pub auto_graph: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long, help_heading = "Network")]
@@ -869,6 +874,10 @@ impl RunCmd {
         // flags pass through. Flags the sidecar runner can't honor are rejected
         // at parse time via `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            let mut env = self.env;
+            if self.auto_graph {
+                smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+            }
             return crate::cli::pack_run::PackRunCmd {
                 sidecar: Some(from),
                 command: self.command,
@@ -876,7 +885,7 @@ impl RunCmd {
                 tty: self.tty,
                 timeout: self.timeout,
                 workdir: self.workdir,
-                env: self.env,
+                env,
                 volume: self.volume,
                 port: self.port,
                 net: self.net,
@@ -888,7 +897,8 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
-                cuda: false,
+                cuda: self.cuda,
+                auto_graph: self.auto_graph,
             }
             .run();
         }
@@ -942,6 +952,10 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -1003,7 +1017,8 @@ impl RunCmd {
                     force_extract: false,
                     info: false,
                     debug: false,
-                    cuda: false,
+                    cuda: self.cuda || params.cuda,
+                    auto_graph: self.auto_graph,
                 }
                 .run();
             }
@@ -1056,7 +1071,8 @@ impl RunCmd {
                 force_extract: false,
                 info: false,
                 debug: false,
-                cuda: false,
+                cuda: self.cuda || params.cuda,
+                auto_graph: self.auto_graph,
             }
             .run();
         }
@@ -1887,6 +1903,36 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn run_accepts_auto_graph_flag() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--auto-graph",
+            "--image",
+            "alpine",
+            "--",
+            "true",
+        ]);
+
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert!(cmd.auto_graph);
+        assert!(!cmd.cuda, "auto-graph implies CUDA during parameter merge");
+    }
+
+    #[test]
+    fn create_accepts_auto_graph_flag() {
+        let cli =
+            TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--auto-graph"]);
+
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert!(cmd.auto_graph);
+    }
+
     // Documents the clap parsing behaviour: positionals before "--" land in
     // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
     // cases before a VM is booted.
@@ -2385,6 +2431,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub cuda: bool,
 
+    /// Ask compatible CUDA frameworks to graph safe compiled regions.
+    /// Implies --cuda; arbitrary eager CUDA calls are not captured.
+    #[arg(long)]
+    pub auto_graph: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long)]
@@ -2493,6 +2544,10 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        if self.auto_graph {
+            smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
+            params.cuda = true;
+        }
         params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
@@ -2684,6 +2739,9 @@ impl CreateCmd {
             env: {
                 let mut env = manifest.env;
                 env.extend(self.env.iter().cloned());
+                if self.auto_graph {
+                    smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+                }
                 env
             },
             workdir: manifest.workdir,
@@ -2699,7 +2757,7 @@ impl CreateCmd {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
-            cuda: self.cuda,
+            cuda: self.cuda || self.auto_graph,
             docker_socket: self.docker_socket,
             dns_filter_hosts: None,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
