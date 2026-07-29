@@ -45,6 +45,52 @@ fn mps_enabled(mode: Option<&str>, fork_workers: bool) -> bool {
     }
 }
 
+/// Frozen fork pools can release the golden's CUDA context after every initial
+/// worker is resident. The host snapshot is automatic for pools; the explicit
+/// setting is a rollback switch, not an opt-in requirement.
+fn golden_eviction_enabled(mode: Option<&str>, fork_pool_size: Option<u32>) -> bool {
+    let pool_enabled = fork_pool_size.is_some_and(|size| size > 0);
+    match mode.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("0" | "off" | "false" | "no") => false,
+        Some("1" | "on" | "true" | "yes" | "force") => pool_enabled,
+        Some(_) | None => pool_enabled,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_snapshot_fits(required: u64, meminfo: &str) -> bool {
+    let available_kib = meminfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "MemAvailable:")
+            .then(|| fields.next()?.parse::<u64>().ok())
+            .flatten()
+    });
+    let Some(available) = available_kib.and_then(|kib| kib.checked_mul(1024)) else {
+        return false;
+    };
+    // Leave meaningful room for the host, VMs, and page cache. The snapshot is
+    // anonymous memory and must not turn a GPU-density optimization into host
+    // memory pressure.
+    let reserve = (required / 4).max(1 << 30);
+    required
+        .checked_add(reserve)
+        .is_some_and(|needed| needed <= available)
+}
+
+#[cfg(target_os = "linux")]
+fn host_snapshot_capacity_available(required: u64) -> bool {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .is_some_and(|meminfo| host_snapshot_fits(required, &meminfo))
+}
+
+fn host_snapshot_reconstructable(vmm_maps: usize) -> bool {
+    // Ordinary CUDA allocations can contain device pointers that RPC-boundary
+    // translation cannot see. At least one VMM mapping is required before the
+    // automatic durable-snapshot path is allowed to own the source state.
+    vmm_maps > 0
+}
+
 #[cfg(target_os = "linux")]
 fn mps_control_binary() -> std::ffi::OsString {
     std::env::var_os("SMOLVM_CUDA_MPS_CONTROL").unwrap_or_else(|| "nvidia-cuda-mps-control".into())
@@ -296,10 +342,10 @@ fn is_alive(sock: &Path) -> bool {
 /// How long the daemon may sit with ZERO open connections before it exits and
 /// releases the GPU context. `None` (env set to `0`) disables the timeout.
 ///
-/// Counting *open connections* (not activity) is what makes this fork-safe: a
-/// frozen golden keeps its proxied connection open, so it counts as active and
-/// never trips the timeout even while paused. The daemon only exits once every
-/// VM — golden and clones — has disconnected.
+/// Counting open connections, clone workers, and retained golden snapshots
+/// makes this fork-safe: a frozen golden remains represented after its CUDA
+/// channels are intentionally evicted, so the daemon stays available for later
+/// pool replenishment until that golden VM exits.
 fn idle_timeout() -> Option<Duration> {
     let secs = std::env::var("SMOLVM_CUDA_DAEMON_IDLE_SECS")
         .ok()
@@ -309,7 +355,7 @@ fn idle_timeout() -> Option<Duration> {
 }
 
 /// Exit the process once `active` has been 0 for `timeout`. Polls slowly (the
-/// timeout is coarse) and resets the idle clock whenever a connection is live.
+/// timeout is coarse) and resets the idle clock whenever CUDA state is live.
 fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
     thread::Builder::new()
         .name("cuda-daemon-idle".into())
@@ -320,7 +366,15 @@ fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
                 #[cfg(unix)]
                 prune_dead_metadata_layout_waiters();
                 let live_workers = live_clone_worker_count();
-                if daemon_has_live_cuda_clients(active.load(Ordering::SeqCst), live_workers) {
+                #[cfg(unix)]
+                let live_snapshots = live_host_snapshot_count();
+                #[cfg(not(unix))]
+                let live_snapshots = 0;
+                if daemon_has_live_cuda_clients(
+                    active.load(Ordering::SeqCst),
+                    live_workers,
+                    live_snapshots,
+                ) {
                     idle_since = Instant::now();
                 } else if idle_since.elapsed() >= timeout {
                     tracing::info!(
@@ -608,7 +662,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                     };
                                     #[cfg(not(unix))]
                                     let policy = ServeOptions::default();
-                                    spawn_serve(s, &active_tcp, None, None, policy);
+                                    spawn_serve(s, &active_tcp, None, None, policy, None);
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, "CUDA daemon TCP accept error")
@@ -642,7 +696,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
                 // would silently serve it a reconstructed COPY of its memory.
                 // Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
-                let (guest_ram, ring_dir, policy) = {
+                let (guest_ram, ring_dir, policy, golden_connection) = {
                     use std::os::unix::io::AsRawFd;
                     let mut policy = consume_policy_preamble(stream.as_raw_fd());
                     let ram = consume_ram_preamble(stream.as_raw_fd());
@@ -657,11 +711,28 @@ pub fn run(sock: &Path) -> io::Result<()> {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
-                    (ram, rdir, policy)
+                    let golden_connection = ram.as_ref().map(|(pid, _)| {
+                        let token = peek_clone_token(stream.as_raw_fd()).unwrap_or(0);
+                        (*pid, token, stream.as_raw_fd())
+                    });
+                    (
+                        ram.map(|(_, regions)| regions),
+                        rdir,
+                        policy,
+                        golden_connection,
+                    )
                 };
                 #[cfg(not(unix))]
-                let (guest_ram, ring_dir, policy) = (None, None::<String>, ServeOptions::default());
-                spawn_serve(stream, &active, guest_ram, ring_dir, policy);
+                let (guest_ram, ring_dir, policy, golden_connection) =
+                    (None, None::<String>, ServeOptions::default(), None);
+                spawn_serve(
+                    stream,
+                    &active,
+                    guest_ram,
+                    ring_dir,
+                    policy,
+                    golden_connection,
+                );
             }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
@@ -681,14 +752,21 @@ fn spawn_serve<S>(
     guest_ram: Option<Vec<(u64, u64, u64)>>,
     ring_dir: Option<String>,
     options: ServeOptions,
+    #[cfg(unix)] golden_connection: Option<(u32, u64, std::os::unix::io::RawFd)>,
+    #[cfg(not(unix))] _golden_connection: Option<(u32, u64, i32)>,
 ) where
     S: std::io::Read + std::io::Write + Send + 'static,
 {
     let guard = ConnGuard::new(active);
+    #[cfg(unix)]
+    let golden_guard = golden_connection
+        .and_then(|(pid, token, fd)| GoldenConnectionGuard::register(pid, token, fd));
     thread::Builder::new()
         .name("cuda-daemon-conn".into())
         .spawn(move || {
             let _guard = guard;
+            #[cfg(unix)]
+            let _golden_guard = golden_guard;
             let mut backend = make_backend();
             if let Some(regions) = guest_ram {
                 tracing::info!(
@@ -712,6 +790,7 @@ fn spawn_serve<S>(
 /// or golden connection (leaves the bytes untouched for the RPC serve loop).
 /// A fork clone's live-RAM advert: its pid + (gpa, host_va, len) regions.
 type ProcMemAdvert = (u32, Vec<(u64, u64, u64)>);
+type GuestRamAdvert = (u32, Vec<(u64, u64, u64)>);
 
 /// Consume the per-VM CUDA capacity policy (`SMVCPOL1`) when present. Older
 /// proxies send no policy; the peek leaves their first preamble or RPC frame
@@ -910,7 +989,7 @@ fn consume_ring_dir_preamble(fd: std::os::unix::io::RawFd) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<Vec<(u64, u64, u64)>> {
+fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<GuestRamAdvert> {
     let mut hdr = [0u8; 20];
     // SAFETY: MSG_PEEK of the fixed header on a valid fd; loops like
     // peek_clone_token because proxied bytes can arrive in pieces.
@@ -1002,7 +1081,7 @@ fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<Vec<(u64, u64, u
         }
         regions.push((gpa, va as u64, len));
     }
-    Some(regions)
+    Some((pid, regions))
 }
 
 /// Keeps the daemon's open-connection count accurate: +1 on construction, -1 on
@@ -1117,7 +1196,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
     if let Some(layout) = clone_layout.as_deref() {
         let (n, vmm_trans) =
-            reconstruct_golden_memory(backend.as_mut(), layout, clone_dev, &pre_reserved);
+            reconstruct_golden_memory(backend.as_mut(), layout, clone_dev, &pre_reserved)?;
         tracing::info!(
             maps = n,
             vmm_handles = vmm_trans.len(),
@@ -1487,6 +1566,108 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
 }
 
 #[cfg(unix)]
+fn read_host_snapshot(fd: i32, offset: u64, size: u64) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "snapshot range too large"))?;
+    let mut bytes = vec![0u8; len];
+    let mut done = 0usize;
+    while done < len {
+        // SAFETY: pread writes at most the remaining initialized Vec capacity;
+        // the inherited memfd stays open for the worker's reconstruction phase.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                bytes[done..].as_mut_ptr().cast(),
+                len - done,
+                i64::try_from(offset.saturating_add(done as u64)).unwrap_or(i64::MAX),
+            )
+        };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short CUDA host snapshot",
+            ));
+        }
+        done += n as usize;
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn append_host_snapshot(fd: i32, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    let mut done = 0usize;
+    while done < bytes.len() {
+        // SAFETY: pwrite reads from a valid byte slice and writes to our memfd.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                bytes[done..].as_ptr().cast(),
+                bytes.len() - done,
+                i64::try_from(offset.saturating_add(done as u64)).unwrap_or(i64::MAX),
+            )
+        };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short CUDA host snapshot write",
+            ));
+        }
+        done += n as usize;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn seal_host_snapshot(fd: i32) -> io::Result<()> {
+    let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+    // SAFETY: F_ADD_SEALS only changes the write policy of the owned memfd.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_host_snapshot_memfd() -> io::Result<i32> {
+    let name = std::ffi::CString::new("smolvm-cuda-golden-snapshot").unwrap();
+    // SAFETY: memfd_create returns a new anonymous file descriptor owned by
+    // the clone spawn path and later inherited by its worker.
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    (fd >= 0).then_some(fd).ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn seal_host_snapshot(_fd: i32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "host CUDA snapshots require Linux",
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn create_host_snapshot_memfd() -> io::Result<i32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "host CUDA snapshots require Linux",
+    ))
+}
+
+#[cfg(unix)]
 fn clone_layout_reservations(layout: &str) -> Vec<(u64, u64)> {
     let hx = |s: &str| u64::from_str_radix(s, 16).ok();
     let mut ranges = Vec::new();
@@ -1615,10 +1796,11 @@ fn reconstruct_golden_memory(
     layout: &str,
     device: i32,
     pre_reserved: &[(u64, u64)],
-) -> (usize, std::collections::HashMap<u64, u64>) {
+) -> io::Result<(usize, std::collections::HashMap<u64, u64>)> {
     let mut vmm_trans = std::collections::HashMap::new();
     let (mut resv_s, mut maps_s, mut aregions_s, mut allocs_s) = ("", "", "", "");
     let mut astage: Option<i32> = None;
+    let mut ahost: Option<i32> = None;
     for part in layout.split('|') {
         if let Some(r) = part.strip_prefix("resv=") {
             resv_s = r;
@@ -1628,6 +1810,9 @@ fn reconstruct_golden_memory(
         }
         if let Some(a) = part.strip_prefix("astage=") {
             astage = a.parse().ok();
+        }
+        if let Some(a) = part.strip_prefix("ahost=") {
+            ahost = a.parse().ok();
         }
         if let Some(a) = part.strip_prefix("aregions=") {
             aregions_s = a;
@@ -1662,6 +1847,7 @@ fn reconstruct_golden_memory(
         // golden's handle value for this chunk (hex).
         let loaded = f.get(3).map(|s| *s == "1").unwrap_or(false);
         let golden_h = f.get(4).and_then(|s| hx(s));
+        let host_offset = f.get(5).and_then(|s| hx(s));
 
         // DENSITY (opt-in, SMOLVM_CUDA_FORK_SHARE_WEIGHTS): a loaded weight range is
         // read-only during frozen-base fine-tuning (LoRA freezes the base; only the
@@ -1730,13 +1916,16 @@ fn reconstruct_golden_memory(
         let priv_h = match b.mem_create(size, device) {
             Ok(h) => h,
             Err(e) => {
-                tracing::warn!(e, "M2: private create failed");
-                continue;
+                return Err(io::Error::other(format!(
+                    "private CUDA snapshot allocation failed at {va:#x}: {e}"
+                )));
             }
         };
         if let Err(e) = b.mem_map(va, size, 0, priv_h) {
-            tracing::warn!(e, va, "M2: private map failed");
-            continue;
+            let _ = b.mem_release(priv_h);
+            return Err(io::Error::other(format!(
+                "private CUDA snapshot map failed at {va:#x}: {e}"
+            )));
         }
         // priv_h stays held (never released here): the clone releases this chunk
         // post-fork by the GOLDEN's handle value, translated to priv_h.
@@ -1744,31 +1933,42 @@ fn reconstruct_golden_memory(
             vmm_trans.insert(g, priv_h);
         }
         if let Err(e) = b.mem_set_access(va, size, device) {
-            tracing::warn!(e, va, "M2: private set_access failed");
+            return Err(io::Error::other(format!(
+                "private CUDA snapshot access failed at {va:#x}: {e}"
+            )));
         }
-        match import_with_retry(b, 4 + idx) {
-            Ok(gh) => {
-                if let Ok(tmp) = b.mem_address_reserve(size, 0) {
-                    match b.mem_map(tmp, size, 0, gh) {
-                        Ok(()) => {
-                            if let Err(e) = b.mem_set_access(tmp, size, device) {
-                                tracing::warn!(e, "M2: temp set_access failed");
+        if let Some(offset) = host_offset {
+            let bytes = read_host_snapshot(4 + idx, offset, size)?;
+            b.memcpy_htod(va, &bytes, 0).map_err(|error| {
+                io::Error::other(format!(
+                    "CUDA host snapshot restore failed at {va:#x}: {error}"
+                ))
+            })?;
+        } else {
+            match import_with_retry(b, 4 + idx) {
+                Ok(gh) => {
+                    if let Ok(tmp) = b.mem_address_reserve(size, 0) {
+                        match b.mem_map(tmp, size, 0, gh) {
+                            Ok(()) => {
+                                if let Err(e) = b.mem_set_access(tmp, size, device) {
+                                    tracing::warn!(e, "M2: temp set_access failed");
+                                }
+                                if let Err(e) = b.memcpy_dtod(va, tmp, size) {
+                                    tracing::warn!(e, va, tmp, "M2: dtod copy failed");
+                                }
+                                // The copy must finish before we unmap the temp source,
+                                // or the in-flight copy faults on unmapped memory.
+                                let _ = b.ctx_synchronize();
+                                let _ = b.mem_unmap(tmp, size);
                             }
-                            if let Err(e) = b.memcpy_dtod(va, tmp, size) {
-                                tracing::warn!(e, va, tmp, "M2: dtod copy failed");
-                            }
-                            // The copy must finish before we unmap the temp source,
-                            // or the in-flight copy faults on unmapped memory.
-                            let _ = b.ctx_synchronize();
-                            let _ = b.mem_unmap(tmp, size);
+                            Err(e) => tracing::warn!(e, tmp, "M2: temp map failed"),
                         }
-                        Err(e) => tracing::warn!(e, tmp, "M2: temp map failed"),
+                        let _ = b.mem_address_free(tmp, size);
                     }
-                    let _ = b.mem_address_free(tmp, size);
+                    let _ = b.mem_release(gh);
                 }
-                let _ = b.mem_release(gh);
+                Err(e) => tracing::warn!(e, idx, "M2: import failed"),
             }
-            Err(e) => tracing::warn!(e, idx, "M2: import failed"),
         }
         count += 1;
     }
@@ -1782,7 +1982,7 @@ fn reconstruct_golden_memory(
     // collide with the worker's own host mappings (cuMemAddressReserve treats
     // the address as a hint) — but every op already translates through
     // `dptr_trans`, so translated copies are equivalent.
-    if let (Some(sidx), false) = (astage, aregions_s.is_empty()) {
+    if let (true, false) = (astage.is_some() || ahost.is_some(), aregions_s.is_empty()) {
         let regions: Vec<(u64, u64, u64)> = aregions_s
             .split(',')
             .filter(|e| !e.is_empty())
@@ -1798,12 +1998,16 @@ fn reconstruct_golden_memory(
                 }
             })
             .collect();
-        let allocs: Vec<(u64, u64)> = allocs_s
+        let allocs: Vec<(u64, u64, Option<u64>)> = allocs_s
             .split(',')
             .filter(|e| !e.is_empty())
             .filter_map(|e| {
-                let (d, sz) = e.split_once(':')?;
-                Some((hx(d)?, hx(sz)?))
+                let mut fields = e.split(':');
+                Some((
+                    hx(fields.next()?)?,
+                    hx(fields.next()?)?,
+                    fields.next().and_then(hx),
+                ))
             })
             .collect();
         // VA guard: reserve every golden non-VMM span at its exact address so
@@ -1822,40 +2026,64 @@ fn reconstruct_golden_memory(
         }
         let total: u64 = regions.iter().map(|r| r.1).sum();
         let mut trans: Vec<(u64, u64, u64)> = Vec::new();
-        match import_with_retry(b, 4 + sidx) {
-            Ok(sh) => {
-                if let Ok(tmp) = b.mem_address_reserve(total, 0) {
-                    if b.mem_map(tmp, total, 0, sh).is_ok() {
-                        let _ = b.mem_set_access(tmp, total, device);
-                        for &(d, sz) in &allocs {
-                            // Staging offset: region offset + intra-region delta.
-                            let Some(&(base, _, off)) =
-                                regions.iter().find(|&&(b0, rs, _)| d >= b0 && d < b0 + rs)
-                            else {
-                                continue;
-                            };
-                            let cdptr = match b.mem_alloc(sz) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    tracing::warn!(e, d, "M2-alloc: copy alloc failed");
-                                    continue;
-                                }
-                            };
-                            if let Err(e) = b.memcpy_dtod(cdptr, tmp + off + (d - base), sz) {
-                                tracing::warn!(e, d, "M2-alloc: dtod failed");
-                            }
-                            trans.push((d, sz, cdptr));
-                        }
-                        let _ = b.ctx_synchronize();
-                        let _ = b.mem_unmap(tmp, total);
-                    } else {
-                        tracing::warn!("M2-alloc: staging map failed");
-                    }
-                    let _ = b.mem_address_free(tmp, total);
-                }
-                let _ = b.mem_release(sh);
+        if let Some(sidx) = ahost {
+            for &(d, sz, offset) in &allocs {
+                let Some(offset) = offset else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("missing host snapshot offset for CUDA allocation {d:#x}"),
+                    ));
+                };
+                let cdptr = b.mem_alloc(sz).map_err(|error| {
+                    io::Error::other(format!(
+                        "CUDA allocation restore failed for {d:#x}: {error}"
+                    ))
+                })?;
+                let bytes = read_host_snapshot(4 + sidx, offset, sz)?;
+                b.memcpy_htod(cdptr, &bytes, 0).map_err(|error| {
+                    io::Error::other(format!(
+                        "CUDA allocation snapshot restore failed for {d:#x}: {error}"
+                    ))
+                })?;
+                trans.push((d, sz, cdptr));
             }
-            Err(e) => tracing::warn!(e, "M2-alloc: staging import failed"),
+            let _ = b.ctx_synchronize();
+        } else if let Some(sidx) = astage {
+            match import_with_retry(b, 4 + sidx) {
+                Ok(sh) => {
+                    if let Ok(tmp) = b.mem_address_reserve(total, 0) {
+                        if b.mem_map(tmp, total, 0, sh).is_ok() {
+                            let _ = b.mem_set_access(tmp, total, device);
+                            for &(d, sz, _) in &allocs {
+                                // Staging offset: region offset + intra-region delta.
+                                let Some(&(base, _, off)) =
+                                    regions.iter().find(|&&(b0, rs, _)| d >= b0 && d < b0 + rs)
+                                else {
+                                    continue;
+                                };
+                                let cdptr = match b.mem_alloc(sz) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::warn!(e, d, "M2-alloc: copy alloc failed");
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = b.memcpy_dtod(cdptr, tmp + off + (d - base), sz) {
+                                    tracing::warn!(e, d, "M2-alloc: dtod failed");
+                                }
+                                trans.push((d, sz, cdptr));
+                            }
+                            let _ = b.ctx_synchronize();
+                            let _ = b.mem_unmap(tmp, total);
+                        } else {
+                            tracing::warn!("M2-alloc: staging map failed");
+                        }
+                        let _ = b.mem_address_free(tmp, total);
+                    }
+                    let _ = b.mem_release(sh);
+                }
+                Err(e) => tracing::warn!(e, "M2-alloc: staging import failed"),
+            }
         }
         tracing::info!(
             copies = trans.len(),
@@ -1866,7 +2094,7 @@ fn reconstruct_golden_memory(
         count += trans.len();
         smolvm_cuda::host::set_worker_alloc_trans(trans);
     }
-    (count, vmm_trans)
+    Ok((count, vmm_trans))
 }
 
 /// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
@@ -2158,8 +2386,8 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
     REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-fn daemon_has_live_cuda_clients(connections: usize, workers: usize) -> bool {
-    connections > 0 || workers > 0
+fn daemon_has_live_cuda_clients(connections: usize, workers: usize, snapshots: usize) -> bool {
+    connections > 0 || workers > 0 || snapshots > 0
 }
 
 #[cfg(unix)]
@@ -2175,6 +2403,189 @@ fn live_clone_worker_count() -> usize {
         }
     });
     reg.len()
+}
+
+#[cfg(unix)]
+struct GoldenConnectionEntry {
+    id: u64,
+    token: u64,
+    fd: std::os::unix::io::RawFd,
+}
+
+#[cfg(unix)]
+fn golden_connection_registry(
+) -> &'static Mutex<std::collections::HashMap<u32, Vec<GoldenConnectionEntry>>> {
+    static REG: OnceLock<Mutex<std::collections::HashMap<u32, Vec<GoldenConnectionEntry>>>> =
+        OnceLock::new();
+    REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(unix)]
+fn golden_token_owners() -> &'static Mutex<std::collections::HashMap<u64, u32>> {
+    static OWNERS: OnceLock<Mutex<std::collections::HashMap<u64, u32>>> = OnceLock::new();
+    OWNERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(unix)]
+struct GoldenConnectionGuard {
+    pid: u32,
+    id: u64,
+}
+
+#[cfg(unix)]
+impl GoldenConnectionGuard {
+    fn register(pid: u32, token: u64, fd: std::os::unix::io::RawFd) -> Option<Self> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        // A duplicate lets the pool coordinator shut down the socket while the
+        // serving thread owns the accepted fd. shutdown(2) affects the shared
+        // socket endpoint and wakes the blocked serve loop; this duplicate is
+        // otherwise closed when the connection ends.
+        let duplicate = unsafe { libc::dup(fd) };
+        if duplicate < 0 {
+            return None;
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        golden_connection_registry()
+            .lock()
+            .unwrap()
+            .entry(pid)
+            .or_default()
+            .push(GoldenConnectionEntry {
+                id,
+                token,
+                fd: duplicate,
+            });
+        if token != 0 {
+            golden_token_owners().lock().unwrap().insert(token, pid);
+        }
+        Some(Self { pid, id })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GoldenConnectionGuard {
+    fn drop(&mut self) {
+        let mut registry = golden_connection_registry().lock().unwrap();
+        let mut remove_pid = false;
+        if let Some(entries) = registry.get_mut(&self.pid) {
+            if let Some(index) = entries.iter().position(|entry| entry.id == self.id) {
+                let entry = entries.swap_remove(index);
+                unsafe { libc::close(entry.fd) };
+            }
+            remove_pid = entries.is_empty();
+        }
+        if remove_pid {
+            registry.remove(&self.pid);
+            golden_token_owners()
+                .lock()
+                .unwrap()
+                .retain(|_, owner| *owner != self.pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn select_golden_owner(
+    mut matching: Vec<u32>,
+    known_owner: Option<u32>,
+    registered: &[u32],
+) -> Option<u32> {
+    if let Some(owner) = known_owner.filter(|owner| registered.contains(owner)) {
+        matching.push(owner);
+    }
+    if matching.is_empty() && registered.len() == 1 {
+        matching.push(registered[0]);
+    }
+    matching.sort_unstable();
+    matching.dedup();
+    let [owner] = matching.as_slice() else {
+        return None;
+    };
+    Some(*owner)
+}
+
+#[cfg(unix)]
+fn evict_golden_cuda_connections(token: u64) -> usize {
+    let mut registry = golden_connection_registry().lock().unwrap();
+    let matching: Vec<u32> = registry
+        .iter()
+        .filter_map(|(&pid, entries)| {
+            entries
+                .iter()
+                .any(|entry| {
+                    entry.token == token
+                        || smolvm_cuda::host::layout_handoff_same_process(entry.token, token)
+                })
+                .then_some(pid)
+        })
+        .collect();
+    let known_owner = golden_token_owners().lock().unwrap().get(&token).copied();
+    let registered: Vec<u32> = registry.keys().copied().collect();
+    // The initial golden channel legitimately carries token 0: the daemon
+    // assigns the process lineage during Init. If no later token-bearing
+    // channel established the owner mapping, fail closed unless exactly one
+    // golden VMM is registered with this single-tenant CUDA daemon.
+    let Some(owner) = select_golden_owner(matching, known_owner, &registered) else {
+        return 0;
+    };
+    golden_token_owners().lock().unwrap().insert(token, owner);
+    bind_host_snapshot_owner(token, owner);
+    let mut closed = 0;
+    if let Some(entries) = registry.remove(&owner) {
+        for entry in entries {
+            // SAFETY: a duplicate owned by this registry. shutdown wakes
+            // both relay directions; close releases our duplicate.
+            unsafe {
+                libc::shutdown(entry.fd, libc::SHUT_RDWR);
+                libc::close(entry.fd);
+            }
+            closed += 1;
+        }
+    }
+    closed
+}
+
+#[cfg(unix)]
+fn maybe_evict_frozen_golden(
+    token: u64,
+    options: &ServeOptions,
+    workers: &std::collections::HashMap<(u64, u64), CloneWorkerEntry>,
+) {
+    let mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
+    if !golden_eviction_enabled(mode.as_deref(), options.fork_pool_size) {
+        return;
+    }
+    let Some(pool_size) = options.fork_pool_size else {
+        return;
+    };
+    let residents = workers
+        .keys()
+        .filter(|&&(candidate, _)| {
+            candidate == token || smolvm_cuda::host::layout_handoff_same_process(candidate, token)
+        })
+        .count();
+    if residents < pool_size as usize {
+        return;
+    }
+    if cached_host_snapshot(token).is_none() {
+        tracing::debug!(
+            token,
+            residents,
+            pool_size,
+            "golden eviction skipped because this process has no host snapshot"
+        );
+        return;
+    }
+    let closed = evict_golden_cuda_connections(token);
+    if closed > 0 {
+        tracing::info!(
+            token,
+            residents,
+            pool_size,
+            connections = closed,
+            "evicted frozen golden CUDA connections after pool residency"
+        );
+    }
 }
 
 #[cfg(not(unix))]
@@ -2402,6 +2813,7 @@ fn route_clone_connection(
                     worker_pid = pid,
                     "warm dial: spawned clone process worker ahead of its first CUDA call"
                 );
+                maybe_evict_frozen_golden(*token, &options, &reg);
                 true
             }
             Err(e) => {
@@ -2574,6 +2986,7 @@ fn route_clone_connection(
                 share_weights,
                 "routed isolating clone to a worker process"
             );
+            maybe_evict_frozen_golden(token, &options, &reg);
         }
         Err(e) => {
             // REJECT rather than serve in-process: this IS an isolating clone
@@ -2870,6 +3283,162 @@ fn stage_alloc_copies(
     }
 }
 
+#[cfg(unix)]
+struct CachedHostSnapshot {
+    layout: String,
+    device: i32,
+    fds: Vec<std::os::unix::io::RawFd>,
+    host_bytes: u64,
+    golden_pid: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(unix)]
+impl CachedHostSnapshot {
+    fn duplicate_fds(&self) -> io::Result<Vec<std::os::unix::io::RawFd>> {
+        let mut duplicates = Vec::with_capacity(self.fds.len());
+        for &fd in &self.fds {
+            // SAFETY: dup creates an independently-owned descriptor for the
+            // next worker spawn; the cache keeps its original descriptor.
+            let duplicate = unsafe { libc::dup(fd) };
+            if duplicate < 0 {
+                for fd in duplicates {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(io::Error::last_os_error());
+            }
+            duplicates.push(duplicate);
+        }
+        Ok(duplicates)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CachedHostSnapshot {
+    fn drop(&mut self) {
+        for &fd in &self.fds {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(unix)]
+fn host_snapshot_cache() -> &'static Mutex<std::collections::HashMap<u64, Arc<CachedHostSnapshot>>>
+{
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Arc<CachedHostSnapshot>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(unix)]
+fn cached_host_snapshot(token: u64) -> Option<Arc<CachedHostSnapshot>> {
+    let cache = host_snapshot_cache().lock().unwrap();
+    if let Some(snapshot) = cache.get(&token) {
+        return Some(snapshot.clone());
+    }
+    cache.iter().find_map(|(&candidate, snapshot)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| snapshot.clone())
+    })
+}
+
+#[cfg(unix)]
+fn bind_host_snapshot_owner(token: u64, pid: u32) {
+    if let Some(snapshot) = cached_host_snapshot(token) {
+        let _ = snapshot
+            .golden_pid
+            .compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+fn live_host_snapshot_count() -> usize {
+    let snapshots: Vec<(u64, Arc<CachedHostSnapshot>)> = host_snapshot_cache()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&token, snapshot)| (token, snapshot.clone()))
+        .collect();
+    let workers = clone_worker_registry().lock().unwrap();
+    let mut expired = Vec::new();
+    let mut live = 0;
+    for (token, snapshot) in snapshots {
+        let pid = snapshot.golden_pid.load(Ordering::SeqCst);
+        if pid == 0 {
+            continue;
+        }
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            live += 1;
+            continue;
+        }
+        let has_workers = workers.keys().any(|&(candidate, _)| {
+            candidate == token || smolvm_cuda::host::layout_handoff_same_process(candidate, token)
+        });
+        if !has_workers {
+            expired.push((token, pid));
+        }
+    }
+    drop(workers);
+    if !expired.is_empty() {
+        let mut cache = host_snapshot_cache().lock().unwrap();
+        let mut owners = golden_token_owners().lock().unwrap();
+        for (token, pid) in expired {
+            if let Some(snapshot) = cache.remove(&token) {
+                tracing::info!(
+                    token,
+                    host_bytes = snapshot.host_bytes,
+                    "released frozen golden host snapshot after VM exit"
+                );
+            }
+            owners.retain(|_, owner| *owner != pid);
+            smolvm_cuda::host::release_metadata_only_layout(token);
+        }
+    }
+    live
+}
+
+#[cfg(unix)]
+fn retain_host_snapshot(
+    token: u64,
+    layout: &str,
+    device: i32,
+    source_fds: &[std::os::unix::io::RawFd],
+    host_bytes: u64,
+) -> io::Result<()> {
+    if cached_host_snapshot(token).is_some() {
+        return Ok(());
+    }
+    let mut fds = Vec::with_capacity(source_fds.len());
+    for &fd in source_fds {
+        let duplicate = unsafe { libc::dup(fd) };
+        if duplicate < 0 {
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(io::Error::last_os_error());
+        }
+        fds.push(duplicate);
+    }
+    if !smolvm_cuda::host::cache_frozen_layout(token) {
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "golden process layout disappeared before host snapshot retention",
+        ));
+    }
+    host_snapshot_cache().lock().unwrap().insert(
+        token,
+        Arc::new(CachedHostSnapshot {
+            layout: layout.to_owned(),
+            device,
+            fds,
+            host_bytes,
+            golden_pid: std::sync::atomic::AtomicU32::new(0),
+        }),
+    );
+    Ok(())
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
@@ -2884,62 +3453,158 @@ fn spawn_clone_worker(
     options: ServeOptions,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
     use std::os::unix::process::CommandExt;
-    // Gather the golden's VMM layout (reservations + maps→physical handle).
-    let (resvs, maps, golden_dev) = smolvm_cuda::host::layout_handoff_snapshot(token)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
-    // Export each map's physical to a POSIX fd (in the golden's shared context) and
-    // build the layout string the worker parses
-    // ("resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"; loaded=1 → shareable
-    // weight; ghandle = the golden's
-    // handle value, so the worker can translate the clone's inherited
-    // MemRelease/MemMap handles to its own).
-    let mut backend = make_backend();
-    backend
-        .init()
-        .map_err(|e| io::Error::other(format!("worker-export init: {e}")))?;
-    backend
-        .primary_ctx_retain(golden_dev)
-        .map_err(|e| io::Error::other(format!("ctx retain: {e}")))?;
-    // Commit the golden's pending device work so its writes are visible in the
-    // physical the clone will IPC-import (the golden runs on another thread of the
-    // shared primary context).
-    let _ = backend.ctx_synchronize();
-    let mut layout = String::from("resv=");
-    for (va, size) in &resvs {
-        layout.push_str(&format!("{va:x}:{size:x},"));
-    }
-    layout.push_str("|maps=");
-    let mut export_fds: Vec<i32> = Vec::new();
-    for ch in &maps {
-        if let Ok(efd) = backend.mem_export_handle(ch.handle) {
+    let eviction_mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
+    let snapshot_requested =
+        golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size);
+    let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
+    let sharing_active =
+        share_weights && !matches!(configured_sharing.as_deref(), Some("0" | "false" | "off"));
+    let (golden_dev, layout, export_fds) = if let Some(cached) = cached_host_snapshot(token) {
+        tracing::info!(
+            token,
+            bytes = cached.layout.len(),
+            "reusing retained golden host snapshot"
+        );
+        (
+            cached.device,
+            cached.layout.clone(),
+            cached.duplicate_fds()?,
+        )
+    } else {
+        // Gather the golden's VMM layout (reservations + maps→physical handle).
+        let (resvs, maps, golden_dev) = smolvm_cuda::host::layout_handoff_snapshot(token)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
+        let allocs = smolvm_cuda::host::alloc_handoff_snapshot(token).unwrap_or_default();
+        // Export each map's physical to a POSIX fd (in the golden's shared
+        // context) and build the worker's reconstruction layout.
+        let mut backend = make_backend();
+        backend
+            .init()
+            .map_err(|e| io::Error::other(format!("worker-export init: {e}")))?;
+        backend
+            .primary_ctx_retain(golden_dev)
+            .map_err(|e| io::Error::other(format!("ctx retain: {e}")))?;
+        let _ = backend.ctx_synchronize();
+        let safe_maps: Vec<bool> = maps
+            .iter()
+            .map(|chunk| match (chunk.candidate, chunk.verified) {
+                (false, _) => false,
+                (true, Some(verdict)) => verdict,
+                (true, None) => {
+                    let verdict = verify_chunk_content(backend.as_mut(), chunk);
+                    smolvm_cuda::host::layout_set_share_verdict(token, chunk.va, verdict);
+                    verdict
+                }
+            })
+            .collect();
+        let snapshot_required = maps
+            .iter()
+            .zip(&safe_maps)
+            .filter_map(|(chunk, &safe)| (!(sharing_active && safe)).then_some(chunk.size))
+            .chain(allocs.iter().map(|(_, size, _)| *size))
+            .fold(0u64, u64::saturating_add);
+        let memory_bearing = !maps.is_empty() || !allocs.is_empty();
+        // cudaMalloc pointers can be translated at the RPC boundary, but a
+        // device pointer embedded inside another device allocation cannot.
+        // A VMM layout supplies address-preserved storage for those structures;
+        // an ordinary-allocation-only process does not have a generic durable
+        // reconstruction contract, so keep its live golden as the safe source.
+        let snapshot_reconstructable = host_snapshot_reconstructable(maps.len());
+        #[cfg(target_os = "linux")]
+        let host_snapshot = snapshot_requested
+            && memory_bearing
+            && snapshot_reconstructable
+            && host_snapshot_capacity_available(snapshot_required);
+        #[cfg(not(target_os = "linux"))]
+        let host_snapshot = false;
+        if snapshot_requested && memory_bearing && !snapshot_reconstructable {
+            tracing::warn!(
+                token,
+                allocs = allocs.len(),
+                "keeping frozen golden resident for an ordinary-allocation-only CUDA layout"
+            );
+        } else if snapshot_requested && memory_bearing && !host_snapshot {
+            tracing::warn!(
+                token,
+                snapshot_required,
+                "keeping frozen golden resident because host snapshot capacity is unavailable"
+            );
+        }
+        let mut layout = String::from("resv=");
+        for (va, size) in &resvs {
+            layout.push_str(&format!("{va:x}:{size:x},"));
+        }
+        layout.push_str("|maps=");
+        let mut export_fds: Vec<i32> = Vec::new();
+        let mut snapshot_fd = None;
+        let mut snapshot_offset = 0u64;
+        let mut snapshot_complete = host_snapshot;
+        if host_snapshot {
+            match create_host_snapshot_memfd() {
+                Ok(fd) => {
+                    let idx = export_fds.len();
+                    export_fds.push(fd);
+                    snapshot_fd = Some((fd, idx));
+                }
+                Err(error) => {
+                    snapshot_complete = false;
+                    tracing::warn!(%error, "host snapshot memfd unavailable");
+                }
+            }
+        }
+        for (ch, safe) in maps.iter().zip(safe_maps) {
+            // Share-safety: a candidate chunk is shared only if its device content
+            // still equals what the H2Ds uploaded. All other chunks may be staged
+            // to host RAM for an address-preserving private restore.
+            if host_snapshot && !(sharing_active && safe) {
+                if let Some((fd, idx)) = snapshot_fd {
+                    match backend.memcpy_dtoh(ch.va, ch.size, 0) {
+                        Ok(bytes) => match append_host_snapshot(fd, snapshot_offset, &bytes) {
+                            Ok(()) => {
+                                layout.push_str(&format!(
+                                    "{:x}:{:x}:{}:0:{:x}:{:x},",
+                                    ch.va, ch.size, idx, ch.ghandle, snapshot_offset
+                                ));
+                                snapshot_offset += ch.size;
+                                continue;
+                            }
+                            Err(error) => tracing::warn!(
+                                %error,
+                                va = ch.va,
+                                size = ch.size,
+                                "host snapshot write failed; keeping the golden resident"
+                            ),
+                        },
+                        Err(error) => tracing::warn!(
+                            error,
+                            va = ch.va,
+                            size = ch.size,
+                            "device-to-host snapshot failed; keeping the golden resident"
+                        ),
+                    }
+                    snapshot_complete = false;
+                } else {
+                    snapshot_complete = false;
+                }
+            }
+            let efd = backend.mem_export_handle(ch.handle).map_err(|error| {
+                io::Error::other(format!(
+                    "failed to export golden VMM range {:#x}+{:#x}: {error}",
+                    ch.va, ch.size
+                ))
+            })?;
             let idx = export_fds.len();
             export_fds.push(efd);
-            // Share-safety: a candidate chunk is shared only if its device
-            // content still equals what the H2Ds uploaded (any kernel write —
-            // e.g. LoRA adapters placed in freed weight space — must keep the
-            // chunk private or clone writes leak through the shared physical).
-            // Verified once per frozen golden; verdict cached.
-            let safe = match (ch.candidate, ch.verified) {
-                (false, _) => false,
-                (true, Some(v)) => v,
-                (true, None) => {
-                    let v = verify_chunk_content(backend.as_mut(), ch);
-                    smolvm_cuda::host::layout_set_share_verdict(token, ch.va, v);
-                    v
-                }
-            };
             let ld = u8::from(safe);
             layout.push_str(&format!(
                 "{:x}:{:x}:{}:{}:{:x},",
                 ch.va, ch.size, idx, ld, ch.ghandle
             ));
         }
-    }
-    // Non-VMM golden memory: a plain-torch golden (no expandable_segments) keeps
-    // every tensor in cudaMalloc'd blocks that never enter the VMM layout, so a
-    // worker-mode clone would lose them all (illegal address on first touch —
-    // the maps above only cover VMM). Stage private copies for the worker.
-    if let Some(allocs) = smolvm_cuda::host::alloc_handoff_snapshot(token) {
+        // Non-VMM golden memory: a plain-torch golden (no expandable_segments) keeps
+        // every tensor in cudaMalloc'd blocks that never enter the VMM layout, so a
+        // worker-mode clone would lose them all (illegal address on first touch —
+        // the maps above only cover VMM). Stage private copies for the worker.
         if !allocs.is_empty() {
             let gran = backend
                 .mem_get_allocation_granularity(golden_dev, 0)
@@ -2958,34 +3623,105 @@ fn spawn_clone_worker(
                 }
             }
             let total: u64 = regions.iter().map(|&(b0, e0)| e0 - b0).sum();
-            match stage_alloc_copies(backend.as_mut(), golden_dev, &allocs, &regions, total) {
-                Ok(efd) => {
-                    let idx = export_fds.len();
-                    export_fds.push(efd);
-                    layout.push_str(&format!("|astage={idx}|aregions="));
+            let host_staged = if host_snapshot {
+                snapshot_fd.and_then(|(fd, idx)| {
+                    let mut entries = Vec::with_capacity(allocs.len());
+                    for &(d, sz, _) in &allocs {
+                        let bytes = backend.memcpy_dtoh(d, sz, 0).ok()?;
+                        append_host_snapshot(fd, snapshot_offset, &bytes).ok()?;
+                        entries.push((d, sz, snapshot_offset));
+                        snapshot_offset += sz;
+                    }
+                    layout.push_str(&format!("|ahost={idx}|aregions="));
                     let mut off = 0u64;
                     for &(b0, e0) in &regions {
                         layout.push_str(&format!("{:x}:{:x}:{:x},", b0, e0 - b0, off));
                         off += e0 - b0;
                     }
                     layout.push_str("|allocs=");
-                    for &(d, sz, _) in &allocs {
-                        layout.push_str(&format!("{d:x}:{sz:x},"));
+                    for (d, sz, host_off) in entries {
+                        layout.push_str(&format!("{d:x}:{sz:x}:{host_off:x},"));
                     }
-                    tracing::info!(
-                        allocs = allocs.len(),
-                        regions = regions.len(),
-                        bytes = total,
-                        "staged the golden's non-VMM allocations for the worker"
-                    );
+                    Some(())
+                })
+            } else {
+                None
+            };
+            if host_staged.is_some() {
+                tracing::info!(
+                    allocs = allocs.len(),
+                    bytes = allocs.iter().map(|(_, size, _)| *size).sum::<u64>(),
+                    "staged the golden's non-VMM allocations in host RAM"
+                );
+            } else {
+                if host_snapshot {
+                    snapshot_complete = false;
                 }
-                Err(e) => tracing::warn!(
-                    e,
-                    "failed to stage non-VMM golden allocations; the clone will fault on pre-fork tensors"
-                ),
+                match stage_alloc_copies(backend.as_mut(), golden_dev, &allocs, &regions, total) {
+                    Ok(efd) => {
+                        let idx = export_fds.len();
+                        export_fds.push(efd);
+                        layout.push_str(&format!("|astage={idx}|aregions="));
+                        let mut off = 0u64;
+                        for &(b0, e0) in &regions {
+                            layout.push_str(&format!("{:x}:{:x}:{:x},", b0, e0 - b0, off));
+                            off += e0 - b0;
+                        }
+                        layout.push_str("|allocs=");
+                        for &(d, sz, _) in &allocs {
+                            layout.push_str(&format!("{d:x}:{sz:x},"));
+                        }
+                        tracing::info!(
+                            allocs = allocs.len(),
+                            regions = regions.len(),
+                            bytes = total,
+                            "staged the golden's non-VMM allocations for the worker"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(io::Error::other(format!(
+                            "failed to stage non-VMM golden allocations: {error}"
+                        )))
+                    }
+                }
             }
         }
-    }
+        if snapshot_complete {
+            let Some((fd, _)) = snapshot_fd else {
+                return Err(io::Error::other("host snapshot fd disappeared"));
+            };
+            if let Err(error) = seal_host_snapshot(fd) {
+                snapshot_complete = false;
+                tracing::warn!(
+                    %error,
+                    "host snapshot sealing failed; keeping the golden resident"
+                );
+            }
+        }
+        if snapshot_complete {
+            match retain_host_snapshot(token, &layout, golden_dev, &export_fds, snapshot_offset) {
+                Ok(()) => tracing::info!(
+                    token,
+                    fds = export_fds.len(),
+                    host_bytes = snapshot_offset,
+                    "retained golden host snapshot for pool replenishment"
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        token,
+                        "host snapshot retention failed; keeping the golden resident"
+                    );
+                }
+            }
+        } else if snapshot_requested && memory_bearing && snapshot_reconstructable {
+            tracing::warn!(
+                token,
+                "golden eviction disabled because its host snapshot was incomplete"
+            );
+        }
+        (golden_dev, layout, export_fds)
+    };
     // M3a: serialize the golden's modules (images) + functions to a temp file for
     // the worker to reload + remap. Images are MB-scale, so a file, not env.
     let mut modpath: Option<String> = None;
@@ -3145,7 +3881,6 @@ fn spawn_clone_worker(
     // daemon kill switch remains authoritative. This is needed for safe
     // all-private controls and emergency rollback; blindly replacing an
     // inherited "0" here made SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0 ineffective.
-    let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
     if let Some(setting) = clone_worker_share_env(share_weights, configured_sharing.as_deref()) {
         cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", setting);
     }
@@ -3290,9 +4025,11 @@ mod mps_tests {
     use super::{
         clone_layout_reservation_envelopes, clone_worker_idle_expired,
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_vm_is_alive,
-        consume_procmem_preamble, create_private_mps_paths, daemon_has_live_cuda_clients,
-        decode_attach_procmem, disabled_worker_route, encode_attach_procmem, mps_enabled,
-        range_is_reserved, recv_fd, send_fd, spawn_clone_attach_listener_with_timeout,
+        consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
+        daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
+        encode_attach_procmem, golden_eviction_enabled, host_snapshot_fits,
+        host_snapshot_reconstructable, mps_enabled, range_is_reserved, read_host_snapshot, recv_fd,
+        seal_host_snapshot, select_golden_owner, send_fd, spawn_clone_attach_listener_with_timeout,
         unique_live_clone_worker,
     };
     use std::collections::HashMap;
@@ -3348,9 +4085,54 @@ mod mps_tests {
 
     #[test]
     fn daemon_idle_watchdog_counts_routed_clone_workers() {
-        assert!(!daemon_has_live_cuda_clients(0, 0));
-        assert!(daemon_has_live_cuda_clients(1, 0));
-        assert!(daemon_has_live_cuda_clients(0, 1));
+        assert!(!daemon_has_live_cuda_clients(0, 0, 0));
+        assert!(daemon_has_live_cuda_clients(1, 0, 0));
+        assert!(daemon_has_live_cuda_clients(0, 1, 0));
+        assert!(daemon_has_live_cuda_clients(0, 0, 1));
+    }
+
+    #[test]
+    fn golden_eviction_is_automatic_for_fork_pools_with_a_kill_switch() {
+        assert!(golden_eviction_enabled(None, Some(4)));
+        assert!(golden_eviction_enabled(Some("on"), Some(4)));
+        assert!(!golden_eviction_enabled(Some("off"), Some(4)));
+        assert!(!golden_eviction_enabled(None, None));
+        assert!(!golden_eviction_enabled(Some("force"), None));
+    }
+
+    #[test]
+    fn golden_eviction_requires_one_unambiguous_vm_owner() {
+        assert_eq!(select_golden_owner(vec![7], None, &[7, 8]), Some(7));
+        assert_eq!(select_golden_owner(Vec::new(), Some(8), &[7, 8]), Some(8));
+        assert_eq!(select_golden_owner(Vec::new(), None, &[7]), Some(7));
+        assert_eq!(select_golden_owner(vec![7, 8], None, &[7, 8]), None);
+        assert_eq!(select_golden_owner(Vec::new(), None, &[7, 8]), None);
+    }
+
+    #[test]
+    fn host_snapshot_capacity_preserves_a_host_reserve() {
+        let eight_gib_kib = 8 * 1024 * 1024;
+        let meminfo =
+            format!("MemTotal:       {eight_gib_kib} kB\nMemAvailable:   {eight_gib_kib} kB\n");
+        assert!(host_snapshot_fits(2 << 30, &meminfo));
+        assert!(!host_snapshot_fits(7 << 30, &meminfo));
+        assert!(!host_snapshot_fits(1, "MemTotal: 8192 kB\n"));
+    }
+
+    #[test]
+    fn host_snapshot_requires_an_address_preserved_vmm_layout() {
+        assert!(!host_snapshot_reconstructable(0));
+        assert!(host_snapshot_reconstructable(1));
+    }
+
+    #[test]
+    fn host_snapshot_roundtrips_and_is_immutable_after_sealing() {
+        let fd = create_host_snapshot_memfd().unwrap();
+        super::append_host_snapshot(fd, 0, b"frozen cuda state").unwrap();
+        seal_host_snapshot(fd).unwrap();
+        assert_eq!(read_host_snapshot(fd, 0, 17).unwrap(), b"frozen cuda state");
+        assert!(super::append_host_snapshot(fd, 0, b"changed").is_err());
+        unsafe { libc::close(fd) };
     }
 
     #[test]
