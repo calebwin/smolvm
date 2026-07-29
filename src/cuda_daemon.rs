@@ -84,11 +84,13 @@ fn host_snapshot_capacity_available(required: u64) -> bool {
         .is_some_and(|meminfo| host_snapshot_fits(required, &meminfo))
 }
 
-fn host_snapshot_reconstructable(vmm_maps: usize) -> bool {
-    // Ordinary CUDA allocations can contain device pointers that RPC-boundary
-    // translation cannot see. At least one VMM mapping is required before the
-    // automatic durable-snapshot path is allowed to own the source state.
-    vmm_maps > 0
+fn host_snapshot_reconstructable(vmm_maps: usize, ordinary_allocs: usize) -> bool {
+    // Both paths restore at the golden virtual addresses. Ordinary CUDA
+    // allocations previously relied on RPC-boundary pointer translation, which
+    // could not repair embedded device pointers or TMA descriptors and made an
+    // ordinary-only snapshot unsafe. Exact-address VMM backing removes that
+    // distinction, so either memory class can durably own the frozen state.
+    vmm_maps > 0 || ordinary_allocs > 0
 }
 
 #[cfg(target_os = "linux")]
@@ -1565,6 +1567,35 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
     Err(last)
 }
 
+/// Map an imported CUDA allocation, retrying the transient CUDA 801 failures
+/// observed when many MPS clients reconstruct a fork pool concurrently.
+#[cfg(unix)]
+fn map_import_with_retry(
+    b: &mut dyn Backend,
+    va: u64,
+    size: u64,
+    offset: u64,
+    handle: u64,
+) -> Result<(), i32> {
+    let mut last = 0;
+    for attempt in 0..5 {
+        match b.mem_map(va, size, offset, handle) {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!(va, size, attempt, "M2: map succeeded on retry");
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                last = error;
+                let _ = b.ctx_synchronize();
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    Err(last)
+}
+
 #[cfg(unix)]
 fn read_host_snapshot(fd: i32, offset: u64, size: u64) -> io::Result<Vec<u8>> {
     let len = usize::try_from(size)
@@ -1723,6 +1754,13 @@ fn range_is_reserved(ranges: &[(u64, u64)], va: u64, size: u64) -> bool {
 }
 
 #[cfg(unix)]
+fn ordinary_regions_are_reserved(regions: &[(u64, u64, u64)], reserved: &[(u64, u64)]) -> bool {
+    regions
+        .iter()
+        .all(|&(base, size, _)| range_is_reserved(reserved, base, size))
+}
+
+#[cfg(unix)]
 fn reserve_clone_address_exact(b: &mut dyn Backend, va: u64, size: u64, align: u64) -> bool {
     match b.mem_address_reserve_fixed(size, align, va) {
         Ok(actual) if actual == va => true,
@@ -1861,32 +1899,41 @@ fn reconstruct_golden_memory(
         if share_weights && loaded {
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
-                if b.mem_map(va, size, 0, gh).is_ok() {
-                    // READ-ONLY by default. A shared chunk is one the golden's
-                    // H2Ds wrote and nothing has touched since (verified at fork
-                    // time), so a clone has no business writing it. Mapping it
-                    // read-write means a post-fork base write — unsloth's
-                    // embedding fixup is a KERNEL write, invisible to the COW
-                    // path, which only sees explicit mem ops — silently races
-                    // across every clone sharing that physical (loss=nan).
-                    // Read-only makes that fail-stop instead: the write faults,
-                    // and since each clone worker owns its context the blast
-                    // radius is that one clone, with the shared bytes intact for
-                    // its siblings. A warmed golden never trips it (its writes
-                    // happen pre-fork, so verification already marked those
-                    // chunks private): measured 8/8 clean, 0 faults, same
-                    // 260-shared/160-private split as read-write.
-                    // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
-                    let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
-                        b.mem_set_access(va, size, device)
-                    } else {
-                        b.mem_set_access_ro(va, size, device)
-                    };
-                    if set.is_ok() {
-                        ok = true;
-                    } else {
-                        let _ = b.mem_unmap(va, size); // roll back for the fallback
+                match map_import_with_retry(b, va, size, 0, gh) {
+                    Ok(()) => {
+                        // READ-ONLY by default. A shared chunk is one the golden's
+                        // H2Ds wrote and nothing has touched since (verified at fork
+                        // time), so a clone has no business writing it. Mapping it
+                        // read-write means a post-fork base write — unsloth's
+                        // embedding fixup is a KERNEL write, invisible to the COW
+                        // path, which only sees explicit mem ops — silently races
+                        // across every clone sharing that physical (loss=nan).
+                        // Read-only makes that fail-stop instead: the write faults,
+                        // and since each clone worker owns its context the blast
+                        // radius is that one clone, with the shared bytes intact for
+                        // its siblings. A warmed golden never trips it (its writes
+                        // happen pre-fork, so verification already marked those
+                        // chunks private): measured 8/8 clean, 0 faults, same
+                        // 260-shared/160-private split as read-write.
+                        // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
+                        let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
+                            b.mem_set_access(va, size, device)
+                        } else {
+                            b.mem_set_access_ro(va, size, device)
+                        };
+                        if set.is_ok() {
+                            ok = true;
+                        } else {
+                            let _ = b.mem_unmap(va, size); // roll back for the fallback
+                        }
                     }
+                    Err(error) => tracing::warn!(
+                        error,
+                        idx,
+                        va,
+                        size,
+                        "M2-share: imported allocation map failed"
+                    ),
                 }
                 match (ok, golden_h) {
                     // Keep gh held and record golden→worker: the clone later
@@ -1945,30 +1992,52 @@ fn reconstruct_golden_memory(
                 ))
             })?;
         } else {
-            match import_with_retry(b, 4 + idx) {
-                Ok(gh) => {
-                    if let Ok(tmp) = b.mem_address_reserve(size, 0) {
-                        match b.mem_map(tmp, size, 0, gh) {
-                            Ok(()) => {
-                                if let Err(e) = b.mem_set_access(tmp, size, device) {
-                                    tracing::warn!(e, "M2: temp set_access failed");
-                                }
-                                if let Err(e) = b.memcpy_dtod(va, tmp, size) {
-                                    tracing::warn!(e, va, tmp, "M2: dtod copy failed");
-                                }
-                                // The copy must finish before we unmap the temp source,
-                                // or the in-flight copy faults on unmapped memory.
-                                let _ = b.ctx_synchronize();
-                                let _ = b.mem_unmap(tmp, size);
-                            }
-                            Err(e) => tracing::warn!(e, tmp, "M2: temp map failed"),
-                        }
-                        let _ = b.mem_address_free(tmp, size);
-                    }
-                    let _ = b.mem_release(gh);
-                }
-                Err(e) => tracing::warn!(e, idx, "M2: import failed"),
-            }
+            let gh = import_with_retry(b, 4 + idx).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot import failed for range {idx}: {error}"
+                ))
+            })?;
+            let tmp = b.mem_address_reserve(size, 0).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary reservation failed at {va:#x}: {error}"
+                ))
+            })?;
+            map_import_with_retry(b, tmp, size, 0, gh).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary map failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_set_access(tmp, size, device).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary access failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.memcpy_dtod(va, tmp, size).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot copy failed at {va:#x}: {error}"
+                ))
+            })?;
+            // The copy must finish before unmapping the temporary source.
+            b.ctx_synchronize().map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot synchronization failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_unmap(tmp, size).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary unmap failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_address_free(tmp, size).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot temporary release failed at {va:#x}: {error}"
+                ))
+            })?;
+            b.mem_release(gh).map_err(|error| {
+                io::Error::other(format!(
+                    "private CUDA snapshot handle release failed at {va:#x}: {error}"
+                ))
+            })?;
         }
         count += 1;
     }
@@ -2025,6 +2094,114 @@ fn reconstruct_golden_memory(
             }
         }
         let total: u64 = regions.iter().map(|r| r.1).sum();
+        // Ordinary cudaMalloc buffers can contain device-resident pointers and
+        // TMA descriptors whose embedded addresses never cross an RPC boundary.
+        // Rewriting only top-level kernel arguments is therefore insufficient.
+        // The worker reserved these spans before creating its context; back the
+        // same VAs with private VMM allocations so every embedded address stays
+        // valid while each clone still owns independent physical memory.
+        if ordinary_regions_are_reserved(&regions, pre_reserved) {
+            for &(base, size, _) in &regions {
+                let handle = b.mem_create(size, device).map_err(|error| {
+                    io::Error::other(format!(
+                        "address-preserving CUDA allocation failed for {base:#x}: {error}"
+                    ))
+                })?;
+                b.mem_map(base, size, 0, handle).map_err(|error| {
+                    io::Error::other(format!(
+                        "address-preserving CUDA map failed for {base:#x}: {error}"
+                    ))
+                })?;
+                b.mem_set_access(base, size, device).map_err(|error| {
+                    io::Error::other(format!(
+                        "address-preserving CUDA access failed for {base:#x}: {error}"
+                    ))
+                })?;
+                // The mapping retains the allocation; drop the creation
+                // handle now. The mapped region intentionally lives for the
+                // clone worker's lifetime, and inherited cudaMalloc frees are
+                // handled by the identity allocation registry below.
+                b.mem_release(handle).map_err(|error| {
+                    io::Error::other(format!(
+                        "address-preserving CUDA handle release failed for {base:#x}: {error}"
+                    ))
+                })?;
+            }
+            if let Some(sidx) = ahost {
+                for &(dptr, size, offset) in &allocs {
+                    let Some(offset) = offset else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing host snapshot offset for CUDA allocation {dptr:#x}"),
+                        ));
+                    };
+                    let bytes = read_host_snapshot(4 + sidx, offset, size)?;
+                    b.memcpy_htod(dptr, &bytes, 0).map_err(|error| {
+                        io::Error::other(format!(
+                            "address-preserving CUDA restore failed for {dptr:#x}: {error}"
+                        ))
+                    })?;
+                }
+            } else if let Some(sidx) = astage {
+                let source_handle = import_with_retry(b, 4 + sidx).map_err(|error| {
+                    io::Error::other(format!("CUDA staging import failed: {error}"))
+                })?;
+                let source = b.mem_address_reserve(total, 0).map_err(|error| {
+                    io::Error::other(format!("CUDA staging reservation failed: {error}"))
+                })?;
+                map_import_with_retry(b, source, total, 0, source_handle).map_err(|error| {
+                    io::Error::other(format!("CUDA staging map failed: {error}"))
+                })?;
+                b.mem_set_access(source, total, device).map_err(|error| {
+                    io::Error::other(format!("CUDA staging access failed: {error}"))
+                })?;
+                for &(base, size, offset) in &regions {
+                    b.memcpy_dtod(base, source + offset, size)
+                        .map_err(|error| {
+                            io::Error::other(format!(
+                                "address-preserving CUDA copy failed for {base:#x}: {error}"
+                            ))
+                        })?;
+                }
+                b.ctx_synchronize().map_err(|error| {
+                    io::Error::other(format!(
+                        "address-preserving CUDA synchronization failed: {error}"
+                    ))
+                })?;
+                b.mem_unmap(source, total).map_err(|error| {
+                    io::Error::other(format!("CUDA staging unmap failed: {error}"))
+                })?;
+                b.mem_address_free(source, total).map_err(|error| {
+                    io::Error::other(format!("CUDA staging release failed: {error}"))
+                })?;
+                b.mem_release(source_handle).map_err(|error| {
+                    io::Error::other(format!("CUDA staging handle release failed: {error}"))
+                })?;
+            }
+            b.ctx_synchronize().map_err(|error| {
+                io::Error::other(format!(
+                    "address-preserving CUDA restore synchronization failed: {error}"
+                ))
+            })?;
+            let identity = allocs
+                .iter()
+                .map(|&(dptr, size, _)| (dptr, size, dptr))
+                .collect();
+            smolvm_cuda::host::set_worker_alloc_trans(identity);
+            tracing::info!(
+                allocations = allocs.len(),
+                regions = regions.len(),
+                bytes = total,
+                "M2-alloc: restored ordinary allocations at their golden addresses"
+            );
+            count += allocs.len();
+            return Ok((count, vmm_trans));
+        }
+        if ahost.is_some() {
+            return Err(io::Error::other(
+                "ordinary CUDA host snapshot could not reserve every golden address",
+            ));
+        }
         let mut trans: Vec<(u64, u64, u64)> = Vec::new();
         if let Some(sidx) = ahost {
             for &(d, sz, offset) in &allocs {
@@ -2813,7 +2990,7 @@ fn route_clone_connection(
                     worker_pid = pid,
                     "warm dial: spawned clone process worker ahead of its first CUDA call"
                 );
-                maybe_evict_frozen_golden(*token, &options, &reg);
+                maybe_evict_frozen_golden(*token, options, &reg);
                 true
             }
             Err(e) => {
@@ -2986,7 +3163,7 @@ fn route_clone_connection(
                 share_weights,
                 "routed isolating clone to a worker process"
             );
-            maybe_evict_frozen_golden(token, &options, &reg);
+            maybe_evict_frozen_golden(token, options, &reg);
         }
         Err(e) => {
             // REJECT rather than serve in-process: this IS an isolating clone
@@ -3504,12 +3681,9 @@ fn spawn_clone_worker(
             .chain(allocs.iter().map(|(_, size, _)| *size))
             .fold(0u64, u64::saturating_add);
         let memory_bearing = !maps.is_empty() || !allocs.is_empty();
-        // cudaMalloc pointers can be translated at the RPC boundary, but a
-        // device pointer embedded inside another device allocation cannot.
-        // A VMM layout supplies address-preserved storage for those structures;
-        // an ordinary-allocation-only process does not have a generic durable
-        // reconstruction contract, so keep its live golden as the safe source.
-        let snapshot_reconstructable = host_snapshot_reconstructable(maps.len());
+        // Every retained memory class must have an address-preserving restore
+        // contract before the host snapshot may replace its live golden source.
+        let snapshot_reconstructable = host_snapshot_reconstructable(maps.len(), allocs.len());
         #[cfg(target_os = "linux")]
         let host_snapshot = snapshot_requested
             && memory_bearing
@@ -3517,13 +3691,7 @@ fn spawn_clone_worker(
             && host_snapshot_capacity_available(snapshot_required);
         #[cfg(not(target_os = "linux"))]
         let host_snapshot = false;
-        if snapshot_requested && memory_bearing && !snapshot_reconstructable {
-            tracing::warn!(
-                token,
-                allocs = allocs.len(),
-                "keeping frozen golden resident for an ordinary-allocation-only CUDA layout"
-            );
-        } else if snapshot_requested && memory_bearing && !host_snapshot {
+        if snapshot_requested && memory_bearing && !host_snapshot {
             tracing::warn!(
                 token,
                 snapshot_required,
@@ -4028,9 +4196,9 @@ mod mps_tests {
         consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
         daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
         encode_attach_procmem, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, mps_enabled, range_is_reserved, read_host_snapshot, recv_fd,
-        seal_host_snapshot, select_golden_owner, send_fd, spawn_clone_attach_listener_with_timeout,
-        unique_live_clone_worker,
+        host_snapshot_reconstructable, mps_enabled, ordinary_regions_are_reserved,
+        range_is_reserved, read_host_snapshot, recv_fd, seal_host_snapshot, select_golden_owner,
+        send_fd, spawn_clone_attach_listener_with_timeout, unique_live_clone_worker,
     };
     use std::collections::HashMap;
     use std::io;
@@ -4120,9 +4288,10 @@ mod mps_tests {
     }
 
     #[test]
-    fn host_snapshot_requires_an_address_preserved_vmm_layout() {
-        assert!(!host_snapshot_reconstructable(0));
-        assert!(host_snapshot_reconstructable(1));
+    fn host_snapshot_requires_address_preserved_device_memory() {
+        assert!(!host_snapshot_reconstructable(0, 0));
+        assert!(host_snapshot_reconstructable(1, 0));
+        assert!(host_snapshot_reconstructable(0, 1));
     }
 
     #[test]
@@ -4289,6 +4458,19 @@ mod mps_tests {
         assert!(range_is_reserved(&ranges, 0x314000000, 0x1400000));
         assert!(range_is_reserved(&ranges, 0x7a5ed2600000, 0x200000));
         assert!(!range_is_reserved(&ranges, 0x316000000, 0x200000));
+    }
+
+    #[test]
+    fn ordinary_restore_requires_every_region_to_keep_its_golden_address() {
+        let reserved = vec![(0x1000, 0x4000), (0x8000, 0x2000)];
+        assert!(ordinary_regions_are_reserved(
+            &[(0x1000, 0x2000, 0), (0x8000, 0x1000, 0x2000)],
+            &reserved,
+        ));
+        assert!(!ordinary_regions_are_reserved(
+            &[(0x1000, 0x2000, 0), (0xa000, 0x1000, 0x2000)],
+            &reserved,
+        ));
     }
 
     #[test]
