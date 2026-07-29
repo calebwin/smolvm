@@ -14,7 +14,7 @@
 //! `CAP_SYS_ADMIN`, older libkrun), so forwarding it is always safe.
 
 /// The env var the launcher sets on the agent, and that the guest shim reads.
-const ZEROCOPY_ENV: &str = "SMOLVM_CUDA_ZEROCOPY";
+const ZEROCOPY_ENV: &str = smolvm_protocol::guest_env::CUDA_ZEROCOPY;
 
 /// Whether CUDA guest-RAM zero-copy was requested for this VM.
 pub fn zerocopy_enabled() -> bool {

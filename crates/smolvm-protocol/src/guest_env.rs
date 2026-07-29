@@ -23,6 +23,12 @@ pub const VALUE_ON: &str = "1";
 /// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
 pub const GPU: &str = "SMOLVM_GPU";
 
+/// Env var the host sets on guest init when CUDA-over-vsock is available.
+///
+/// The guest agent uses it to stage the bundled CUDA shims into workload
+/// containers and the runtime shim uses it to enable guest-RAM zero-copy.
+pub const CUDA_ZEROCOPY: &str = "SMOLVM_CUDA_ZEROCOPY";
+
 /// Env var the host sets on guest init to signal Rosetta 2 x86_64 translation
 /// was requested (and is available on the host).
 ///
