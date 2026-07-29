@@ -960,6 +960,44 @@ pub fn cache_metadata_only_layout(token: u64) -> bool {
     true
 }
 
+/// Retain a frozen process layout after its live golden CUDA sessions exit.
+///
+/// The daemon separately snapshots every private device-memory range to host
+/// storage before calling this. Keeping the layout alive preserves module,
+/// function, stream, event, graph, and handle metadata for later pool
+/// replenishment without retaining the golden's CUDA context or VRAM.
+pub fn cache_frozen_layout(token: u64) -> bool {
+    let Some(layout) = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|reg| reg.get(&token))
+        .and_then(std::sync::Weak::upgrade)
+    else {
+        return false;
+    };
+    let aliases: Vec<u64> = LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|reg| {
+            reg.iter()
+                .filter_map(|(&alias, weak)| {
+                    weak.upgrade()
+                        .is_some_and(|candidate| std::sync::Arc::ptr_eq(&candidate, &layout))
+                        .then_some(alias)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut cache = METADATA_LAYOUT_HANDOFF.lock().unwrap();
+    let cache = cache.get_or_insert_with(HashMap::new);
+    for alias in aliases {
+        cache.insert(alias, layout.clone());
+    }
+    true
+}
+
 /// Release a retained metadata-only process layout and all of its channel-token
 /// aliases. Live golden sessions remain discoverable through the weak registry;
 /// this only drops the durable reference used after golden exit.
@@ -5479,6 +5517,33 @@ mod tests {
 
         assert!(!cache_metadata_only_layout(token));
         drop(layout);
+        assert!(layout_handoff_snapshot(token).is_none());
+    }
+
+    #[test]
+    fn frozen_memory_layout_survives_after_host_snapshot() {
+        use std::sync::{Arc, Mutex};
+
+        let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
+        layout.lock().unwrap().reservations.insert(0x4000, 0x2000);
+        layout
+            .lock()
+            .unwrap()
+            .modules
+            .insert(0xBEEF, vec![4, 3, 2, 1]);
+        let token = 0xA5A5_0000_0000_0001;
+        layout_handoff_register(&layout, token);
+
+        assert!(cache_frozen_layout(token));
+        drop(layout);
+
+        assert_eq!(
+            layout_handoff_snapshot(token).unwrap().0,
+            vec![(0x4000, 0x2000)]
+        );
+        let (modules, ..) = module_handoff_snapshot(token).unwrap();
+        assert_eq!(modules, vec![(0xBEEF, vec![4, 3, 2, 1])]);
+        assert!(release_metadata_only_layout(token));
         assert!(layout_handoff_snapshot(token).is_none());
     }
 
