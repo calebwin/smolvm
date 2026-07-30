@@ -2227,6 +2227,65 @@ boundaries from arbitrary calls, so a correct transparent experience must be
 activated at orchestration/framework level for a supported rollout interface and
 fall back to isolated forks otherwise.
 
+#### End-to-end GRPO rollout pool — functional, but current clone path is a no-go
+
+A second prototype subclasses the installed TRL `GRPOTrainer` generation boundary,
+exports a versioned LoRA adapter for each optimizer step, and submits prompts to one
+multi-LoRA vLLM engine. It runs real reward calculation, backward passes, and optimizer
+updates rather than a rollout-only approximation. A synchronized N=4, 20-step test
+completed 4/4 trainers and 80/80 updates; all trainers began from one exact adapter,
+all four final adapters changed and were distinct, and reward standard deviation was
+nonzero. The shared engine served all 80 policy versions without cross-routing them.
+
+The matched native control preloaded four trainers behind the same release barrier, used
+the same shared rollout server and workload, and excluded model-load time from its timed
+span. The comparison is therefore a steady-state execution result:
+
+| mode | updates | rollout tokens | scheduled span | updates/s | rollout tok/s | peak GPU | adapter export | pool busy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| four smolvm clones, ordinary allocator | 80/80 | 10,225 | 232.237 s | 0.344 | 44.028 | 24,800 MiB | 80.730 s | 13.261 s |
+| four smolvm clones, shared VMM + golden eviction | 80/80 | 10,216 | 228.222 s | 0.351 | 44.763 | 20,064 MiB | 63.453 s | 14.064 s |
+| four native MPS trainers | 80/80 | 10,205 | 40.387 s | 1.981 | 252.680 | 18,513 MiB | 5.567 s | 9.083 s |
+
+Shared VMM and golden eviction are real wins over the ordinary fallback: they remove
+4,736 MiB (19.1%) of peak GPU use and improve scheduled update rate by 1.8%. All four
+workers report `shared=20 private=34`; the daemon retains one 127.9 MiB private host
+snapshot, reuses its 21 exported handles for the next three workers, and evicts the
+redundant golden CUDA context after the declared pool becomes resident. The complete
+run passes real forward, reward, backward, optimizer, and final-readback operations.
+
+It is still a **no-go as a performance optimization for this 0.5B N=4 shape**. Native
+is 5.65x faster by completed updates and uses 1,551 MiB less peak GPU memory than the
+best shared-VMM result. The rollout service is not the limiter: it occupied only 14.1
+seconds of the 228.2-second clone span, and pool wait time was nearly identical in all
+modes. Clone-side training/remoting dominates, while writing an adapter through the
+guest mount adds a second concrete cost (0.793 versus 0.070 seconds per version).
+Trainer skew also expands 39 native rollout batches to 69 clone batches.
+
+A bulk adapter-export arm is also rejected. It collects the LoRA state, concatenates
+all same-dtype tensors on-device, performs one D2H per dtype, reconstructs the standard
+safetensors checkpoint on the CPU, and vLLM successfully loads every version. Native
+N=1 completed two updates with 0.177 seconds total export, but the full shared-VMM N=4
+arm increased aggregate export time from 63.453 to 84.062 seconds. Its later scheduled
+span was 202.065 seconds, but the persistent MPS/driver caches had already served the
+preceding cold run; because the directly scoped export metric regressed, that wall-time
+movement is not attributed to packing. Standard PEFT export remains the valid default.
+
+Two excluded failures bound reliability. An early probe issued a diagnostic D2H adapter
+checksum immediately after restore and all four clones returned
+`cudaErrorInvalidValue`; moving that non-workload operation before the fork barrier
+produced passing N=1, N=3, and full N=4 workload gates. A separate manual-fork N=4 run
+segfaulted the daemon during repeated golden exports. A symbolized N=3 retry did not
+reproduce it, while the intended declared-pool path retained one snapshot/export set,
+reused it three times, evicted the golden, and passed N=4. The framework integration
+must therefore declare its pool size; arbitrary undeclared repeated-export reliability
+remains an independent product issue rather than a qualified path.
+
+The reproducible probes are `bench/probe_grpo_pool_server.py`,
+`bench/probe_grpo_pool_trainer.py`, `bench/probe_grpo_pool_fork.sh`, and
+`bench/probe_grpo_pool_native.sh`. This remains a framework-aware experiment; arbitrary
+CUDA interception cannot infer policy versions or generation semantics.
+
 ### Remaining pure-smolvm questions
 
 The per-operation transport questions and MPS policy/lifecycle gates are now bounded.
@@ -2683,6 +2742,21 @@ Safety snapshots:
   `queue_grpo-multiadapter-refresh-kv020_n8_s20_c4_20260730-012438_r1`. The excluded
   N=8 isolated-vLLM restore attempt is under
   `~/bench_run/fork_grpo-rollout-isolated-prod-n8-correct_n8_s20_c4_20260730-012957_r1/`.
+  The real pooled-GRPO comparison is
+  `~/bench_pool_runs/fork_n4_corrected2_20260730_0240/` versus
+  `~/bench_pool_runs/native_n4_corrected_20260730_0250/`; the final shared-VMM and
+  golden-eviction result is
+  `~/bench_pool_runs/fork_vmm_pool_n4_repeat_20260730_0355/`. The passing N=1
+  workload gate and symbolized N=3 retry are
+  `fork_vmm_n1_workload_20260730_0300/` and
+  `fork_vmm_n3_debug_remote_20260730_0330/`. Excluded shared-VMM checksum,
+  undeclared-pool daemon-crash, and clone-startup attempts are retained in
+  `fork_n4_long_20260730_0205/`, `fork_vmm_n4_corrected_20260730_0310/`, and
+  `fork_vmm_pool_n4_corrected_20260730_0345/`; earlier ordinary-allocation smoke and
+  pre-seed-fix controls remain under `~/bench_pool_runs/` but are not used for the
+  final comparison. The rejected bulk-export correctness smoke and N=4 screen are
+  `native_flat_n1_smoke_20260730_0410/` and
+  `fork_vmm_pool_flat_n4_repeat_20260730_0425/`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus
