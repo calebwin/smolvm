@@ -10,6 +10,7 @@ POOL_GPU_UTIL="${POOL_GPU_UTIL:-0.14}"
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:False}"
 DECLARE_POOL="${DECLARE_POOL:-1}"
 ADAPTER_EXPORT_MODE="${ADAPTER_EXPORT_MODE:-peft}"
+DAEMON_LINGER_SECS="${DAEMON_LINGER_SECS:-0}"
 MPS_PIPE="${MPS_PIPE:-/tmp/smolvm-mps-1000-2190482}"
 SMOLVM="${SMOLVM:-$HOME/smolvm-vmm-cow-prod-bin}"
 SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$HOME/smolvm/lib/linux-x86_64}"
@@ -27,6 +28,7 @@ cleanup() {
     touch "$COORD_HOST/sample-stop" 2>/dev/null || true
     if [[ -n "$SAMPLER_PID" ]]; then wait "$SAMPLER_PID" 2>/dev/null || true; fi
     "$SMOLVM" machine rm --name bench-g --cascade >/dev/null 2>&1 || true
+    if [[ "$DAEMON_LINGER_SECS" != "0" ]]; then sleep "$DAEMON_LINGER_SECS"; fi
     if [[ -n "$SERVER_PID" ]]; then kill "$SERVER_PID" 2>/dev/null || true; fi
     if [[ -n "$DAEMON_PID" ]]; then kill "$DAEMON_PID" 2>/dev/null || true; fi
 }

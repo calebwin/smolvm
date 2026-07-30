@@ -2271,15 +2271,22 @@ span was 202.065 seconds, but the persistent MPS/driver caches had already serve
 preceding cold run; because the directly scoped export metric regressed, that wall-time
 movement is not attributed to packing. Standard PEFT export remains the valid default.
 
-Two excluded failures bound reliability. An early probe issued a diagnostic D2H adapter
-checksum immediately after restore and all four clones returned
-`cudaErrorInvalidValue`; moving that non-workload operation before the fork barrier
-produced passing N=1, N=3, and full N=4 workload gates. A separate manual-fork N=4 run
-segfaulted the daemon during repeated golden exports. A symbolized N=3 retry did not
-reproduce it, while the intended declared-pool path retained one snapshot/export set,
-reused it three times, evicted the golden, and passed N=4. The framework integration
-must therefore declare its pool size; arbitrary undeclared repeated-export reliability
-remains an independent product issue rather than a qualified path.
+An early probe issued a diagnostic D2H adapter checksum immediately after restore and
+all four clones returned `cudaErrorInvalidValue`; moving that non-workload operation
+before the fork barrier produced passing N=1, N=3, and full N=4 workload gates. A
+separate manual-fork N=4 run then exposed an intermittent daemon segfault while every
+clone independently re-exported the same golden allocations.
+
+Product commit `d44836e` removes that repeated-export path transparently. Every
+`--share-weights` lineage now retains one owner-bound host snapshot even when the user
+does not declare a pool, reuses its exported handles for later workers, and reaps the
+snapshot independently of the optional daemon idle watchdog. Exact release binary
+`95cc2120...` passed the previously failing undeclared N=4 shape: one retention, three
+reuses, no crash, `shared=20 private=34`, 4/4 learners, 8/8 real updates, four changed
+and distinct adapters, nonzero reward variance, and 20,898 MiB peak. After machine
+teardown the daemon logged release of the 127.9 MiB snapshot while
+`SMOLVM_CUDA_DAEMON_IDLE_SECS=0`. Declared pools still additionally evict the golden
+context; declaration is no longer required merely to avoid repeated exports.
 
 The reproducible probes are `bench/probe_grpo_pool_server.py`,
 `bench/probe_grpo_pool_trainer.py`, `bench/probe_grpo_pool_fork.sh`, and
@@ -2483,8 +2490,9 @@ The shared-VMM safety follow-up is `/home/binsquare/smolvm-vmm-cow` on
 files. Commit `7712d84` keeps frozen CUDA metadata alive across pool replenishment;
 commit `43e1881` fixes exported-fd source clobbering, preserves shared mappings as
 read-only across resume, and performs address-preserving VMM COW before explicit
-post-fork writes. Benchmark code, raw results, and this document are excluded from
-that PR.
+post-fork writes. Commit `d44836e` reuses one snapshot for ad hoc shared forks and
+reaps it after lineage teardown even when daemon idling is disabled. Benchmark code,
+raw results, and this document are excluded from that PR.
 
 The investigation and validation work is preserved in the following commits and at
 the current branch tip:
@@ -2515,6 +2523,7 @@ the current branch tip:
 | `c6929cf` on `cuda-clone-restore` | stabilize automatically one-vCPU CUDA fork pools on affected KVM hosts |
 | `7712d84` on `cuda-vmm-cow-safety` | preserve frozen CUDA metadata across pool replenishment |
 | `43e1881` on `cuda-vmm-cow-safety` | keep shared CUDA VMM writes clone-private and make worker fd handoff collision-free |
+| `d44836e` on `cuda-vmm-cow-safety` | reuse and reap one owner-bound snapshot across ad hoc shared forks |
 | `38aba8e` on `fix-vllm-fork-compatibility` | rebased worker-disabled warm-dial routing guard |
 | `07ba737` on `fix-vllm-fork-compatibility` | resolve locally loaded CUDA for truthful NVML hardware queries |
 | `eb8c950` on `fix-vllm-fork-compatibility` | safe lazy inherited-graph replay across clone channels |
@@ -2756,7 +2765,10 @@ Safety snapshots:
   pre-seed-fix controls remain under `~/bench_pool_runs/` but are not used for the
   final comparison. The rejected bulk-export correctness smoke and N=4 screen are
   `native_flat_n1_smoke_20260730_0410/` and
-  `fork_vmm_pool_flat_n4_repeat_20260730_0425/`.
+  `fork_vmm_pool_flat_n4_repeat_20260730_0425/`. The automatic undeclared-pool
+  snapshot prototype and exact final lifecycle gate are
+  `fork_vmm_autosnapshot_n4_20260730_0445/` and
+  `fork_vmm_autosnapshot_final_n4_20260730_0500/`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus
