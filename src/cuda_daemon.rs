@@ -57,6 +57,10 @@ fn golden_eviction_enabled(mode: Option<&str>, fork_pool_size: Option<u32>) -> b
     }
 }
 
+fn fork_snapshot_enabled(golden_eviction: bool, share_weights: bool) -> bool {
+    golden_eviction || share_weights
+}
+
 #[cfg(target_os = "linux")]
 fn host_snapshot_fits(required: u64, meminfo: &str) -> bool {
     let available_kib = meminfo.lines().find_map(|line| {
@@ -415,6 +419,12 @@ fn spawn_child_reaper() {
                     break;
                 }
             }
+            // Snapshot cleanup must not depend on the optional idle watchdog.
+            // Long-lived daemons use IDLE_SECS=0, but their completed fork
+            // lineages must still release retained descriptors and metadata.
+            prune_dead_metadata_layout_waiters();
+            let _ = live_clone_worker_count();
+            let _ = live_host_snapshot_count();
             thread::sleep(Duration::from_secs(2));
         })
         .ok();
@@ -3545,6 +3555,31 @@ fn bind_host_snapshot_owner(token: u64, pid: u32) {
 }
 
 #[cfg(unix)]
+fn bind_host_snapshot_to_golden(token: u64) -> Option<u32> {
+    let (matching, registered) = {
+        let registry = golden_connection_registry().lock().unwrap();
+        let matching = registry
+            .iter()
+            .filter_map(|(&pid, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| {
+                        entry.token == token
+                            || smolvm_cuda::host::layout_handoff_same_process(entry.token, token)
+                    })
+                    .then_some(pid)
+            })
+            .collect();
+        (matching, registry.keys().copied().collect::<Vec<_>>())
+    };
+    let known_owner = golden_token_owners().lock().unwrap().get(&token).copied();
+    let owner = select_golden_owner(matching, known_owner, &registered)?;
+    golden_token_owners().lock().unwrap().insert(token, owner);
+    bind_host_snapshot_owner(token, owner);
+    Some(owner)
+}
+
+#[cfg(unix)]
 fn live_host_snapshot_count() -> usize {
     let snapshots: Vec<(u64, Arc<CachedHostSnapshot>)> = host_snapshot_cache()
         .lock()
@@ -3650,11 +3685,13 @@ fn spawn_clone_worker(
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let eviction_mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
-    let snapshot_requested =
-        golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size);
     let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
     let sharing_active =
         share_weights && !matches!(configured_sharing.as_deref(), Some("0" | "false" | "off"));
+    let snapshot_requested = fork_snapshot_enabled(
+        golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size),
+        sharing_active,
+    );
     let (golden_dev, layout, export_fds) = if let Some(cached) = cached_host_snapshot(token) {
         tracing::info!(
             token,
@@ -3887,12 +3924,25 @@ fn spawn_clone_worker(
         }
         if snapshot_complete {
             match retain_host_snapshot(token, &layout, golden_dev, &export_fds, snapshot_offset) {
-                Ok(()) => tracing::info!(
-                    token,
-                    fds = export_fds.len(),
-                    host_bytes = snapshot_offset,
-                    "retained golden host snapshot for pool replenishment"
-                ),
+                Ok(()) => {
+                    let owner = bind_host_snapshot_to_golden(token);
+                    if owner.is_some() {
+                        tracing::info!(
+                            token,
+                            ?owner,
+                            fds = export_fds.len(),
+                            host_bytes = snapshot_offset,
+                            "retained golden host snapshot for clone reuse"
+                        );
+                    } else {
+                        host_snapshot_cache().lock().unwrap().remove(&token);
+                        smolvm_cuda::host::release_metadata_only_layout(token);
+                        tracing::warn!(
+                            token,
+                            "golden snapshot owner is ambiguous; disabling snapshot reuse"
+                        );
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         %error,
@@ -4232,10 +4282,11 @@ mod mps_tests {
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_vm_is_alive,
         consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
         daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
-        encode_attach_procmem, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, lift_owned_fds, mps_enabled, ordinary_regions_are_reserved,
-        range_is_reserved, read_host_snapshot, recv_fd, seal_host_snapshot, select_golden_owner,
-        send_fd, spawn_clone_attach_listener_with_timeout, unique_live_clone_worker,
+        encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
+        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count, mps_enabled,
+        ordinary_regions_are_reserved, range_is_reserved, read_host_snapshot, recv_fd,
+        seal_host_snapshot, select_golden_owner, send_fd, spawn_clone_attach_listener_with_timeout,
+        unique_live_clone_worker,
     };
     use std::collections::HashMap;
     use std::io;
@@ -4328,6 +4379,13 @@ mod mps_tests {
     }
 
     #[test]
+    fn shared_forks_retain_one_reusable_snapshot_without_requiring_a_pool() {
+        assert!(fork_snapshot_enabled(false, true));
+        assert!(fork_snapshot_enabled(true, false));
+        assert!(!fork_snapshot_enabled(false, false));
+    }
+
+    #[test]
     fn golden_eviction_requires_one_unambiguous_vm_owner() {
         assert_eq!(select_golden_owner(vec![7], None, &[7, 8]), Some(7));
         assert_eq!(select_golden_owner(Vec::new(), Some(8), &[7, 8]), Some(8));
@@ -4374,6 +4432,30 @@ mod mps_tests {
             .contains_key(&token));
 
         super::host_snapshot_cache().lock().unwrap().remove(&token);
+    }
+
+    #[test]
+    fn dead_golden_snapshot_is_released_without_the_idle_watchdog() {
+        let token = u64::MAX - 42;
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        super::host_snapshot_cache().lock().unwrap().insert(
+            token,
+            Arc::new(super::CachedHostSnapshot {
+                layout: String::new(),
+                device: 0,
+                fds: Vec::new(),
+                host_bytes: 1,
+                golden_pid: std::sync::atomic::AtomicU32::new(pid),
+            }),
+        );
+
+        assert_eq!(live_host_snapshot_count(), 0);
+        assert!(!super::host_snapshot_cache()
+            .lock()
+            .unwrap()
+            .contains_key(&token));
     }
 
     #[test]
