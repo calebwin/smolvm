@@ -8,6 +8,7 @@ VMEM="${VMEM:-16384}"
 MODEL="${MODEL:-unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit}"
 POOL_GPU_UTIL="${POOL_GPU_UTIL:-0.14}"
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:False}"
+AUTO_ALLOCATOR="${AUTO_ALLOCATOR:-0}"
 DECLARE_POOL="${DECLARE_POOL:-1}"
 ADAPTER_EXPORT_MODE="${ADAPTER_EXPORT_MODE:-peft}"
 DAEMON_LINGER_SECS="${DAEMON_LINGER_SECS:-0}"
@@ -61,9 +62,14 @@ DAEMON_PID=$!
 for _index in $(seq 1 100); do [[ -S "$SOCKET" ]] && break; sleep 0.1; done
 [[ -S "$SOCKET" ]] || { echo "CUDA daemon failed to start" >&2; exit 1; }
 
+allocator_env="PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_ALLOC_CONF"
+if [[ "$AUTO_ALLOCATOR" == "1" ]]; then
+    allocator_env=""
+fi
 guest="export HF_HOME=/home/ubuntu/hf HF_HUB_OFFLINE=0 TOKENIZERS_PARALLELISM=false \
 POOL_ROOT=/opt/coord/pool COORD=/opt/coord FORK=1 NSLOTS=$N STEPS=$STEPS \
-BATCH=4 NGEN=4 MAXSEQ=256 MODEL=$MODEL PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_ALLOC_CONF; \
+BATCH=4 NGEN=4 MAXSEQ=256 MODEL=$MODEL $allocator_env; \
+printf '%s\\n' \"\${PYTORCH_CUDA_ALLOC_CONF-}\" > /opt/coord/pytorch-alloc-conf; \
 export ADAPTER_EXPORT_MODE=$ADAPTER_EXPORT_MODE; \
 /home/ubuntu/ptwork/bin/python /opt/coord/workload.py >>/opt/coord/golden.log 2>&1"
 

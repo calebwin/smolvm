@@ -2335,6 +2335,28 @@ The raw pool runs are under `~/bench_pool_runs/`: the phase profile is
 `fork_vmm_pool_7b_expand_n2_s2_20260730_0545`, and
 `native_pool_7b_match_n2_s2_20260730_0600`.
 
+The expandable-segments requirement is now transparent for declared CUDA fork pools in
+product commit `fd0b54e` (PR #781). The guest agent appends
+`expandable_segments:True` to an existing PyTorch allocator configuration or creates the
+legacy-compatible `PYTORCH_CUDA_ALLOC_CONF` setting when none exists. Ordinary CUDA
+machines remain unchanged, an explicit `expandable_segments:False` is preserved, and a
+workload can disable the automatic policy with
+`SMOLVM_CUDA_EXPANDABLE_SEGMENTS=off`. A fresh H100 end-to-end control recorded
+`expandable_segments:True|` for a declared pool, `|` for ordinary CUDA, and `|` for a
+declared pool with the opt-out. The raw control is
+`~/bench_pool_runs/auto_allocator_gate_20260730`; the reusable probe is
+`bench/probe_auto_allocator.sh`.
+
+The qualified 7B pooled GRPO workload was then repeated with the harness-side allocator
+setting removed. The guest recorded `expandable_segments:True`, both clones again
+reported 259 shared and 71 private mappings, all 4/4 updates completed with two changed
+and distinct adapters and reward standard deviation 0.5, and the run produced exactly
+509 rollout tokens. It used 25,547 MiB peak GPU memory and took 171.910 seconds, within
+20 MiB and 5 ms of the manually configured 25,567 MiB / 171.915-second control. The raw
+run is `~/bench_pool_runs/fork_vmm_pool_7b_auto_n2_s2_20260730_0730`. This validates the
+memory improvement without workload injection; it does not change the remaining cold
+throughput gap.
+
 An early probe issued a diagnostic D2H adapter checksum immediately after restore and
 all four clones returned `cudaErrorInvalidValue`; moving that non-workload operation
 before the fork barrier produced passing N=1, N=3, and full N=4 workload gates. A
