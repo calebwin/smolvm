@@ -78,14 +78,16 @@ sampled trajectories rather than misreporting their extra generated tokens as sp
   post-eviction replacement reconstructs 97 mappings and completes with exact hashes.
   vLLM still reports `shared=0 private=33`, so this removes inactive-source overhead;
   it does not turn vLLM's private worker state into shared weights (§7).
-- **Forked GRPO also beats a production-style resident-base queue.** Eight
-  source-identical 200-step jobs finish 41.3% sooner, with 1.70x jobs/hour, 2.38x
-  effective rollout-token throughput, and 2.34x learner-step throughput. This is
-  direct evidence for rollouts generated inside independent trainer forks. A
-  follow-up rollout-only comparison is a no-go as a homogeneous performance
-  optimization: one fused vLLM engine is 4.15x faster and uses 28.6% less memory
-  than four isolated fork workers at the same small KV-cache setting. The queue
-  uses 7,443 MiB versus the training fork pool's 21,479 MiB (§7).
+- **Forked GRPO beats a production-style resident-base training queue, while fused
+  multi-adapter execution is the better rollout architecture.** Eight source-identical
+  200-step jobs finish 41.3% sooner in independent trainer forks, with 1.70x
+  jobs/hour, 2.38x effective rollout-token throughput, and 2.34x learner-step
+  throughput. For rollout-only work, four dynamically refreshed, distinct LoRAs in
+  one vLLM engine reach 4,025 tok/s at 6,991 MiB versus four isolated rollout forks'
+  1,072 scheduled tok/s at 9,154 MiB: 3.76x faster with 23.6% less memory. Eight
+  distinct policies reach 6,746 tok/s at 19,019 MiB with a 20% engine budget. This
+  proves the multi-adapter substrate, not an end-to-end GRPO integration; transparent
+  productization requires a framework-aware rollout service (§7).
 - **Synthetic explicit CUDA graphs remain fast through the boundary**, but the real
   installed Unsloth training path is not graphable today. A K=500 graph measures
   1.241 µs/op versus native's 1.224, yet forced Inductor graphs contained one op each,
@@ -2178,6 +2180,53 @@ scheduled span changed only 72.553 to 71.695 seconds (+1.2%), aggregate tok/s ch
 result is `fork_sft-prod-d2d-cow-probe_n8_a8_s1_c2_20260730-005231_r1`; the simpler,
 already-qualified host snapshot remains in PR #779.
 
+### Fused multi-adapter GRPO rollout prototype
+
+The installed TRL 0.24 server interface is not a safe pool for independent policies.
+It owns one global vLLM model, permits only one weight-update communicator at a time,
+and streams merged parameters into that global model. It also rejects colocating the
+trainer client and rollout server on the same CUDA device. Pointing several forked
+trainers at that endpoint would race global policy updates and can mix experiments.
+
+vLLM's native per-request `LoRARequest` path does provide the required isolation. A
+rollout-only probe created genuinely different LoRA tensor snapshots, assigned a
+unique adapter ID to every policy version, sent one adapter request per prompt, and
+verified distinct tensor and output hashes for every logical job. The dynamic arm
+replaced every policy on every round to model optimizer-driven LoRA changes; those
+updates use new IDs so vLLM's LRU adapter cache cannot return stale weights.
+
+| policies | engine budget | active sequences | aggregate tok/s | peak GPU | verdict |
+|---:|---:|---:|---:|---:|---|
+| 4 static | 6% | 32 | 4,552 | 6,709 MiB | 4/4 distinct adapters and outputs |
+| 4 refreshed/round | 6% | 32 | 4,025 | 6,991 MiB | 4/4 distinct; refresh snapshots cost 0.280 s total |
+| 8 refreshed/round | 6% | 16 | 2,126 | 7,339 MiB | correct, but Unsloth undersizes scheduler |
+| 8 refreshed/round | 8% | 32 | 4,030 | 9,063 MiB | restores N=4 saturated throughput |
+| 8 refreshed/round | 14% | 48 | 5,034 | 14,099 MiB | higher useful batching tier |
+| 8 refreshed/round | 20% | 64 | **6,746** | 19,019 MiB | best measured throughput |
+
+The same-shape four-policy isolated-fork control previously measured 1,071.578
+scheduled tok/s and 9,154 MiB. The dynamic four-adapter engine is therefore 3.76x
+faster and uses 23.6% less memory. The eight-policy sweep also exposes a specific
+adaptive-capacity requirement: Unsloth derives `max_num_seqs` from the engine memory
+budget and adapter count, accepting but then ignoring a caller-supplied
+`max_num_seqs`. At 6% it selects only 16 sequences; crossing its supported 8%, 14%,
+and 20% tiers selects 32, 48, and 64 and increases throughput monotonically.
+
+An exact N=8 isolated-vLLM fork control on the stripped production candidate did not
+qualify. Five workers completed, while three remained in LoRA load after one worker
+reported `address-preserving CUDA allocation failed for 0x702612000000: 2` during
+clone reconstruction. The partial execution is retained as restore-reliability
+evidence and is not used as a performance result. N=4 remains the valid exact
+head-to-head control.
+
+This is a **go for a framework-aware rollout-pool integration prototype**, not a
+runtime product change. The probe does not include optimizer work, inter-process
+adapter transfer, backpressure, request cancellation, or end-to-end GRPO reward and
+quality gates. The CUDA daemon cannot infer prompts, policy versions, or reward-group
+boundaries from arbitrary calls, so a correct transparent experience must be
+activated at orchestration/framework level for a supported rollout interface and
+fall back to isolated forks otherwise.
+
 ### Remaining pure-smolvm questions
 
 The per-operation transport questions and MPS policy/lifecycle gates are now bounded.
@@ -2436,6 +2485,7 @@ The latest validation files are:
 | `bench/workload_sft.py` | real Unsloth/TRL SFT qualification with exact adapter, model-output, dataset, and RNG fingerprints |
 | `bench/workload_sft_resume.py` | diagnostic fork-from-live-Trainer placement upper bound |
 | `bench/workload_grpo.py` | real sampled Unsloth/TRL GRPO qualification plus a resident-base queue control with exact adapter/RNG reset and per-step rollout/reward fingerprints |
+| `bench/probe_grpo_multiadapter.py` | distinct-policy vLLM multi-LoRA batching, per-round adapter replacement, routing hashes, and scheduler-capacity probe |
 | `bench/compare_grpo.py` | source-identity, deterministic-setup, reward/adapter-quality, queue-aware effective throughput, completed-step, and density release gate |
 | `bench/results/grpo-h100-20260726.json` | durable H100 GRPO precision, correctness, density, isolation-control, exclusion, and next-gate summary |
 | `bench/results/grpo-queue-vs-fork-h100-20260726.json` | source-identical resident-base queue versus concurrent-fork quality and performance verdict |
@@ -2623,6 +2673,16 @@ Safety snapshots:
   gate `fork_sft-prod-clean-probe_n8_a8_s1_c2_20260730-003858_r1`. Matching DPO and
   GRPO regressions are `fork_dpo-vmm-cow-regression_n4_a4_s20_c4_20260730-002413_r1`
   and `fork_grpo-vmm-cow-regression_n4_a4_s20_c2_20260730-002859_r1`.
+  Multi-adapter rollout results are
+  `queue_grpo-multiadapter-kv006_n4_s20_c4_20260730-011442_r1`,
+  `queue_grpo-multiadapter-refresh_n4_s20_c4_20260730-011559_r1`, and the N=8
+  capacity sweep
+  `queue_grpo-multiadapter-refresh_n8_s20_c4_20260730-011657_r1`,
+  `queue_grpo-multiadapter-refresh-kv008_n8_s20_c4_20260730-012219_r1`,
+  `queue_grpo-multiadapter-refresh-kv014_n8_s20_c4_20260730-012333_r1`, and
+  `queue_grpo-multiadapter-refresh-kv020_n8_s20_c4_20260730-012438_r1`. The excluded
+  N=8 isolated-vLLM restore attempt is under
+  `~/bench_run/fork_grpo-rollout-isolated-prod-n8-correct_n8_s20_c4_20260730-012957_r1/`.
 - **In this repo**: `bench/results/*.json` (11 committed in #742), `bench/README.md`
   (harness usage), `bench/RESULTS.md` (generated summary table), and
   `bench/results/mps-h100-20260725.json` plus
