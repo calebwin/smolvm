@@ -1999,6 +1999,14 @@ this workload's deterministic stragglers. Eight is the measured Pareto point on 
 but selecting it automatically still requires runtime pressure and progress signals rather
 than a fixed global constant.
 
+The default-policy decision is therefore **no-go for a fixed automatic cap**. Full
+residency remains the highest-throughput result (about 209 versus 182.847 tok/s at cap
+8), while cap 8 is an explicit cost/density trade: 12.5% less throughput for 53.9% less
+VRAM. Smolvm cannot infer that preference from CUDA activity alone, and setting cap 8
+globally would violate the throughput-first default. Keep the admission prototype out
+of the production follow-up until a real pressure/progress signal can select a cap
+dynamically; do not encode this H100/workload-specific Pareto point as policy.
+
 Supporting results:
 
 - `~/bench/results/fork_grpo-vllm-adaptive-strict-parallel_n16_a4_s20_c4_20260729-203015_r1.json`
@@ -2162,6 +2170,13 @@ for 20 stochastic updates with exact initial model/adapter hashes, four distinct
 datasets and final adapters, healthy reward ranges, 19.145 exact aggregate tok/s,
 12,907 MiB, and `shared=260 private=162` in
 `fork_grpo-vmm-cow-regression_n4_a4_s20_c2_20260730-002859_r1`.
+
+Replacing the first-write COW host snapshot with a temporary device-to-device mapping
+was also screened and rejected. The source-identical N=8 exact gate remained 8/8, but
+scheduled span changed only 72.553 to 71.695 seconds (+1.2%), aggregate tok/s changed
+113 to 112, and completed-step movement remained inside one-step noise. The candidate
+result is `fork_sft-prod-d2d-cow-probe_n8_a8_s1_c2_20260730-005231_r1`; the simpler,
+already-qualified host snapshot remains in PR #779.
 
 ### Remaining pure-smolvm questions
 
