@@ -2392,6 +2392,47 @@ The reproducible probes are `bench/probe_grpo_pool_server.py`,
 `bench/probe_grpo_pool_native.sh`. This remains a framework-aware experiment; arbitrary
 CUDA interception cannot infer policy versions or generation semantics.
 
+### Transactional batch fork and standard readiness — release-qualified candidate
+
+The manual host-side ready-file/release-file harness has now been replaced by a
+standard guest contract. A forkable VM exposes `smolvm-fork-ready` inside bare and
+OCI workloads. The workload calls it after the shared base is initialized; the
+helper records readiness in VM-private RAM and blocks. Batch forks wait for this
+boundary automatically, restore every clone, install a fresh machine identity and
+per-clone `/etc/smolvm/fork-env`, and only then release the clone-specific helper.
+The workload must still choose the semantic initialization boundary because smolvm
+cannot safely infer when a framework has finished all intended base-model writes.
+
+`machine fork --count N --name-prefix PREFIX --parallel P` is the low-level batch
+primitive. It takes one RAM/device snapshot, creates N CoW disk overlays and clone
+records, and boots clones through a continuous bounded worker queue. `{index}` and
+`{name}` substitutions plus `SMOLVM_FORK_INDEX`/`SMOLVM_FORK_NAME` give each restored
+process deterministic parameters without a sweep-specific command or shared claim
+files. Existing one-clone behavior remains available, with `--wait-ready` opting it
+into the same safe boundary.
+
+H100 qualification covered the following failure and success shapes:
+
+- a long `XDG_CACHE_HOME` that previously made libkrun restore return `EINVAL` now
+  passes because snapshot directories use the bounded
+  `<golden>/s/<8-hex-id>` layout, no longer than the already-required agent socket;
+- three CPU clones restored from exactly one snapshot with two boots in flight and
+  received distinct index/name/user env before any workload continued;
+- three concurrent PyTorch/H100 clones read the same pre-fork 256 MiB base tensor,
+  then allocated private adapter state and produced the three exact indexed results;
+- an injected two-clone boot failure removed all clone records and directories, and
+  an injected one-clone boot failure did the same;
+- both failures then reused the same golden immediately for a successful two-clone
+  batch.
+
+The failure test found a separate libkrun rollback bug: fork checkpoints quiesced
+virtio workers, but `RESUME` restarted only vCPUs, leaving the resumed golden unable
+to serve agent, block, or network I/O. libkrun now tracks whether devices were
+quiesced and rearms them before resuming. The fix is commit `ede6f79` / libkrun PR
+#51; the smolvm implementation is commits `a996075` and `888062c` / smolvm PR #783,
+stacked on the merged allocator candidate. Product commits contain no benchmark
+harness or raw results.
+
 ### Remaining pure-smolvm questions
 
 The per-operation transport questions and MPS policy/lifecycle gates are now bounded.
