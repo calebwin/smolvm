@@ -2357,6 +2357,18 @@ run is `~/bench_pool_runs/fork_vmm_pool_7b_auto_n2_s2_20260730_0730`. This valid
 memory improvement without workload injection; it does not change the remaining cold
 throughput gap.
 
+Two additional Qwen2.5-7B compatibility gates removed the workload allocator setting
+from ordinary Unsloth/TRL training as well. DPO completed 2/2 two-step learners with
+the expected 0.6931 endpoints, 260 shared / 160 private mappings, and 9,418 MiB peak.
+SFT completed 2/2 two-step learners with finite 0.4146→0.4196 and 0.4151→0.4131 loss
+paths, distinct changed parameter hashes, 260 shared / 169 private mappings, and
+11,375 MiB peak. Both guests recorded `expandable_segments:True`, and both cleanups
+left only the protected standing MPS server. The result files are
+`~/bench/results/fork_dpo-autoalloc_n2_s2_c4_20260730-053409_r1.json` and
+`~/bench/results/fork_sft-autoalloc_n2_s2_c4_20260730-053839_r1.json`. These are
+cross-workload functional and sharing gates, not throughput comparisons; the two-step
+scheduled spans are dominated by cold initialization.
+
 An early probe issued a diagnostic D2H adapter checksum immediately after restore and
 all four clones returned `cudaErrorInvalidValue`; moving that non-workload operation
 before the fork barrier produced passing N=1, N=3, and full N=4 workload gates. A
