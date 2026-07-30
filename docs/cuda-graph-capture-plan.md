@@ -2271,6 +2271,34 @@ span was 202.065 seconds, but the persistent MPS/driver caches had already serve
 preceding cold run; because the directly scoped export metric regressed, that wall-time
 movement is not attributed to packing. Standard PEFT export remains the valid default.
 
+A host-side phase profile of the same pooled trainer localizes the remaining gap. The
+N=4, five-step run completed 20/20 updates with four changed and distinct adapters,
+nonzero reward variance, and 21,174 MiB peak GPU memory. At the last complete profiler
+interval each learner had issued 376,832 CUDA proxy operations, while cumulative daemon
+dispatch consumed only 1.370--1.723 seconds; decode and response bookkeeping together
+were at most 4 ms. The release profiler does not charge time spent parked on the guest to
+its `idle` bucket, so its 2.398--2.475 seconds of observed spin-idle is a lower bound, not
+the wall-time attribution used in older spin-dominated runs. The trainer runtimes were
+165.387--166.575 seconds: more than 97% of each learner's time was therefore outside
+daemon dispatch.
+
+Progress timestamps identify that outside time as clone-local cold first use. The first
+real update took 158.07--159.09 seconds in all four clones; the remaining four updates
+finished in roughly 6--8 seconds. In the qualified native N=4 control, the first update
+took 17.23--17.44 seconds and all 20 updates finished in 29.998--38.667 seconds. This
+confirms that the small-model pool's 5.65x short-run gap is dominated by repeated lazy
+framework/context initialization, with a smaller steady eager-execution gap after that.
+It is not rollout-server work, slow daemon dispatch, module reload, extra guest vCPUs,
+or an adapter-path issue. The earlier real-GRPO screens already rejected shared compiler
+caches, eager module loading, setter elision, and semantically unsafe blind replay; do not
+retry those as transport changes.
+
+Writing the standard PEFT checkpoint to guest-local `/tmp` and then bulk-copying its
+files to the shared pool mount was also rejected. The otherwise identical N=4, 20-step
+run completed 80/80 updates, but aggregate adapter export increased from 63.453 to
+71.379 seconds, scheduled span increased from 228.222 to 231.220 seconds, and rollout
+throughput fell from 44.763 to 44.222 tok/s. The local-staging prototype was removed.
+
 An early probe issued a diagnostic D2H adapter checksum immediately after restore and
 all four clones returned `cudaErrorInvalidValue`; moving that non-workload operation
 before the fork barrier produced passing N=1, N=3, and full N=4 workload gates. A
