@@ -2342,9 +2342,10 @@ legacy-compatible `PYTORCH_CUDA_ALLOC_CONF` setting when none exists. Ordinary C
 machines remain unchanged, an explicit `expandable_segments:False` is preserved, and a
 workload can disable the automatic policy with
 `SMOLVM_CUDA_EXPANDABLE_SEGMENTS=off`. A fresh H100 end-to-end control recorded
-`expandable_segments:True|` for a declared pool, `|` for ordinary CUDA, and `|` for a
-declared pool with the opt-out. The raw control is
-`~/bench_pool_runs/auto_allocator_gate_20260730`; the reusable probe is
+`expandable_segments:True|` for both a declared pool's initial command and a later
+`machine exec`, `|` for both ordinary-CUDA paths, and `|` for both declared-pool paths
+with the opt-out. The final raw control is
+`~/bench_pool_runs/auto_allocator_exec_gate_20260730`; the reusable probe is
 `bench/probe_auto_allocator.sh`.
 
 The qualified 7B pooled GRPO workload was then repeated with the harness-side allocator

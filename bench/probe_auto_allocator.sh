@@ -46,7 +46,7 @@ run_case() {
         create_args+=(-e "$override")
     fi
     create_args+=(-- sh -c
-        "printf '%s|%s\\n' \"\${PYTORCH_CUDA_ALLOC_CONF-}\" \"\${PYTORCH_ALLOC_CONF-}\" > /opt/result/allocator")
+        "printf '%s|%s\\n' \"\${PYTORCH_CUDA_ALLOC_CONF-}\" \"\${PYTORCH_ALLOC_CONF-}\" > /opt/result/allocator; sleep 120")
     "$SMOLVM" "${create_args[@]}" >/dev/null
 
     start_args=(machine start --name "$name")
@@ -59,6 +59,10 @@ run_case() {
         sleep 0.2
     done
     [[ -f "$result_dir/allocator" ]] || { echo "$name did not record its environment" >&2; exit 1; }
+    "$SMOLVM" machine exec --name "$name" -- sh -c \
+        "printf '%s|%s\\n' \"\${PYTORCH_CUDA_ALLOC_CONF-}\" \"\${PYTORCH_ALLOC_CONF-}\" > /opt/result/allocator-exec" \
+        >/dev/null
+    [[ -f "$result_dir/allocator-exec" ]] || { echo "$name exec did not record its environment" >&2; exit 1; }
     "$SMOLVM" machine rm --name "$name" --cascade >/dev/null
 }
 
@@ -69,8 +73,16 @@ run_case auto-alloc-optout pool SMOLVM_CUDA_EXPANDABLE_SEGMENTS=off
 pool_value=$(<"$COORD_HOST/auto-alloc-pool/allocator")
 ordinary_value=$(<"$COORD_HOST/auto-alloc-ordinary/allocator")
 optout_value=$(<"$COORD_HOST/auto-alloc-optout/allocator")
+pool_exec_value=$(<"$COORD_HOST/auto-alloc-pool/allocator-exec")
+ordinary_exec_value=$(<"$COORD_HOST/auto-alloc-ordinary/allocator-exec")
+optout_exec_value=$(<"$COORD_HOST/auto-alloc-optout/allocator-exec")
 
 [[ "$pool_value" == "expandable_segments:True|" ]]
 [[ "$ordinary_value" == "|" ]]
 [[ "$optout_value" == "|" ]]
-printf 'pool=%s\nordinary=%s\noptout=%s\n' "$pool_value" "$ordinary_value" "$optout_value"
+[[ "$pool_exec_value" == "expandable_segments:True|" ]]
+[[ "$ordinary_exec_value" == "|" ]]
+[[ "$optout_exec_value" == "|" ]]
+printf 'pool=%s\npool_exec=%s\nordinary=%s\nordinary_exec=%s\noptout=%s\noptout_exec=%s\n' \
+    "$pool_value" "$pool_exec_value" "$ordinary_value" "$ordinary_exec_value" \
+    "$optout_value" "$optout_exec_value"
