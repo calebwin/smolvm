@@ -9,7 +9,7 @@ ADAPTER_EXPORT_MODE="${ADAPTER_EXPORT_MODE:-peft}"
 MPS_PIPE="${MPS_PIPE:-/tmp/smolvm-mps-1000-2190482}"
 BENCH_DIR="${BENCH_DIR:-$HOME/bench}"
 COORD="${COORD:?set COORD to a new result directory}"
-TRAIN_PYTHON="${TRAIN_PYTHON:-$HOME/ptwork/bin/python}"
+TRAIN_PYTHON="${TRAIN_PYTHON:-$HOME/rlwork/bin/python}"
 POOL_PYTHON="${POOL_PYTHON:-$HOME/rlwork/bin/python}"
 
 SERVER_PID=""
@@ -32,6 +32,7 @@ used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
 [[ "$used" -lt 500 ]] || { echo "GPU is not clean: ${used} MiB" >&2; exit 1; }
 
 env CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" \
+    HF_HOME="$HOME/hf" HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
     POOL_ROOT="$COORD/pool" MODEL="$MODEL" MAXSEQ=256 MAX_POLICIES="$N" \
     VLLM_GPU_MEMORY_UTILIZATION="$POOL_GPU_UTIL" BATCH_WINDOW_MS=50 \
     "$POOL_PYTHON" "$BENCH_DIR/probe_grpo_pool_server.py" \

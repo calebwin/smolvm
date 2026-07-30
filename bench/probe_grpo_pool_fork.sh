@@ -110,6 +110,7 @@ for clone in $(seq 0 $((N - 1))); do
 done
 
 nohup env CUDA_MPS_PIPE_DIRECTORY="$MPS_PIPE" \
+    HF_HOME="$HOME/hf" HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
     POOL_ROOT="$COORD_HOST/pool" MODEL="$MODEL" MAXSEQ=256 MAX_POLICIES="$N" \
     VLLM_GPU_MEMORY_UTILIZATION="$POOL_GPU_UTIL" BATCH_WINDOW_MS=50 \
     "$HOME/rlwork/bin/python" "$BENCH_DIR/probe_grpo_pool_server.py" \

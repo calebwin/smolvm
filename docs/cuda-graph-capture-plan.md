@@ -2245,7 +2245,7 @@ span. The comparison is therefore a steady-state execution result:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | four smolvm clones, ordinary allocator | 80/80 | 10,225 | 232.237 s | 0.344 | 44.028 | 24,800 MiB | 80.730 s | 13.261 s |
 | four smolvm clones, shared VMM + golden eviction | 80/80 | 10,216 | 228.222 s | 0.351 | 44.763 | 20,064 MiB | 63.453 s | 14.064 s |
-| four native MPS trainers | 80/80 | 10,205 | 40.387 s | 1.981 | 252.680 | 18,513 MiB | 5.567 s | 9.083 s |
+| four native MPS trainers, matched runtime | 80/80 | 10,225 | 52.594 s | 1.521 | 194.413 | 18,917 MiB | 4.945 s | 12.482 s |
 
 Shared VMM and golden eviction are real wins over the ordinary fallback: they remove
 4,736 MiB (19.1%) of peak GPU use and improve scheduled update rate by 1.8%. All four
@@ -2254,13 +2254,20 @@ snapshot, reuses its 21 exported handles for the next three workers, and evicts 
 redundant golden CUDA context after the declared pool becomes resident. The complete
 run passes real forward, reward, backward, optimizer, and final-readback operations.
 
-It is still a **no-go as a performance optimization for this 0.5B N=4 shape**. Native
-is 5.65x faster by completed updates and uses 1,551 MiB less peak GPU memory than the
-best shared-VMM result. The rollout service is not the limiter: it occupied only 14.1
-seconds of the 228.2-second clone span, and pool wait time was nearly identical in all
-modes. Clone-side training/remoting dominates, while writing an adapter through the
-guest mount adds a second concrete cost (0.793 versus 0.070 seconds per version).
-Trainer skew also expands 39 native rollout batches to 69 clone batches.
+It is still a **no-go as a performance optimization for this 0.5B N=4 shape**. Matched
+native is 4.34x faster by completed updates and uses 1,147 MiB (6.1%) less peak GPU
+memory than the best shared-VMM result. The rollout service is not the limiter: it
+occupied only 14.1 seconds of the 228.2-second clone span versus 12.5 seconds native.
+Clone-side training/remoting dominates, while writing an adapter through the guest
+mount adds a second concrete cost (0.793 versus 0.062 seconds per version). Trainer
+skew also expands 60 native rollout batches to 69 clone batches.
+
+The original 40.387-second native row is excluded from the comparison. Its trainer used
+Unsloth 2026.7.3, Torch 2.7, CUDA 12.6, Triton 3.3, and xFormers 0.0.30 while the VM pack
+uses Unsloth 2026.7.4, Torch 2.10, CUDA 12.8, Triton 3.6, and xFormers 0.0.35. The
+replacement control uses the host's matching 2026.7.4/Torch-2.10 environment for both
+trainers and the already-matching rollout server. All modes still pass 80/80 updates,
+four changed and distinct adapters, and nonzero reward variance.
 
 A bulk adapter-export arm is also rejected. It collects the LoRA state, concatenates
 all same-dtype tensors on-device, performs one D2H per dtype, reconstructs the standard
@@ -2285,8 +2292,8 @@ daemon dispatch.
 Progress timestamps identify that outside time as clone-local cold first use. The first
 real update took 158.07--159.09 seconds in all four clones; the remaining four updates
 finished in roughly 6--8 seconds. In the qualified native N=4 control, the first update
-took 17.23--17.44 seconds and all 20 updates finished in 29.998--38.667 seconds. This
-confirms that the small-model pool's 5.65x short-run gap is dominated by repeated lazy
+took 16.45--20.38 seconds and all 20 updates finished in 32.102--50.415 seconds. This
+confirms that the small-model pool's 4.34x short-run gap is dominated by repeated lazy
 framework/context initialization, with a smaller steady eager-execution gap after that.
 It is not rollout-server work, slow daemon dispatch, module reload, extra guest vCPUs,
 or an adapter-path issue. The earlier real-GRPO screens already rejected shared compiler
@@ -2298,6 +2305,35 @@ files to the shared pool mount was also rejected. The otherwise identical N=4, 2
 run completed 80/80 updates, but aggregate adapter export increased from 63.453 to
 71.379 seconds, scheduled span increased from 228.222 to 231.220 seconds, and rollout
 throughput fell from 44.763 to 44.222 tok/s. The local-staging prototype was removed.
+
+The model-scale follow-up used Qwen2.5-7B-bnb-4bit, two trainers, two real updates per
+trainer, and a 20% shared-vLLM engine budget. Every qualified arm completed 4/4 updates
+from one initial adapter into two changed and distinct final adapters with reward
+standard deviation 0.5 and exactly 509 rollout tokens:
+
+| 7B mode | scheduled span | updates/s | rollout tok/s | peak GPU | sharing |
+|---|---:|---:|---:|---:|---|
+| smolvm, ordinary private snapshot | 172.921 s | 0.0231 | 2.944 | 29,751 MiB | 0 shared; 105 private copies per clone |
+| smolvm, expandable shared VMM | 171.915 s | 0.0233 | 2.961 | **25,567 MiB** | 259 shared / 71 private mappings |
+| native MPS, matched runtime | **50.374 s** | **0.0794** | **10.104** | 32,994 MiB | independent trainers |
+
+Expandable segments therefore recover a real 7B density result without a speed
+regression: one 337.6 MiB host snapshot and 260 exported handles are reused across both
+clones, peak GPU memory is 14.1% below the private-snapshot fork and 22.5% below native,
+and scheduled time is within 0.6% of the private fork. It is not a throughput win:
+matched native remains 3.41x faster on this deliberately cold two-step shape. The first
+native attempt used the older Torch-2.7 environment and its 23.165-second result is
+excluded. The first 7B rollout-server attempt also failed before measurement because
+the host process did not receive the pinned `HF_HOME`; both pool harnesses now set the
+same offline cache contract explicitly.
+
+The raw pool runs are under `~/bench_pool_runs/`: the phase profile is
+`fork_vmm_prof_n4_s5_20260730_0430`, the rejected local-staging arm is
+`fork_vmm_pool_peftlocal_n4_20260730_0440`, the corrected 0.5B native control is
+`native_pool_05b_match_n4_s20_20260730_0610`, and the 7B private/shared/native arms are
+`fork_vmm_pool_7b_n2_s2_20260730_0510`,
+`fork_vmm_pool_7b_expand_n2_s2_20260730_0545`, and
+`native_pool_7b_match_n2_s2_20260730_0600`.
 
 An early probe issued a diagnostic D2H adapter checksum immediately after restore and
 all four clones returned `cudaErrorInvalidValue`; moving that non-workload operation
