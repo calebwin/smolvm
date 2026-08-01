@@ -446,6 +446,7 @@ impl AdmissionRegistry {
 /// Samples aggregate host CPU busy time from `/proc/stat`.
 #[derive(Default)]
 pub struct HostCpuSampler {
+    #[cfg(target_os = "linux")]
     previous: Option<(u64, u64)>,
 }
 
@@ -609,6 +610,7 @@ impl Drop for NvmlSampler {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Reports unavailable NVML telemetry on unsupported hosts.
 pub struct NvmlSampler;
 
 #[cfg(not(target_os = "linux"))]
