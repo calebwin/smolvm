@@ -23,6 +23,7 @@ pub mod admission;
 pub mod error;
 pub mod handlers;
 pub mod pool_controller;
+pub mod rollout;
 pub mod state;
 pub mod supervisor;
 pub mod types;
@@ -62,6 +63,7 @@ use state::ApiState;
         (name = "Node", description = "Node capacity introspection"),
         (name = "Machines", description = "Machine lifecycle management"),
         (name = "Pools", description = "Automatic held-fork worker pools"),
+        (name = "Rollouts", description = "Framework-aware fused multi-policy rollout executors"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
         (name = "Images", description = "OCI image management"),
@@ -104,6 +106,15 @@ use state::ApiState;
         handlers::pools::get_lease,
         handlers::pools::heartbeat_lease,
         handlers::pools::complete_lease,
+        // Fused rollouts
+        handlers::rollouts::create_executor,
+        handlers::rollouts::list_executors,
+        handlers::rollouts::get_executor,
+        handlers::rollouts::delete_executor,
+        handlers::rollouts::publish_policy,
+        handlers::rollouts::retire_policy,
+        handlers::rollouts::generate,
+        handlers::rollouts::generate_batch,
     ),
     components(schemas(
         // Request types
@@ -128,6 +139,12 @@ use state::ApiState;
         types::AcquireForkLeaseRequest,
         types::ForkLeasePayloadFile,
         types::ResizeForkPoolRequest,
+        rollout::CreateRolloutExecutorRequest,
+        rollout::PublishRolloutPolicyRequest,
+        rollout::RolloutPrompt,
+        rollout::RolloutSamplingParams,
+        rollout::RolloutGenerateRequest,
+        rollout::RolloutBatchRequest,
         // Response types
         types::HealthResponse,
         types::CapacityResponse,
@@ -146,6 +163,13 @@ use state::ApiState;
         types::ForkPoolInfo,
         types::ListForkPoolsResponse,
         types::ForkLeaseInfo,
+        rollout::RolloutExecutorInfo,
+        rollout::RolloutPolicyInfo,
+        rollout::RolloutCompletion,
+        rollout::RolloutUsage,
+        rollout::RolloutGenerateResponse,
+        rollout::RolloutBatchItemResponse,
+        rollout::RolloutBatchResponse,
     ))
 )]
 pub struct ApiDoc;
@@ -160,6 +184,8 @@ const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// uploads before the handler runs; the control plane permits 100 MiB, so match
 /// it here. The agent streams the write and enforces the true ceiling.
 const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+/// Bounded but large enough for cohorts of pre-tokenized RL prompts.
+const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
 /// Validate that an API command payload is not empty.
 pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
@@ -290,10 +316,27 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/", post(handlers::volumes::provision_volume))
         .route("/{id}", delete(handlers::volumes::deprovision_volume));
 
+    // Fused rollout handlers own their deadlines so cancelled clients abort the
+    // backend HTTP request instead of inheriting the generic lifecycle timeout.
+    let rollout_routes = Router::new()
+        .route("/", post(handlers::rollouts::create_executor))
+        .route("/", get(handlers::rollouts::list_executors))
+        .route("/{name}", get(handlers::rollouts::get_executor))
+        .route("/{name}", delete(handlers::rollouts::delete_executor))
+        .route("/{name}/policies", post(handlers::rollouts::publish_policy))
+        .route(
+            "/{name}/policies/{policy}/{version}",
+            delete(handlers::rollouts::retire_policy),
+        )
+        .route("/{name}/generate", post(handlers::rollouts::generate))
+        .route("/{name}/batches", post(handlers::rollouts::generate_batch))
+        .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
+
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
         .nest("/pools", pool_routes)
+        .nest("/rollout-executors", rollout_routes)
         .nest("/volumes", volume_routes);
 
     let cors = build_cors(cors_origins);
@@ -494,12 +537,22 @@ fn machine_id_from_path(path: &str) -> Option<&str> {
 
 fn normalize_metrics_path(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() >= 4 && parts[1] == "api" && parts[3] == "machines" {
+    if parts.len() >= 4
+        && parts[1] == "api"
+        && matches!(parts[3], "machines" | "pools" | "rollout-executors")
+    {
         if let Some(id_pos) = parts.get(4) {
             if !id_pos.is_empty() {
                 let mut normalized = parts[..4].to_vec();
                 normalized.push(":id");
                 normalized.extend_from_slice(&parts[5..]);
+                if parts[3] == "rollout-executors"
+                    && normalized.get(5) == Some(&"policies")
+                    && normalized.len() >= 8
+                {
+                    normalized[6] = ":policy";
+                    normalized[7] = ":version";
+                }
                 return normalized.join("/");
             }
         }
@@ -546,7 +599,7 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{machine_id_from_path, validate_command};
+    use super::{machine_id_from_path, normalize_metrics_path, validate_command};
 
     #[test]
     fn machine_id_is_extracted_from_machine_routes() {
@@ -569,6 +622,22 @@ mod tests {
         assert_eq!(machine_id_from_path("/health"), None);
         assert_eq!(machine_id_from_path("/api/v1/machines"), None);
         assert_eq!(machine_id_from_path("/api/v1/machines/"), None);
+    }
+
+    #[test]
+    fn metrics_paths_hide_rollout_and_pool_identifiers() {
+        assert_eq!(
+            normalize_metrics_path("/api/v1/pools/team-a/leases"),
+            "/api/v1/pools/:id/leases"
+        );
+        assert_eq!(
+            normalize_metrics_path("/api/v1/rollout-executors/qwen/policies/experiment-1/step-400"),
+            "/api/v1/rollout-executors/:id/policies/:policy/:version"
+        );
+        assert_eq!(
+            normalize_metrics_path("/api/v1/rollout-executors/qwen/generate"),
+            "/api/v1/rollout-executors/:id/generate"
+        );
     }
 
     #[test]

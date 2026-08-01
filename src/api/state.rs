@@ -70,6 +70,8 @@ pub struct ApiState {
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
+    /// Runtime registry for framework-aware fused rollout executors.
+    rollout: crate::api::rollout::RolloutRegistry,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -234,6 +236,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            rollout: crate::api::rollout::RolloutRegistry::default(),
         })
     }
 
@@ -250,6 +253,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            rollout: crate::api::rollout::RolloutRegistry::default(),
         }
     }
 
@@ -257,6 +261,11 @@ impl ApiState {
     /// the atomic lease claim path.
     pub fn admission(&self) -> &crate::api::admission::AdmissionRegistry {
         &self.admission
+    }
+
+    /// Framework-aware fused rollout executors registered on this node.
+    pub fn rollout(&self) -> &crate::api::rollout::RolloutRegistry {
+        &self.rollout
     }
 
     /// How long the main runtime may go without a supervisor heartbeat before

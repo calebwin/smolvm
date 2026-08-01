@@ -3032,6 +3032,7 @@ dependencies = [
  "parking_lot",
  "pkg-config",
  "regex",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
