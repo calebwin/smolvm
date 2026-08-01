@@ -876,6 +876,10 @@ pub struct CreateForkPoolRequest {
     /// Optional maximum number of simultaneously active leases.
     #[serde(default)]
     pub max_active: Option<u32>,
+    /// Automatically calibrate resident CUDA leases. Defaults on for shared
+    /// CUDA pools when omitted; set false for full residency.
+    #[serde(default)]
+    pub auto_admission: Option<bool>,
     /// Share immutable CUDA allocations with the golden and sibling workers.
     #[serde(default)]
     pub share_weights: bool,
@@ -916,6 +920,29 @@ pub struct ForkPoolInfo {
     /// Optional simultaneous active-lease limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_active: Option<u32>,
+    /// Whether lease residency is calibrated automatically.
+    pub auto_admission: bool,
+    /// Current dynamic resident limit when automatic admission is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_active_limit: Option<u32>,
+    /// Human-readable reason for the current automatic limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_reason: Option<String>,
+    /// True while the controller is comparing resident levels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_calibrating: Option<bool>,
+    /// Latest node-wide GPU utilization used by admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_utilization_percent: Option<f64>,
+    /// Latest aggregate GPU memory use in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_used_mib: Option<u64>,
+    /// Latest aggregate GPU memory capacity in MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_total_mib: Option<u64>,
+    /// Latest host CPU busy percentage used by admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_cpu_percent: Option<f64>,
     /// Whether immutable CUDA allocations are shared.
     pub share_weights: bool,
     /// Default lease heartbeat duration.

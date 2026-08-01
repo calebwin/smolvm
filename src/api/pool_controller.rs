@@ -18,16 +18,27 @@ pub struct ForkPoolController {
     shutdown_rx: watch::Receiver<bool>,
     fills: tokio::task::JoinSet<String>,
     filling: std::collections::HashSet<String>,
+    nvml: Option<crate::api::admission::NvmlSampler>,
+    host_cpu: crate::api::admission::HostCpuSampler,
 }
 
 impl ForkPoolController {
     /// Create a controller sharing the API's durable state and shutdown signal.
     pub fn new(state: Arc<ApiState>, shutdown_rx: watch::Receiver<bool>) -> Self {
+        let nvml = match crate::api::admission::NvmlSampler::new() {
+            Ok(nvml) => Some(nvml),
+            Err(error) => {
+                tracing::info!(%error, "NVML unavailable; automatic admission will use full residency");
+                None
+            }
+        };
         Self {
             state,
             shutdown_rx,
             fills: tokio::task::JoinSet::new(),
             filling: std::collections::HashSet::new(),
+            nvml,
+            host_cpu: crate::api::admission::HostCpuSampler::default(),
         }
     }
 
@@ -162,6 +173,7 @@ impl ForkPoolController {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
+        self.update_admission(&pools).await?;
         for pool in pools.into_iter().filter(|pool| !pool.deleting) {
             if self.filling.contains(&pool.name) {
                 continue;
@@ -180,6 +192,42 @@ impl ForkPoolController {
                     Self::fill_pool(state, pool).await;
                     pool_name
                 });
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_admission(&mut self, pools: &[ForkPoolRecord]) -> Result<(), String> {
+        let gpu = self.nvml.as_mut().and_then(|nvml| nvml.sample());
+        let host_cpu = self.host_cpu.sample();
+        let names = pools
+            .iter()
+            .map(|pool| pool.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.state.admission().retain_pools(&names);
+
+        for pool in pools.iter().filter(|pool| !pool.deleting) {
+            if !pool.auto_admission {
+                self.state.admission().observe(pool, 0, 0, gpu, host_cpu);
+                continue;
+            }
+            let db = self.state.db().clone();
+            let pool_name = pool.name.clone();
+            let (active, completed) =
+                tokio::task::spawn_blocking(move || db.fork_pool_admission_counts(&pool_name))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+            self.state
+                .admission()
+                .observe(pool, active, completed, gpu, host_cpu);
+            if let Some(snapshot) = self.state.admission().snapshot(pool) {
+                metrics::gauge!("smolvm_pool_admission_limit", "pool" => pool.name.clone())
+                    .set(f64::from(snapshot.effective_limit));
+                if let Some(utilization) = snapshot.gpu_utilization_percent {
+                    metrics::gauge!("smolvm_pool_gpu_utilization_percent", "pool" => pool.name.clone())
+                        .set(utilization);
+                }
             }
         }
         Ok(())

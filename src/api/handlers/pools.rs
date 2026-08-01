@@ -205,6 +205,7 @@ async fn activate_claimed_lease(
 }
 
 async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInfo, ApiError> {
+    let admission = state.admission().snapshot(&pool);
     let db = state.db().clone();
     let pool_name = pool.name.clone();
     let slots = tokio::task::spawn_blocking(move || db.list_fork_pool_slots(&pool_name))
@@ -230,6 +231,20 @@ async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInf
         golden: pool.golden,
         desired_ready: pool.desired_ready,
         max_active: pool.max_active,
+        auto_admission: pool.auto_admission,
+        effective_active_limit: admission.as_ref().map(|state| state.effective_limit),
+        admission_reason: admission.as_ref().map(|state| state.reason.clone()),
+        admission_calibrating: admission.as_ref().map(|state| state.calibrating),
+        gpu_utilization_percent: admission
+            .as_ref()
+            .and_then(|state| state.gpu_utilization_percent),
+        gpu_memory_used_mib: admission
+            .as_ref()
+            .and_then(|state| state.gpu_memory_used_mib),
+        gpu_memory_total_mib: admission
+            .as_ref()
+            .and_then(|state| state.gpu_memory_total_mib),
+        host_cpu_percent: admission.as_ref().and_then(|state| state.host_cpu_percent),
         share_weights: pool.share_weights,
         lease_ttl_secs: pool.lease_ttl_secs,
         provisioning,
@@ -278,6 +293,12 @@ pub async fn create_pool(
     if matches!(req.max_active, Some(0)) {
         return Err(ApiError::BadRequest(
             "maxActive must be greater than zero when set".into(),
+        ));
+    }
+    let auto_admission = req.auto_admission.unwrap_or(req.share_weights);
+    if auto_admission && !req.share_weights {
+        return Err(ApiError::BadRequest(
+            "autoAdmission requires shareWeights so residency controls CUDA workers".into(),
         ));
     }
     let ready_timeout_secs = req.ready_timeout_secs.unwrap_or(DEFAULT_READY_TIMEOUT_SECS);
@@ -331,6 +352,7 @@ pub async fn create_pool(
         golden: req.golden,
         desired_ready: req.desired_ready,
         max_active: req.max_active,
+        auto_admission,
         share_weights: req.share_weights,
         ready_timeout_secs,
         lease_ttl_secs,
@@ -534,6 +556,7 @@ pub async fn acquire_lease(
     let assignment_for_claim = assignment.clone();
     let payload_for_claim = payload_sha256.clone();
     let require_private_workspace = !files.is_empty();
+    let admission_limit = state.admission().limit(&pool);
     let claim = tokio::task::spawn_blocking(move || {
         db.claim_fork_pool_slot(ForkPoolSlotClaim {
             pool_name: &pool_for_claim,
@@ -542,6 +565,7 @@ pub async fn acquire_lease(
             assignment: &assignment_for_claim,
             payload_sha256: payload_for_claim.as_deref(),
             require_private_workspace,
+            admission_limit,
             ttl_secs: ttl,
             now,
         })
@@ -568,8 +592,11 @@ pub async fn acquire_lease(
             )))
         }
         ClaimForkPoolSlot::AtCapacity => {
+            state.admission().note_blocked(&pool_name);
+            let limit = admission_limit.or(pool.max_active);
             return Err(ApiError::Conflict(format!(
-                "fork pool '{pool_name}' reached maxActive"
+                "fork pool '{pool_name}' reached active lease limit{}",
+                limit.map(|value| format!(" ({value})")).unwrap_or_default()
             )))
         }
         ClaimForkPoolSlot::PoolNotFound => {

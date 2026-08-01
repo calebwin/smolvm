@@ -18,6 +18,7 @@
 //!   -d '{"name": "test"}'
 //! ```
 
+pub mod admission;
 #[path = "errors.rs"]
 pub mod error;
 pub mod handlers;

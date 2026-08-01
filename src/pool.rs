@@ -13,6 +13,10 @@ pub struct ForkPoolRecord {
     pub desired_ready: u32,
     /// Optional limit on simultaneously active leases.
     pub max_active: Option<u32>,
+    /// Dynamically calibrate the active-lease limit from host/GPU telemetry.
+    /// Absent on records written before automatic admission was introduced.
+    #[serde(default)]
+    pub auto_admission: bool,
     /// Share the golden's immutable CUDA allocations with each worker.
     pub share_weights: bool,
     /// Maximum time to wait for the golden's workload forkpoint.
@@ -177,5 +181,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lease.payload_sha256, None);
+    }
+
+    #[test]
+    fn legacy_pool_without_auto_admission_stays_full_residency() {
+        let pool: ForkPoolRecord = serde_json::from_str(
+            r#"{
+                "name":"rollouts",
+                "golden":"golden",
+                "desired_ready":8,
+                "max_active":null,
+                "share_weights":true,
+                "ready_timeout_secs":240,
+                "lease_ttl_secs":300,
+                "created_at":1,
+                "deleting":false
+            }"#,
+        )
+        .unwrap();
+        assert!(!pool.auto_admission);
     }
 }

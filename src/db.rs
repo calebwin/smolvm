@@ -45,6 +45,8 @@ pub struct ForkPoolSlotClaim<'a> {
     pub payload_sha256: Option<&'a str>,
     /// Reject workers whose `/workspace` is backed by an external mount.
     pub require_private_workspace: bool,
+    /// Runtime-calibrated active-lease ceiling, applied with the durable limit.
+    pub admission_limit: Option<u32>,
     /// Lease lifetime renewed by each heartbeat.
     pub ttl_secs: u64,
     /// Timestamp used for every record in this transaction.
@@ -835,6 +837,30 @@ impl SmolvmDb {
         })
     }
 
+    /// Return the active/activating lease count and cumulative successful
+    /// completions used by the runtime-only admission controller.
+    pub fn fork_pool_admission_counts(&self, pool_name: &str) -> Result<(u32, u64)> {
+        self.with_read_conn(|conn| {
+            let active = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_leases
+                     WHERE pool_name = ?1 AND state IN ('activating', 'active')",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count active fork leases for admission")?;
+            let completed = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fork_leases
+                     WHERE pool_name = ?1 AND state = 'completed'",
+                    params![pool_name],
+                    |row| row.get(0),
+                )
+                .db_err("count completed fork leases for admission")?;
+            Ok((active, completed))
+        })
+    }
+
     /// Reserve a provisioning slot only while the pool still has a ready deficit.
     ///
     /// The deficit check and insert share a transaction, so repeated controller
@@ -1004,6 +1030,7 @@ impl SmolvmDb {
             assignment,
             payload_sha256,
             require_private_workspace,
+            admission_limit,
             ttl_secs,
             now,
         } = claim;
@@ -1042,7 +1069,12 @@ impl SmolvmDb {
                 tx.commit().db_err("commit deleting fork pool claim")?;
                 return Ok(ClaimForkPoolSlot::PoolDeleting);
             }
-            if let Some(max_active) = pool.max_active {
+            let max_active = match (pool.max_active, admission_limit) {
+                (Some(configured), Some(adaptive)) => Some(configured.min(adaptive)),
+                (Some(configured), None) => Some(configured),
+                (None, adaptive) => adaptive,
+            };
+            if let Some(max_active) = max_active {
                 let active: u32 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM fork_leases
@@ -2010,6 +2042,7 @@ mod tests {
             golden: "golden".into(),
             desired_ready,
             max_active: None,
+            auto_admission: false,
             share_weights: true,
             ready_timeout_secs: 30,
             lease_ttl_secs: 60,
@@ -2087,6 +2120,7 @@ mod tests {
                 assignment: &assignment,
                 payload_sha256: Some(payload_sha256),
                 require_private_workspace: true,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 200,
             })
@@ -2112,6 +2146,7 @@ mod tests {
                 assignment: &assignment,
                 payload_sha256: Some(payload_sha256),
                 require_private_workspace: true,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 201,
             })
@@ -2130,6 +2165,7 @@ mod tests {
                 assignment: &assignment,
                 payload_sha256: None,
                 require_private_workspace: false,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 201,
             })
@@ -2157,6 +2193,7 @@ mod tests {
                 assignment: &[],
                 payload_sha256: Some("payload-digest"),
                 require_private_workspace: true,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 200,
             })
@@ -2176,6 +2213,7 @@ mod tests {
                 assignment: &[],
                 payload_sha256: None,
                 require_private_workspace: false,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 201,
             })
@@ -2221,6 +2259,7 @@ mod tests {
                         assignment: &[("EPISODE".into(), "42".into())],
                         payload_sha256: None,
                         require_private_workspace: false,
+                        admission_limit: None,
                         ttl_secs: 60,
                         now: 200,
                     })
@@ -2274,6 +2313,7 @@ mod tests {
             assignment: &[],
             payload_sha256: None,
             require_private_workspace: false,
+            admission_limit: None,
             ttl_secs: 60,
             now: 200,
         })
@@ -2288,6 +2328,7 @@ mod tests {
                 assignment: &[],
                 payload_sha256: None,
                 require_private_workspace: false,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 202,
             })
@@ -2311,12 +2352,57 @@ mod tests {
                 assignment: &[],
                 payload_sha256: None,
                 require_private_workspace: false,
+                admission_limit: None,
                 ttl_secs: 60,
                 now: 203,
             })
                 .unwrap(),
             ClaimForkPoolSlot::Existing(lease) if lease.id == "lease-1"
         ));
+    }
+
+    #[test]
+    fn adaptive_limit_is_atomic_and_never_loosens_static_limit() {
+        let (_dir, db) = temp_db();
+        let mut pool = test_pool("rollouts", 3);
+        pool.max_active = Some(2);
+        db.insert_fork_pool_if_not_exists(&pool).unwrap();
+        for machine in ["slot-1", "slot-2", "slot-3"] {
+            insert_ready_pool_slot(&db, "rollouts", machine);
+        }
+
+        let claim = |lease_id: &str, request: &str, admission_limit| {
+            db.claim_fork_pool_slot(ForkPoolSlotClaim {
+                pool_name: "rollouts",
+                lease_id,
+                idempotency_key: request,
+                assignment: &[],
+                payload_sha256: None,
+                require_private_workspace: false,
+                admission_limit,
+                ttl_secs: 60,
+                now: 200,
+            })
+            .unwrap()
+        };
+
+        assert!(matches!(
+            claim("lease-1", "request-1", Some(1)),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        assert_eq!(
+            claim("lease-2", "request-2", Some(1)),
+            ClaimForkPoolSlot::AtCapacity
+        );
+        assert!(matches!(
+            claim("lease-2", "request-2", Some(3)),
+            ClaimForkPoolSlot::Claimed(_)
+        ));
+        assert_eq!(
+            claim("lease-3", "request-3", Some(3)),
+            ClaimForkPoolSlot::AtCapacity,
+            "dynamic admission may not exceed maxActive"
+        );
     }
 
     #[test]
@@ -2339,6 +2425,7 @@ mod tests {
                     assignment: &[],
                     payload_sha256: None,
                     require_private_workspace: false,
+                    admission_limit: None,
                     ttl_secs: 10,
                     now: 200,
                 })
@@ -2399,6 +2486,7 @@ mod tests {
             assignment: &[],
             payload_sha256: None,
             require_private_workspace: false,
+            admission_limit: None,
             ttl_secs: 60,
             now: 200,
         })
@@ -2434,6 +2522,7 @@ mod tests {
             assignment: &[],
             payload_sha256: None,
             require_private_workspace: false,
+            admission_limit: None,
             ttl_secs: 60,
             now: 200,
         })
