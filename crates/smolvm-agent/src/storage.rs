@@ -12,7 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer};
+use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer, ExtractOptions};
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
@@ -1890,7 +1890,7 @@ where
             .take()
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
-        let extract_result = extract_oci_layer(crane_stdout, &layer_dir);
+        let extract_result = extract_oci_layer(crane_stdout, &layer_dir, ExtractOptions::GUEST);
 
         let crane_status = crane
             .wait()
@@ -4371,7 +4371,8 @@ mod tests {
 
         let extract = |bytes: &[u8]| -> Vec<u8> {
             let dir = tempfile::tempdir().unwrap();
-            extract_oci_layer(bytes, dir.path()).expect("extraction should succeed");
+            extract_oci_layer(bytes, dir.path(), ExtractOptions::GUEST)
+                .expect("extraction should succeed");
             std::fs::read(dir.path().join("greeting.txt")).unwrap()
         };
 
@@ -4422,8 +4423,9 @@ mod tests {
 
         for sentinel in ["storage.ext4", "agent-rootfs.tar", "./storage.ext4"] {
             let dir = tempfile::tempdir().unwrap();
-            let err = extract_oci_layer(&build_tar(sentinel)[..], dir.path())
-                .expect_err("pack sentinel must abort extraction");
+            let err =
+                extract_oci_layer(&build_tar(sentinel)[..], dir.path(), ExtractOptions::GUEST)
+                    .expect_err("pack sentinel must abort extraction");
             assert!(
                 err.to_string().contains("smolmachine pack"),
                 "clear error for {sentinel}, got: {err}"
@@ -4436,8 +4438,12 @@ mod tests {
 
         // A NESTED file of the same name is legitimate image content.
         let dir = tempfile::tempdir().unwrap();
-        extract_oci_layer(&build_tar("var/lib/foo/storage.ext4")[..], dir.path())
-            .expect("nested same-named file extracts normally");
+        extract_oci_layer(
+            &build_tar("var/lib/foo/storage.ext4")[..],
+            dir.path(),
+            ExtractOptions::GUEST,
+        )
+        .expect("nested same-named file extracts normally");
         assert!(dir.path().join("var/lib/foo/storage.ext4").exists());
     }
 
@@ -4490,7 +4496,8 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        extract_oci_layer(&buf[..], dest).expect("extraction should succeed");
+        extract_oci_layer(&buf[..], dest, ExtractOptions::GUEST)
+            .expect("extraction should succeed");
 
         // The real file extracted.
         assert_eq!(
