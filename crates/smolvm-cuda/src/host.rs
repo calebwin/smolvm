@@ -26,6 +26,8 @@ pub type CuResult<T> = Result<T, i32>;
 
 /// `CUDA_ERROR_INVALID_HANDLE`.
 pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
+/// `CUDA_ERROR_INVALID_VALUE`.
+pub const CUDA_ERROR_INVALID_VALUE: i32 = 1;
 /// Bit-63 marks a guest-minted virtual handle (see `raw_graph`, cublas vh).
 const VHANDLE_TAG: u64 = 1 << 63;
 /// `CUDA_ERROR_NOT_FOUND`.
@@ -142,6 +144,17 @@ pub trait Backend: Send {
     fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> CuResult<()>;
     /// See `memcpy_htod` for the `stream` contract.
     fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> CuResult<Vec<u8>>;
+    /// Copy directly into caller-owned storage when it can be exposed to the
+    /// CUDA driver. Backends without a direct path retain the compatible owned
+    /// copy fallback.
+    fn memcpy_dtoh_into(&mut self, dptr: u64, output: &mut [u8], stream: u64) -> CuResult<()> {
+        let bytes = self.memcpy_dtoh(dptr, output.len() as u64, stream)?;
+        if bytes.len() != output.len() {
+            return Err(CUDA_ERROR_INVALID_VALUE);
+        }
+        output.copy_from_slice(&bytes);
+        Ok(())
+    }
     fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> CuResult<()>;
     fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> CuResult<()>;
     fn mem_get_info(&mut self) -> CuResult<(u64, u64)>;
@@ -5698,6 +5711,19 @@ mod tests {
             .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
             .collect();
         assert_eq!(c, vec![11., 22., 33., 44.]);
+    }
+
+    #[test]
+    fn dtoh_into_fallback_fills_caller_owned_storage() {
+        let mut backend = CpuBackend::default();
+        let expected = b"direct snapshot destination";
+        let dptr = backend.mem_alloc(expected.len() as u64).unwrap();
+        backend.memcpy_htod(dptr, expected, 0).unwrap();
+
+        let mut output = vec![0_u8; expected.len()];
+        backend.memcpy_dtoh_into(dptr, &mut output, 0).unwrap();
+
+        assert_eq!(output, expected);
     }
 
     #[test]

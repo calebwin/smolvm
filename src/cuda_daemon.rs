@@ -2084,7 +2084,188 @@ fn map_import_with_retry(
     Err(last)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+struct HostSnapshotMapping {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    writable: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl HostSnapshotMapping {
+    fn map_read_only(fd: i32) -> io::Result<Self> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `stat` points to writable storage and `fd` remains owned by
+        // the worker for at least the lifetime of this mapping.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful fstat initialized the entire value.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_size <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA host snapshot source is not a nonempty regular file",
+            ));
+        }
+        let len = usize::try_from(stat.st_size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA host snapshot does not fit in the address space",
+            )
+        })?;
+        Self::map(fd, len, libc::PROT_READ, libc::MAP_PRIVATE, false)
+    }
+
+    fn map_writable(fd: i32, bytes: u64) -> io::Result<Self> {
+        let len = usize::try_from(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CUDA host snapshot does not fit in the address space",
+            )
+        })?;
+        if len == 0 || len > isize::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CUDA host snapshot has invalid size",
+            ));
+        }
+        let file_len = i64::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CUDA host snapshot exceeds the file size limit",
+            )
+        })?;
+        // SAFETY: `fd` is the newly-created private memfd owned by this build.
+        if unsafe { libc::ftruncate(fd, file_len) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::map(
+            fd,
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            true,
+        )
+    }
+
+    fn map(fd: i32, len: usize, protection: i32, flags: i32, writable: bool) -> io::Result<Self> {
+        if len == 0 || len > isize::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA host snapshot has invalid mapping size",
+            ));
+        }
+        // SAFETY: callers validate the file size; the returned mapping is
+        // checked and remains live until this value is dropped.
+        let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, protection, flags, fd, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(ptr) = std::ptr::NonNull::new(raw.cast::<u8>()) else {
+            // SAFETY: mmap succeeded and this releases its exact result.
+            unsafe { libc::munmap(raw, len) };
+            return Err(io::Error::other("CUDA host snapshot mmap returned null"));
+        };
+        Ok(Self { ptr, len, writable })
+    }
+
+    fn slice(&self, offset: u64, bytes: u64) -> io::Result<&[u8]> {
+        let (start, end) = self.checked_range(offset, bytes)?;
+        // SAFETY: checked_range confines this immutable view to the mapping.
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(start), end - start) })
+    }
+
+    fn slice_mut(&mut self, offset: u64, bytes: u64) -> io::Result<&mut [u8]> {
+        if !self.writable {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CUDA host snapshot mapping is read-only",
+            ));
+        }
+        let (start, end) = self.checked_range(offset, bytes)?;
+        // SAFETY: `&mut self` provides exclusive access and checked_range
+        // confines this mutable view to the writable mapping.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(start), end - start) })
+    }
+
+    fn checked_range(&self, offset: u64, bytes: u64) -> io::Result<(usize, usize)> {
+        let start = usize::try_from(offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA host snapshot offset exceeds the address space",
+            )
+        })?;
+        let size = usize::try_from(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA host snapshot range exceeds the address space",
+            )
+        })?;
+        let end = start.checked_add(size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA host snapshot range overflow",
+            )
+        })?;
+        if end > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "CUDA host snapshot range exceeds the mapped file",
+            ));
+        }
+        Ok((start, end))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HostSnapshotMapping {
+    fn drop(&mut self) {
+        // SAFETY: this value uniquely owns the exact successful mmap result.
+        unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+struct HostSnapshotMapping;
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl HostSnapshotMapping {
+    fn map_read_only(_fd: i32) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CUDA host snapshots require Linux",
+        ))
+    }
+
+    fn map_writable(_fd: i32, _bytes: u64) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CUDA host snapshots require Linux",
+        ))
+    }
+
+    fn slice(&self, _offset: u64, _bytes: u64) -> io::Result<&[u8]> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CUDA host snapshots require Linux",
+        ))
+    }
+
+    fn slice_mut(&mut self, _offset: u64, _bytes: u64) -> io::Result<&mut [u8]> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CUDA host snapshots require Linux",
+        ))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl Drop for HostSnapshotMapping {
+    fn drop(&mut self) {}
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn read_host_snapshot(fd: i32, offset: u64, size: u64) -> io::Result<Vec<u8>> {
     let len = usize::try_from(size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "snapshot range too large"))?;
@@ -2119,7 +2300,7 @@ fn read_host_snapshot(fd: i32, offset: u64, size: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, target_os = "linux"))]
 fn append_host_snapshot(fd: i32, offset: u64, bytes: &[u8]) -> io::Result<()> {
     let mut done = 0usize;
     while done < bytes.len() {
@@ -2347,6 +2528,26 @@ fn reconstruct_golden_memory(
             allocs_s = a;
         }
     }
+    let mut host_snapshot_indices: Vec<i32> = maps_s
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let mut fields = entry.split(':');
+            fields.next()?;
+            fields.next()?;
+            let index = fields.next()?.parse().ok()?;
+            fields.next()?;
+            fields.next()?;
+            fields.next().map(|_| index)
+        })
+        .collect();
+    host_snapshot_indices.extend(ahost);
+    host_snapshot_indices.sort_unstable();
+    host_snapshot_indices.dedup();
+    let host_snapshots: std::collections::HashMap<i32, HostSnapshotMapping> = host_snapshot_indices
+        .into_iter()
+        .map(|index| HostSnapshotMapping::map_read_only(4 + index).map(|mapping| (index, mapping)))
+        .collect::<io::Result<_>>()?;
     let hx = |s: &str| u64::from_str_radix(s, 16).ok();
     for e in resv_s.split(',').filter(|s| !s.is_empty()) {
         if let Some((va, size)) = e.split_once(':') {
@@ -2454,8 +2655,11 @@ fn reconstruct_golden_memory(
             )));
         }
         if let Some(offset) = host_offset {
-            let bytes = read_host_snapshot(4 + idx, offset, size)?;
-            b.memcpy_htod(va, &bytes, 0).map_err(|error| {
+            let bytes = host_snapshots
+                .get(&idx)
+                .ok_or_else(|| io::Error::other("missing mapped CUDA host snapshot"))?
+                .slice(offset, size)?;
+            b.memcpy_htod(va, bytes, 0).map_err(|error| {
                 io::Error::other(format!(
                     "CUDA host snapshot restore failed at {va:#x}: {error}"
                 ))
@@ -2605,8 +2809,11 @@ fn reconstruct_golden_memory(
                             format!("missing host snapshot offset for CUDA allocation {dptr:#x}"),
                         ));
                     };
-                    let bytes = read_host_snapshot(4 + sidx, offset, size)?;
-                    b.memcpy_htod(dptr, &bytes, 0).map_err(|error| {
+                    let bytes = host_snapshots
+                        .get(&sidx)
+                        .ok_or_else(|| io::Error::other("missing mapped CUDA host snapshot"))?
+                        .slice(offset, size)?;
+                    b.memcpy_htod(dptr, bytes, 0).map_err(|error| {
                         io::Error::other(format!(
                             "address-preserving CUDA restore failed for {dptr:#x}: {error}"
                         ))
@@ -2686,8 +2893,11 @@ fn reconstruct_golden_memory(
                         "CUDA allocation restore failed for {d:#x}: {error}"
                     ))
                 })?;
-                let bytes = read_host_snapshot(4 + sidx, offset, sz)?;
-                b.memcpy_htod(cdptr, &bytes, 0).map_err(|error| {
+                let bytes = host_snapshots
+                    .get(&sidx)
+                    .ok_or_else(|| io::Error::other("missing mapped CUDA host snapshot"))?
+                    .slice(offset, sz)?;
+                b.memcpy_htod(cdptr, bytes, 0).map_err(|error| {
                     io::Error::other(format!(
                         "CUDA allocation snapshot restore failed for {d:#x}: {error}"
                     ))
@@ -4652,6 +4862,7 @@ fn spawn_clone_worker(
         layout.push_str("|maps=");
         let mut export_fds: Vec<i32> = Vec::new();
         let mut snapshot_fd = None;
+        let mut snapshot_mapping = None;
         let mut snapshot_offset = 0u64;
         let mut snapshot_complete = host_snapshot;
         if host_snapshot {
@@ -4660,6 +4871,13 @@ fn spawn_clone_worker(
                     let idx = export_fds.len();
                     export_fds.push(fd);
                     snapshot_fd = Some((fd, idx));
+                    match HostSnapshotMapping::map_writable(fd, snapshot_required) {
+                        Ok(mapping) => snapshot_mapping = Some(mapping),
+                        Err(error) => {
+                            snapshot_complete = false;
+                            tracing::warn!(%error, "host snapshot mmap unavailable");
+                        }
+                    }
                 }
                 Err(error) => {
                     snapshot_complete = false;
@@ -4671,36 +4889,34 @@ fn spawn_clone_worker(
             // Share-safety: a candidate chunk is shared only if its device content
             // still equals what the H2Ds uploaded. All other chunks may be staged
             // to host RAM for an address-preserving private restore.
-            if host_snapshot && !(sharing_active && safe) {
-                if let Some((fd, idx)) = snapshot_fd {
-                    match backend.memcpy_dtoh(ch.va, ch.size, 0) {
-                        Ok(bytes) => match append_host_snapshot(fd, snapshot_offset, &bytes) {
-                            Ok(()) => {
-                                layout.push_str(&format!(
-                                    "{:x}:{:x}:{}:0:{:x}:{:x},",
-                                    ch.va, ch.size, idx, ch.ghandle, snapshot_offset
-                                ));
-                                snapshot_offset += ch.size;
-                                continue;
-                            }
-                            Err(error) => tracing::warn!(
-                                %error,
-                                va = ch.va,
-                                size = ch.size,
-                                "host snapshot write failed; keeping the golden resident"
-                            ),
-                        },
+            if host_snapshot && snapshot_complete && !(sharing_active && safe) {
+                if let (Some((_, idx)), Some(mapping)) = (snapshot_fd, snapshot_mapping.as_mut()) {
+                    let result = (|| -> Result<(), String> {
+                        let target = mapping
+                            .slice_mut(snapshot_offset, ch.size)
+                            .map_err(|error| error.to_string())?;
+                        backend
+                            .memcpy_dtoh_into(ch.va, target, 0)
+                            .map_err(|error| format!("CUDA error {error}"))
+                    })();
+                    match result {
+                        Ok(()) => {
+                            layout.push_str(&format!(
+                                "{:x}:{:x}:{}:0:{:x}:{:x},",
+                                ch.va, ch.size, idx, ch.ghandle, snapshot_offset
+                            ));
+                            snapshot_offset += ch.size;
+                            continue;
+                        }
                         Err(error) => tracing::warn!(
-                            error,
+                            %error,
                             va = ch.va,
                             size = ch.size,
-                            "device-to-host snapshot failed; keeping the golden resident"
+                            "direct device-to-host snapshot failed; keeping the golden resident"
                         ),
                     }
-                    snapshot_complete = false;
-                } else {
-                    snapshot_complete = false;
                 }
+                snapshot_complete = false;
             }
             let efd = backend.mem_export_handle(ch.handle).map_err(|error| {
                 io::Error::other(format!(
@@ -4738,27 +4954,29 @@ fn spawn_clone_worker(
                 }
             }
             let total: u64 = regions.iter().map(|&(b0, e0)| e0 - b0).sum();
-            let host_staged = if host_snapshot {
-                snapshot_fd.and_then(|(fd, idx)| {
-                    let mut entries = Vec::with_capacity(allocs.len());
-                    for &(d, sz, _) in &allocs {
-                        let bytes = backend.memcpy_dtoh(d, sz, 0).ok()?;
-                        append_host_snapshot(fd, snapshot_offset, &bytes).ok()?;
-                        entries.push((d, sz, snapshot_offset));
-                        snapshot_offset += sz;
-                    }
-                    layout.push_str(&format!("|ahost={idx}|aregions="));
-                    let mut off = 0u64;
-                    for &(b0, e0) in &regions {
-                        layout.push_str(&format!("{:x}:{:x}:{:x},", b0, e0 - b0, off));
-                        off += e0 - b0;
-                    }
-                    layout.push_str("|allocs=");
-                    for (d, sz, host_off) in entries {
-                        layout.push_str(&format!("{d:x}:{sz:x}:{host_off:x},"));
-                    }
-                    Some(())
-                })
+            let host_staged = if host_snapshot && snapshot_complete {
+                snapshot_fd
+                    .zip(snapshot_mapping.as_mut())
+                    .and_then(|((_, idx), mapping)| {
+                        let mut entries = Vec::with_capacity(allocs.len());
+                        for &(d, sz, _) in &allocs {
+                            let target = mapping.slice_mut(snapshot_offset, sz).ok()?;
+                            backend.memcpy_dtoh_into(d, target, 0).ok()?;
+                            entries.push((d, sz, snapshot_offset));
+                            snapshot_offset += sz;
+                        }
+                        layout.push_str(&format!("|ahost={idx}|aregions="));
+                        let mut off = 0u64;
+                        for &(b0, e0) in &regions {
+                            layout.push_str(&format!("{:x}:{:x}:{:x},", b0, e0 - b0, off));
+                            off += e0 - b0;
+                        }
+                        layout.push_str("|allocs=");
+                        for (d, sz, host_off) in entries {
+                            layout.push_str(&format!("{d:x}:{sz:x}:{host_off:x},"));
+                        }
+                        Some(())
+                    })
             } else {
                 None
             };
@@ -4801,6 +5019,9 @@ fn spawn_clone_worker(
                 }
             }
         }
+        // F_SEAL_WRITE rejects a file with any live writable mapping. All
+        // synchronous D2H copies are complete before this mapping is dropped.
+        drop(snapshot_mapping.take());
         if snapshot_complete {
             let Some((fd, _)) = snapshot_fd else {
                 return Err(io::Error::other("host snapshot fd disappeared"));
@@ -5600,10 +5821,30 @@ mod mps_tests {
     #[test]
     fn host_snapshot_roundtrips_and_is_immutable_after_sealing() {
         let fd = create_host_snapshot_memfd().unwrap();
-        super::append_host_snapshot(fd, 0, b"frozen cuda state").unwrap();
+        let mut writable = super::HostSnapshotMapping::map_writable(fd, 17).unwrap();
+        writable
+            .slice_mut(0, 17)
+            .unwrap()
+            .copy_from_slice(b"frozen cuda state");
+        assert!(writable.slice_mut(16, 2).is_err());
+        drop(writable);
+
         seal_host_snapshot(fd).unwrap();
+        let mapped = super::HostSnapshotMapping::map_read_only(fd).unwrap();
+        assert_eq!(mapped.slice(0, 17).unwrap(), b"frozen cuda state");
+        assert!(mapped.slice(17, 1).is_err());
+        let mut mapped = mapped;
+        assert!(mapped.slice_mut(0, 1).is_err());
         assert_eq!(read_host_snapshot(fd, 0, 17).unwrap(), b"frozen cuda state");
         assert!(super::append_host_snapshot(fd, 0, b"changed").is_err());
+        drop(mapped);
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn empty_host_snapshot_cannot_be_mapped() {
+        let fd = create_host_snapshot_memfd().unwrap();
+        assert!(super::HostSnapshotMapping::map_read_only(fd).is_err());
         unsafe { libc::close(fd) };
     }
 
