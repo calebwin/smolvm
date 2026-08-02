@@ -2520,6 +2520,36 @@ impl AgentManager {
         const SOCKET_PROBE_INTERVAL: Duration = Duration::from_millis(20);
         let mut next_socket_probe = Duration::ZERO;
 
+        // --- Readiness-timing experiment (SMOLVM_READY_EXPERIMENT=1) -----------
+        // Record when EACH signal (marker stat, socket ping) first arrives on ONE
+        // host clock, WITHOUT early-returning, so the marker-vs-socket delta is
+        // skew-free. Opt-in; default off leaves the behavior below unchanged
+        // (return on the first signal). Both are polled at 1ms in experiment mode
+        // so neither is quantized by the normal 20ms socket cadence.
+        let experiment = std::env::var("SMOLVM_READY_EXPERIMENT").as_deref() == Ok("1");
+        let exp_settle = Duration::from_millis(200);
+        let mut exp_marker: Option<u128> = None;
+        let mut exp_ping: Option<u128> = None;
+        let mut exp_doorbell: Option<u128> = None;
+        let mut exp_first: Option<Duration> = None;
+        // The event-driven doorbell: libkrun connects to this `ready` socket when
+        // the guest dials AGENT_READY (see launcher). Bind + non-block so we can
+        // poll accept() in the same loop and time it on the same clock.
+        let ready_listener = if experiment {
+            let ready_path = self.vsock_socket.with_extension("ready");
+            let _ = std::fs::remove_file(&ready_path);
+            std::os::unix::net::UnixListener::bind(&ready_path)
+                .and_then(|l| l.set_nonblocking(true).map(|_| l))
+                .ok()
+        } else {
+            None
+        };
+        let probe_interval = if experiment {
+            Duration::from_millis(1)
+        } else {
+            SOCKET_PROBE_INTERVAL
+        };
+
         while start.elapsed() < timeout {
             // Check if child process is still alive
             {
@@ -2549,8 +2579,15 @@ impl AgentManager {
                 .unwrap_or(false)
             {
                 let elapsed = start.elapsed();
-                tracing::info!(elapsed_ms = elapsed.as_millis(), "agent ready (marker)");
-                return Ok(());
+                if experiment {
+                    if exp_marker.is_none() {
+                        exp_marker = Some(elapsed.as_millis());
+                        exp_first.get_or_insert(elapsed);
+                    }
+                } else {
+                    tracing::info!(elapsed_ms = elapsed.as_millis(), "agent ready (marker)");
+                    return Ok(());
+                }
             }
 
             let elapsed = start.elapsed();
@@ -2570,37 +2607,80 @@ impl AgentManager {
             // grace. The marker stays as a cheap fast path; it is no longer the
             // only signal.
             if elapsed >= next_socket_probe && self.vsock_socket.exists() {
-                next_socket_probe = elapsed + SOCKET_PROBE_INTERVAL;
+                next_socket_probe = elapsed + probe_interval;
                 if let Ok(mut client) =
                     super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
                 {
                     if client.ping().is_ok() {
-                        // The agent answers, so readiness is real either way. Say
-                        // WHY the marker lost, and only complain when it is a
-                        // genuine fault rather than a benign race.
-                        if ready_marker_unwritable(&ready_marker) {
-                            tracing::warn!(
-                                elapsed_ms = elapsed.as_millis(),
-                                marker = %ready_marker.display(),
-                                "agent ready via socket; the ready marker cannot be written \
-                                 because its directory is not writable by this user (a \
-                                 root-owned install prefix does this). Boot still works, but \
-                                 the marker fast path is dead — make the agent-rootfs \
-                                 directory writable by the user running smolvm"
-                            );
+                        if experiment {
+                            if exp_ping.is_none() {
+                                exp_ping = Some(elapsed.as_millis());
+                                exp_first.get_or_insert(elapsed);
+                            }
                         } else {
-                            tracing::info!(
-                                elapsed_ms = elapsed.as_millis(),
-                                "agent ready (socket)"
-                            );
+                            // The agent answers, so readiness is real either way.
+                            // Say WHY the marker lost, and only complain when it is
+                            // a genuine fault rather than a benign race.
+                            if ready_marker_unwritable(&ready_marker) {
+                                tracing::warn!(
+                                    elapsed_ms = elapsed.as_millis(),
+                                    marker = %ready_marker.display(),
+                                    "agent ready via socket; the ready marker cannot be written \
+                                     because its directory is not writable by this user (a \
+                                     root-owned install prefix does this). Boot still works, but \
+                                     the marker fast path is dead — make the agent-rootfs \
+                                     directory writable by the user running smolvm"
+                                );
+                            } else {
+                                tracing::info!(
+                                    elapsed_ms = elapsed.as_millis(),
+                                    "agent ready (socket)"
+                                );
+                            }
+                            return Ok(());
                         }
+                    }
+                }
+            }
+
+            // Poll the event-driven doorbell (non-blocking accept) on the same clock.
+            if experiment && exp_doorbell.is_none() {
+                if let Some(l) = &ready_listener {
+                    if l.accept().is_ok() {
+                        let e = start.elapsed();
+                        exp_doorbell = Some(e.as_millis());
+                        exp_first.get_or_insert(e);
+                    }
+                }
+            }
+
+            // Experiment: once any signal has arrived, wait a bounded settle window
+            // for the rest, then log all three (skew-free deltas) and return. Bounds
+            // the wait when a signal never comes (e.g. an unwritable marker, or the
+            // doorbell port not mapped).
+            if experiment {
+                if let Some(first) = exp_first {
+                    let all = exp_marker.is_some() && exp_ping.is_some() && exp_doorbell.is_some();
+                    if all || start.elapsed() >= first + exp_settle {
+                        let d = |a: Option<u128>, b: Option<u128>| {
+                            a.zip(b).map(|(x, y)| x as i128 - y as i128)
+                        };
+                        tracing::info!(
+                            marker_ms = ?exp_marker,
+                            ping_ms = ?exp_ping,
+                            doorbell_ms = ?exp_doorbell,
+                            ping_minus_marker = ?d(exp_ping, exp_marker),
+                            doorbell_minus_marker = ?d(exp_doorbell, exp_marker),
+                            "READY_EXPERIMENT"
+                        );
                         return Ok(());
                     }
                 }
             }
+
             // 1ms polling during first second for sub-interval boot timing resolution;
             // 5ms thereafter to avoid burning CPU while waiting on slow starts.
-            let poll_ms = if elapsed < Duration::from_secs(1) {
+            let poll_ms = if experiment || elapsed < Duration::from_secs(1) {
                 1
             } else {
                 5

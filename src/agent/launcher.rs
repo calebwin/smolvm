@@ -1208,6 +1208,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             ));
         }
 
+        // Experiment (SMOLVM_READY_EXPERIMENT=1): readiness doorbell port.
+        // listen=false → libkrun connects to the host `ready` socket when the guest
+        // dials AGENT_READY at end-of-init; the host (manager) binds+accepts on it
+        // to time the event against the marker. A vsock PORT, not a device — free.
+        // Best-effort: failure just means no doorbell signal for this boot.
+        if std::env::var("SMOLVM_READY_EXPERIMENT").as_deref() == Ok("1") {
+            let ready_path = vsock_socket.with_extension("ready");
+            if let Ok(ready_c) = path_to_cstring(&ready_path) {
+                if krun_add_vsock_port2(ctx, ports::AGENT_READY, ready_c.as_ptr(), false) < 0 {
+                    tracing::warn!("readiness-doorbell vsock port failed to add (experiment)");
+                }
+            }
+        }
+
         // Guest↔host vsock services (SSH agent, DNS filter, CUDA, …). The set
         // and its wiring live in `vsock_service`; here we just register the
         // port for each one enabled for this launch. Adding a capability needs

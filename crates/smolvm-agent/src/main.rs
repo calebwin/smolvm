@@ -486,8 +486,41 @@ fn main() {
 /// Writes a marker file to the virtiofs rootfs. The host polls for this file.
 /// The virtiofs FUSE write is visible on the host filesystem within ~1ms
 /// (hv_gic_set_spi interrupt injection is 0–15µs; no event_manager involvement).
+/// Best-effort readiness doorbell: connect to the host (CID 2) on the
+/// `AGENT_READY` vsock port the instant init completes. Only wired up host-side
+/// under `SMOLVM_READY_EXPERIMENT`; when the port is unmapped the connect simply
+/// fails and is ignored. Emitted alongside the marker so the host can A/B the
+/// event-driven signal against the file stat on one clock.
+#[cfg(target_os = "linux")]
+fn ready_doorbell() {
+    unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return;
+        }
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = libc::VMADDR_CID_HOST;
+        addr.svm_port = smolvm_protocol::ports::AGENT_READY;
+        let _ = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        );
+        libc::close(fd);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ready_doorbell() {}
+
 fn signal_ready_to_host() {
     use std::path::Path;
+
+    // Emit the event-driven doorbell first (a single connect), then the file
+    // marker — both go out microseconds apart, so the host's arrival delta
+    // reflects transport, not emit order.
+    ready_doorbell();
 
     let content = uptime_ms().to_string();
 

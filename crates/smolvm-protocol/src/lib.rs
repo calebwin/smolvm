@@ -152,6 +152,11 @@ pub mod ports {
     /// (`DOCKER_HOST=unix://…`). Inbound (host connects in), like the agent
     /// control channel — unlike the outbound SSH/DNS/CUDA bridges.
     pub const DOCKER: u32 = 6003;
+    /// Readiness doorbell (experimental, `SMOLVM_READY_EXPERIMENT`): the guest
+    /// connects OUT to this host port the instant it finishes init, and the host's
+    /// `accept()` fires — an event-driven readiness signal to A/B against the
+    /// file marker. Outbound (guest connects in), like the SSH/DNS/CUDA bridges.
+    pub const AGENT_READY: u32 = 6004;
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;
