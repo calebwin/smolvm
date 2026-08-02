@@ -423,6 +423,23 @@ impl AdmissionRegistry {
         }
     }
 
+    /// Make a pool's current ceiling available to the claim path without
+    /// adding a telemetry sample. Event-driven reconciliation uses this after
+    /// pool mutations so calibration windows retain their periodic cadence.
+    pub fn ensure(&self, pool: &ForkPoolRecord, completed_total: u64) {
+        let mut pools = self.pools.lock();
+        if !pool.auto_admission {
+            pools.remove(&pool.name);
+            return;
+        }
+        let now = Instant::now();
+        let ceiling = Self::ceiling(pool);
+        let state = pools
+            .entry(pool.name.clone())
+            .or_insert_with(|| PoolAdmissionState::new(ceiling, now, completed_total));
+        state.update_ceiling(ceiling, now, completed_total);
+    }
+
     /// Current dynamic claim limit. `None` means the pool uses its existing
     /// static `maxActive`/ready-slot behavior.
     pub fn limit(&self, pool: &ForkPoolRecord) -> Option<u32> {
@@ -792,6 +809,27 @@ mod tests {
             reason.contains("limiting GPU has 5120 MiB free"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn event_sync_initializes_and_resizes_without_failing_open() {
+        let registry = AdmissionRegistry::default();
+        let mut configured = pool(12);
+
+        registry.ensure(&configured, 7);
+        let initial = registry.snapshot(&configured).unwrap();
+        assert_eq!(initial.effective_limit, 4);
+        assert!(initial.calibrating);
+        assert!(initial.reason.contains("waiting for GPU telemetry"));
+
+        configured.desired_ready = 3;
+        registry.ensure(&configured, 7);
+        assert_eq!(registry.limit(&configured), Some(3));
+
+        configured.auto_admission = false;
+        registry.ensure(&configured, 7);
+        assert_eq!(registry.limit(&configured), None);
+        assert!(registry.snapshot(&configured).is_none());
     }
 
     #[test]

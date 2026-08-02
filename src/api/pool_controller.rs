@@ -53,12 +53,25 @@ impl ForkPoolController {
 
         let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let reconcile_notify = self.state.pool_reconcile_notify();
         tracing::info!("fork pool controller started");
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     self.reap_fill_tasks();
-                    if let Err(error) = self.reconcile_once().await {
+                    if let Err(error) = self.reconcile_once(true).await {
+                        tracing::warn!(%error, "fork pool reconciliation failed");
+                    }
+                }
+                _ = reconcile_notify.notified() => {
+                    self.reap_fill_tasks();
+                    if let Err(error) = self.reconcile_once(false).await {
+                        tracing::warn!(%error, "fork pool reconciliation failed");
+                    }
+                }
+                result = self.fills.join_next(), if !self.fills.is_empty() => {
+                    self.handle_fill_task(result);
+                    if let Err(error) = self.reconcile_once(false).await {
                         tracing::warn!(%error, "fork pool reconciliation failed");
                     }
                 }
@@ -73,20 +86,25 @@ impl ForkPoolController {
         }
     }
 
+    fn handle_fill_task(&mut self, result: Option<Result<String, tokio::task::JoinError>>) {
+        match result {
+            Some(Ok(pool_name)) => {
+                self.filling.remove(&pool_name);
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "fork pool fill task failed");
+                // A panic loses the task's return value, so conservatively
+                // allow every pool to be scheduled again. Slot reservations
+                // still prevent overfill if another task is winding down.
+                self.filling.clear();
+            }
+            None => {}
+        }
+    }
+
     fn reap_fill_tasks(&mut self) {
         while let Some(result) = self.fills.try_join_next() {
-            match result {
-                Ok(pool_name) => {
-                    self.filling.remove(&pool_name);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "fork pool fill task failed");
-                    // A panic loses the task's return value, so conservatively
-                    // allow every pool to be scheduled again. Slot reservations
-                    // still prevent overfill even if another task is winding down.
-                    self.filling.clear();
-                }
-            }
+            self.handle_fill_task(Some(result));
         }
     }
 
@@ -142,7 +160,7 @@ impl ForkPoolController {
         Ok(())
     }
 
-    async fn reconcile_once(&mut self) -> Result<(), String> {
+    async fn reconcile_once(&mut self, sample_admission: bool) -> Result<(), String> {
         let now = crate::util::current_timestamp();
         let db = self.state.db().clone();
         let expired = tokio::task::spawn_blocking(move || db.expire_fork_leases(now))
@@ -173,7 +191,7 @@ impl ForkPoolController {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-        self.update_admission(&pools).await?;
+        self.update_admission(&pools, sample_admission).await?;
         for pool in pools.into_iter().filter(|pool| !pool.deleting) {
             if self.filling.contains(&pool.name) {
                 continue;
@@ -197,9 +215,17 @@ impl ForkPoolController {
         Ok(())
     }
 
-    async fn update_admission(&mut self, pools: &[ForkPoolRecord]) -> Result<(), String> {
-        let gpu = self.nvml.as_mut().and_then(|nvml| nvml.sample());
-        let host_cpu = self.host_cpu.sample();
+    async fn update_admission(
+        &mut self,
+        pools: &[ForkPoolRecord],
+        sample: bool,
+    ) -> Result<(), String> {
+        let gpu = if sample {
+            self.nvml.as_mut().and_then(|nvml| nvml.sample())
+        } else {
+            None
+        };
+        let host_cpu = if sample { self.host_cpu.sample() } else { None };
         let names = pools
             .iter()
             .map(|pool| pool.name.clone())
@@ -208,7 +234,7 @@ impl ForkPoolController {
 
         for pool in pools.iter().filter(|pool| !pool.deleting) {
             if !pool.auto_admission {
-                self.state.admission().observe(pool, 0, 0, gpu, host_cpu);
+                self.state.admission().ensure(pool, 0);
                 continue;
             }
             let db = self.state.db().clone();
@@ -218,9 +244,16 @@ impl ForkPoolController {
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())?;
-            self.state
-                .admission()
-                .observe(pool, active, completed, gpu, host_cpu);
+            if sample {
+                self.state
+                    .admission()
+                    .observe(pool, active, completed, gpu, host_cpu);
+            } else {
+                // Mutations and fill completions need an immediate capacity
+                // pass, but admission's eight-second telemetry windows remain
+                // tied to the periodic cadence rather than event frequency.
+                self.state.admission().ensure(pool, completed);
+            }
             if let Some(snapshot) = self.state.admission().snapshot(pool) {
                 metrics::gauge!("smolvm_pool_admission_limit", "pool" => pool.name.clone())
                     .set(f64::from(snapshot.effective_limit));
