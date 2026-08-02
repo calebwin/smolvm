@@ -884,6 +884,8 @@ impl ChunkCover {
 
 #[derive(Default)]
 struct GoldenLayout {
+    /// Monotonic version of state serialized into a clone worker handoff.
+    handoff_revision: u64,
     reservations: HashMap<u64, u64>,
     /// va → per-chunk H2D coverage + share verdict. A chunk is a share
     /// CANDIDATE only if its recorded upload segments tile it exactly; it is
@@ -1050,6 +1052,11 @@ fn layout_handoff_lookup(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
         .as_ref()?
         .get(&token)
         .cloned()
+}
+
+/// Return whether reconstruction metadata for `token` is still live or retained.
+pub fn layout_handoff_present(token: u64) -> bool {
+    layout_handoff_lookup(token).is_some()
 }
 
 /// Retain a frozen layout only when it has no device-memory dependency.
@@ -1256,6 +1263,16 @@ pub fn module_handoff_snapshot(
     let graphs = g.graphs.clone();
     let lib_handles = g.lib_handles.clone();
     Some((modules, funcs, streams, events, graphs, lib_handles))
+}
+
+/// Current version of the module/handle state serialized for clone workers.
+pub fn module_handoff_revision(token: u64) -> Option<u64> {
+    Some(
+        layout_handoff_lookup(token)?
+            .lock()
+            .unwrap()
+            .handoff_revision,
+    )
 }
 
 /// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
@@ -3854,11 +3871,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // M3a: keep the image so a Path-3 clone worker can reload the module in
             // its own context and remap this inherited handle.
             if path3_enabled() {
-                sess.golden_layout
-                    .lock()
-                    .unwrap()
-                    .modules
-                    .insert(raw, image.clone());
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.modules.insert(raw, image.clone());
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw))
         }
@@ -3868,11 +3883,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // primary context, so a forked clone keeps its parent's functions.
             let raw_fn = b.module_get_function(raw_mod, &name)?;
             if path3_enabled() {
-                sess.golden_layout
-                    .lock()
-                    .unwrap()
-                    .functions
-                    .insert(raw_fn, (raw_mod, name.clone()));
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.functions.insert(raw_fn, (raw_mod, name.clone()));
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw_fn))
         }
@@ -3906,13 +3919,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => {
             let raw_fn = raw_fn_h(sess, b, function);
             if path3_enabled() {
-                sess.golden_layout
-                    .lock()
-                    .unwrap()
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout
                     .func_attrs
                     .entry(raw_fn)
                     .or_default()
                     .push((attrib, value));
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
@@ -4002,7 +4015,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.owned_streams.insert(st);
             worker_handle_register(&WORKER_STREAMS, st);
             if path3_enabled() {
-                sess.golden_layout.lock().unwrap().streams.insert(st, flags);
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.streams.insert(st, flags);
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Response::Handle(st)
         }),
@@ -4034,11 +4049,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         "[p3b] golden recorded {} ops for graph {graph_vh:#x}",
                         log.len()
                     );
-                    sess.golden_layout
-                        .lock()
-                        .unwrap()
-                        .pending_oplogs
-                        .insert(graph_vh, log);
+                    let mut layout = sess.golden_layout.lock().unwrap();
+                    layout.pending_oplogs.insert(graph_vh, log);
+                    layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                 }
             }
             Ok(Response::Handle(g))
@@ -4062,6 +4075,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // on launch rather than mis-executing an unsupported graph).
             if path3_enabled() {
                 let mut layout = sess.golden_layout.lock().unwrap();
+                let mut changed = false;
                 // P3b preferred: promote the parked capture-replay log (keyed by
                 // graph_vh) to a `(graph_vh, exec_vh, log)` entry.
                 if let Some(log) = layout.pending_oplogs.remove(&graph) {
@@ -4070,11 +4084,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         log.len()
                     );
                     layout.graph_oplogs.push((graph, exec_vh, log));
+                    changed = true;
                 }
                 // Node-rebuild fallback (kernel-only graphs): kept for clones
                 // whose exec has no oplog.
                 if let Ok(Some(ser)) = b.graph_introspect(real_graph) {
                     layout.graphs.push((graph, exec_vh, ser));
+                    changed = true;
+                }
+                if changed {
+                    layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                 }
             }
             if exec_vh & VHANDLE_TAG != 0 {
@@ -4302,7 +4321,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.owned_events.insert(e);
             worker_handle_register(&WORKER_EVENTS, e);
             if path3_enabled() {
-                sess.golden_layout.lock().unwrap().events.insert(e, flags);
+                let mut layout = sess.golden_layout.lock().unwrap();
+                layout.events.insert(e, flags);
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Response::Handle(e)
         }),
@@ -4444,11 +4465,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     worker_module_register(raw);
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
-                        sess.golden_layout
-                            .lock()
-                            .unwrap()
-                            .modules
-                            .insert(raw, image.to_vec());
+                        let mut layout = sess.golden_layout.lock().unwrap();
+                        layout.modules.insert(raw, image.to_vec());
+                        layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
                     return Ok(Response::LibResult(0, raw.to_le_bytes().to_vec()));
                 }
@@ -4512,12 +4531,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         if std::env::var_os("SMOLVM_CUDA_LIB_SEED_DEBUG").is_some() {
                             eprintln!("[lib-rec] lib={lib} func={func} h={h:#x}");
                         }
-                        sess.golden_layout.lock().unwrap().lib_handles.push((
-                            lib,
-                            func,
-                            h,
-                            args.clone(),
-                        ));
+                        let mut layout = sess.golden_layout.lock().unwrap();
+                        layout.lib_handles.push((lib, func, h, args.clone()));
+                        layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                     }
                 }
             }
@@ -5893,16 +5909,20 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let layout: Arc<LayoutCell> = Arc::new(Mutex::new(GoldenLayout::default()));
-        layout
-            .lock()
-            .unwrap()
-            .modules
-            .insert(0xCAFE, vec![1, 2, 3, 4]);
+        {
+            let mut state = layout.lock().unwrap();
+            state.modules.insert(0xCAFE, vec![1, 2, 3, 4]);
+            state.handoff_revision = 7;
+        }
         let primary = 0xA3A3_0000_0000_0001;
         let alias = 0xA3A3_0000_0000_0002;
         layout_handoff_register(&layout, primary);
         layout_handoff_register(&layout, alias);
 
+        assert!(layout_handoff_present(primary));
+        assert!(layout_handoff_present(alias));
+        assert_eq!(module_handoff_revision(primary), Some(7));
+        assert_eq!(module_handoff_revision(alias), Some(7));
         assert!(cache_metadata_only_layout(primary));
         drop(layout);
 
@@ -5913,6 +5933,9 @@ mod tests {
         }
         assert!(layout_handoff_same_process(primary, alias));
         assert!(release_metadata_only_layout(alias));
+        assert!(!layout_handoff_present(primary));
+        assert!(!layout_handoff_present(alias));
+        assert_eq!(module_handoff_revision(primary), None);
         assert!(layout_handoff_snapshot(primary).is_none());
         assert!(layout_handoff_snapshot(alias).is_none());
     }

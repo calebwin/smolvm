@@ -40,6 +40,8 @@ const MAX_PENDING_TENSOR_BUNDLES: usize = 64;
 const MAX_PENDING_TENSOR_BYTES: u64 = 32 << 30;
 const TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(60);
 static TENSOR_BUNDLE_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+const MAX_MODULE_HANDOFF_BLOB_BYTES: u64 = 32 << 30;
 
 #[derive(Debug)]
 struct PendingTensorBundle {
@@ -1697,9 +1699,39 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // (reloading all up front stalls serving ~2s and breaks the clone connection)
     // + recreate streams/events, then install the translation so the clone's
     // inherited kernel launches resolve (each module reloads on first use).
-    if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
+    #[cfg(target_os = "linux")]
+    let inherited_module_blob =
+        if let Some(value) = std::env::var_os("SMOLVM_CUDA_CLONE_MODULES_FD") {
+            let value = value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module handoff fd is not valid UTF-8",
+                )
+            })?;
+            let module_fd = value.parse::<std::os::fd::RawFd>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module handoff fd is invalid",
+                )
+            })?;
+            Some(read_module_blob_fd(module_fd)?)
+        } else {
+            None
+        };
+    #[cfg(not(target_os = "linux"))]
+    let inherited_module_blob: Option<Vec<u8>> = None;
+    let module_blob = if inherited_module_blob.is_some() {
+        inherited_module_blob
+    } else if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
+        let result = std::fs::read(&modpath);
+        let _ = std::fs::remove_file(&modpath);
+        Some(result?)
+    } else {
+        None
+    };
+    if let Some(module_blob) = module_blob {
         let (mod_images, func_meta, streams, events, graphs, lib_handles) =
-            reconstruct_golden_modules(backend.as_mut(), &modpath);
+            reconstruct_golden_modules(backend.as_mut(), &module_blob);
         let (nm, nf, ns, ne, ng, nlh) = (
             mod_images.len(),
             func_meta.len(),
@@ -1722,7 +1754,6 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         // pointers reference the golden VAs, valid here). Maps the clone's
         // inherited graph/exec handles to the worker's rebuilt reals.
         let nrebuilt = smolvm_cuda::host::rebuild_clone_graphs(backend.as_mut(), graphs);
-        let _ = std::fs::remove_file(&modpath);
         // Pre-warm now (module reloads + graph re-capture into the
         // process-wide registries), while the guest VM is still resuming —
         // serving sessions adopt the results instead of doing this work on
@@ -2713,18 +2744,66 @@ fn reconstruct_golden_memory(
     Ok((count, vmm_trans))
 }
 
+#[cfg(target_os = "linux")]
+fn read_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    // Take an independent owned descriptor before closing the inherited slot.
+    // Reads use pread so workers forked from the same cached source never share
+    // or race an open-file offset.
+    let owned = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if owned < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::close(fd) };
+    let file = unsafe { std::fs::File::from_raw_fd(owned) };
+    let metadata = file.metadata()?;
+    let bytes = metadata.len();
+    if !metadata.file_type().is_file() || bytes == 0 || bytes > MAX_MODULE_HANDOFF_BLOB_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUDA module handoff source has invalid size or type",
+        ));
+    }
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUDA module handoff source does not fit in address space",
+        )
+    })?;
+    let mut blob = Vec::new();
+    blob.try_reserve_exact(bytes)
+        .map_err(|error| io::Error::other(format!("CUDA module handoff allocation: {error}")))?;
+    blob.resize(bytes, 0);
+    let mut offset = 0usize;
+    while offset < blob.len() {
+        match file.read_at(&mut blob[offset..], offset as u64) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "CUDA module handoff source was truncated",
+                ))
+            }
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(blob)
+}
+
 /// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
 /// THIS worker at first use — reloading ~400 modules up front stalls the clone
 /// ~2s and breaks its connection) and RECREATE its streams/events now (few,
-/// cheap). Returns `(mod_images, func_meta, streams, events)`. Reads the blob the
-/// daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
+/// cheap). Returns `(mod_images, func_meta, streams, events)`. Parses the blob
+/// inherited from the daemon:
 /// `[u32 nmods]([u64 h][u32 len][image])* [u32 nfuncs]([u64 fn][u64 mod][u32 len][name])*
 ///  [u32 nstreams]([u64 h][u32 flags])* [u32 nevents]([u64 h][u32 flags])*`.
 #[cfg(unix)]
 #[allow(clippy::type_complexity)]
 fn reconstruct_golden_modules(
     b: &mut dyn Backend,
-    path: &str,
+    buf: &[u8],
 ) -> (
     Vec<(u64, Vec<u8>)>,
     Vec<smolvm_cuda::host::FuncMeta>,
@@ -2739,16 +2818,6 @@ fn reconstruct_golden_modules(
     let mut event_trans = Vec::new();
     let mut graphs: Vec<(u64, u64, smolvm_cuda::host::GraphSer)> = Vec::new();
     let mut lib_handles: Vec<(u8, u16, u64, Vec<u8>)> = Vec::new();
-    let Ok(buf) = std::fs::read(path) else {
-        return (
-            mod_images,
-            func_meta,
-            stream_trans,
-            event_trans,
-            graphs,
-            lib_handles,
-        );
-    };
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
@@ -3916,6 +3985,17 @@ struct CachedHostSnapshot {
     golden_pid: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CachedModuleBlob {
+    file: std::fs::File,
+    bytes: u64,
+    revision: u64,
+}
+
+#[cfg(target_os = "linux")]
+const MAX_CACHED_MODULE_BLOBS: usize = 32;
+
 #[cfg(unix)]
 impl CachedHostSnapshot {
     fn duplicate_fds(&self) -> io::Result<Vec<std::os::unix::io::RawFd>> {
@@ -3990,6 +4070,170 @@ fn cached_host_snapshot(token: u64) -> Option<Arc<CachedHostSnapshot>> {
     cache.iter().find_map(|(&candidate, snapshot)| {
         smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| snapshot.clone())
     })
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_cache() -> &'static Mutex<std::collections::HashMap<u64, Arc<CachedModuleBlob>>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, Arc<CachedModuleBlob>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_build_gates(
+) -> &'static Mutex<std::collections::HashMap<u64, std::sync::Weak<Mutex<()>>>> {
+    static GATES: OnceLock<Mutex<std::collections::HashMap<u64, std::sync::Weak<Mutex<()>>>>> =
+        OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_build_gate(token: u64) -> Arc<Mutex<()>> {
+    let mut gates = module_blob_build_gates().lock().unwrap();
+    gates.retain(|candidate, gate| {
+        gate.strong_count() > 0 && smolvm_cuda::host::layout_handoff_present(*candidate)
+    });
+    if let Some(gate) = gates.get(&token).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    if let Some(gate) = gates.iter().find_map(|(&candidate, gate)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token)
+            .then(|| gate.upgrade())
+            .flatten()
+    }) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(token, Arc::downgrade(&gate));
+    gate
+}
+
+#[cfg(target_os = "linux")]
+fn prune_module_blob_cache(cache: &mut std::collections::HashMap<u64, Arc<CachedModuleBlob>>) {
+    let before = cache.len();
+    let before_bytes = cache
+        .values()
+        .fold(0u64, |total, blob| total.saturating_add(blob.bytes));
+    cache.retain(|token, blob| {
+        smolvm_cuda::host::module_handoff_revision(*token) == Some(blob.revision)
+    });
+    if cache.len() != before {
+        let retained_bytes = cache
+            .values()
+            .fold(0u64, |total, blob| total.saturating_add(blob.bytes));
+        tracing::info!(
+            entries = before - cache.len(),
+            bytes = before_bytes.saturating_sub(retained_bytes),
+            "released stale CUDA module handoffs"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cached_module_blob(token: u64) -> Option<Arc<CachedModuleBlob>> {
+    let mut cache = module_blob_cache().lock().unwrap();
+    prune_module_blob_cache(&mut cache);
+    if let Some(blob) = cache.get(&token) {
+        return Some(blob.clone());
+    }
+    cache.iter().find_map(|(&candidate, blob)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| blob.clone())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_module_blob(
+    token: u64,
+    revision: u64,
+    bytes: &[u8],
+) -> io::Result<Arc<CachedModuleBlob>> {
+    if let Some(blob) = cached_module_blob(token) {
+        return Ok(blob);
+    }
+    let directory = std::env::temp_dir().join("smolvm");
+    std::fs::create_dir_all(&directory)?;
+    let mut writable = tempfile::tempfile_in(&directory)?;
+    writable.write_all(bytes)?;
+    let read_path = format!("/proc/self/fd/{}", writable.as_raw_fd());
+    let file = std::fs::OpenOptions::new().read(true).open(read_path)?;
+    let blob = Arc::new(CachedModuleBlob {
+        file,
+        bytes: bytes.len() as u64,
+        revision,
+    });
+    drop(writable);
+
+    let mut cache = module_blob_cache().lock().unwrap();
+    prune_module_blob_cache(&mut cache);
+    if let Some(existing) = cache.get(&token) {
+        return Ok(existing.clone());
+    }
+    if let Some(existing) = cache.iter().find_map(|(&candidate, cached)| {
+        smolvm_cuda::host::layout_handoff_same_process(candidate, token).then(|| cached.clone())
+    }) {
+        return Ok(existing);
+    }
+    let cached_bytes = cache
+        .values()
+        .fold(0u64, |total, entry| total.saturating_add(entry.bytes));
+    let revision_current = smolvm_cuda::host::module_handoff_revision(token) == Some(revision);
+    if revision_current
+        && cache.len() < MAX_CACHED_MODULE_BLOBS
+        && cached_bytes.saturating_add(blob.bytes) <= MAX_MODULE_HANDOFF_BLOB_BYTES
+    {
+        cache.insert(token, blob.clone());
+    } else if revision_current {
+        tracing::warn!(
+            token,
+            bytes = blob.bytes,
+            cached_bytes,
+            "CUDA module handoff cache is full; retaining this source for one worker"
+        );
+    }
+    Ok(blob)
+}
+
+#[cfg(target_os = "linux")]
+fn module_blob_for_token(token: u64) -> io::Result<Option<Arc<CachedModuleBlob>>> {
+    if let Some(blob) = cached_module_blob(token) {
+        tracing::info!(
+            token,
+            bytes = blob.bytes,
+            "reusing serialized CUDA module handoff"
+        );
+        return Ok(Some(blob));
+    }
+
+    // Serialize a lineage at most once even when several clone connections
+    // arrive together. Different lineages retain independent build gates.
+    let gate = module_blob_build_gate(token);
+    let _build = gate.lock().unwrap();
+    if let Some(blob) = cached_module_blob(token) {
+        tracing::info!(
+            token,
+            bytes = blob.bytes,
+            "reusing serialized CUDA module handoff after concurrent build"
+        );
+        return Ok(Some(blob));
+    }
+    for _ in 0..3 {
+        let Some((revision, bytes)) = serialize_module_handoff(token)? else {
+            return Ok(None);
+        };
+        let blob = prepare_module_blob(token, revision, &bytes)?;
+        if smolvm_cuda::host::module_handoff_revision(token) == Some(revision) {
+            tracing::info!(
+                token,
+                revision,
+                bytes = blob.bytes,
+                "prepared reusable CUDA module handoff"
+            );
+            return Ok(Some(blob));
+        }
+    }
+    Err(io::Error::other(
+        "CUDA module state changed repeatedly while preparing handoff",
+    ))
 }
 
 #[cfg(unix)]
@@ -4069,6 +4313,11 @@ fn live_host_snapshot_count() -> usize {
             smolvm_cuda::host::release_metadata_only_layout(token);
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        let mut cache = module_blob_cache().lock().unwrap();
+        prune_module_blob_cache(&mut cache);
+    }
     live
 }
 
@@ -4114,6 +4363,134 @@ fn retain_host_snapshot(
         }),
     );
     Ok(())
+}
+
+#[cfg(unix)]
+fn module_handoff_len(value: usize) -> io::Result<[u8; 4]> {
+    Ok(u32::try_from(value)
+        .map_err(|_| io::Error::other("CUDA module handoff field exceeds 4 GiB"))?
+        .to_le_bytes())
+}
+
+#[cfg(unix)]
+fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
+    let (revision, snapshot, oplogs) = {
+        let mut attempts = 0;
+        loop {
+            let Some(before) = smolvm_cuda::host::module_handoff_revision(token) else {
+                return Ok(None);
+            };
+            let Some(snapshot) = smolvm_cuda::host::module_handoff_snapshot(token) else {
+                return Ok(None);
+            };
+            let oplogs = smolvm_cuda::host::graph_oplogs_snapshot(token);
+            if smolvm_cuda::host::module_handoff_revision(token) == Some(before) {
+                break (before, snapshot, oplogs);
+            }
+            attempts += 1;
+            if attempts == 3 {
+                return Err(io::Error::other(
+                    "CUDA module state changed repeatedly during handoff",
+                ));
+            }
+        }
+    };
+    let (modules, funcs, streams, events, graphs, lib_handles) = snapshot;
+    tracing::info!(
+        revision,
+        modules = modules.len(),
+        funcs = funcs.len(),
+        streams = streams.len(),
+        events = events.len(),
+        graphs = graphs.len(),
+        lib_handles = lib_handles.len(),
+        "M3a: gathered golden modules/functions/streams/events"
+    );
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&module_handoff_len(modules.len())?);
+    for (handle, image) in &modules {
+        blob.extend_from_slice(&handle.to_le_bytes());
+        blob.extend_from_slice(&module_handoff_len(image.len())?);
+        blob.extend_from_slice(image);
+    }
+    blob.extend_from_slice(&module_handoff_len(funcs.len())?);
+    for (handle, module, name, attrs) in &funcs {
+        blob.extend_from_slice(&handle.to_le_bytes());
+        blob.extend_from_slice(&module.to_le_bytes());
+        blob.extend_from_slice(&module_handoff_len(name.len())?);
+        blob.extend_from_slice(name.as_bytes());
+        // Per-function attribute replays ([i32 attr][i32 value] each) —
+        // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
+        blob.extend_from_slice(&module_handoff_len(attrs.len())?);
+        for &(attribute, value) in attrs {
+            blob.extend_from_slice(&attribute.to_le_bytes());
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    // Streams + events: [u64 golden handle][u32 create flags] each.
+    blob.extend_from_slice(&module_handoff_len(streams.len())?);
+    for (handle, flags) in &streams {
+        blob.extend_from_slice(&handle.to_le_bytes());
+        blob.extend_from_slice(&flags.to_le_bytes());
+    }
+    blob.extend_from_slice(&module_handoff_len(events.len())?);
+    for (handle, flags) in &events {
+        blob.extend_from_slice(&handle.to_le_bytes());
+        blob.extend_from_slice(&flags.to_le_bytes());
+    }
+    // M3b: captured graphs. Per graph: [u64 graph_vh][u64 exec_vh]
+    //   [u32 nnodes]([u64 func][u32*3 grid][u32*3 block][u32 shmem]
+    //                [u32 nparams]([u32 len][bytes])* )*
+    //   [u32 nedges]([u32 from][u32 to])*
+    blob.extend_from_slice(&module_handoff_len(graphs.len())?);
+    for (graph_vh, exec_vh, graph) in &graphs {
+        blob.extend_from_slice(&graph_vh.to_le_bytes());
+        blob.extend_from_slice(&exec_vh.to_le_bytes());
+        blob.extend_from_slice(&module_handoff_len(graph.nodes.len())?);
+        for node in &graph.nodes {
+            blob.extend_from_slice(&node.func.to_le_bytes());
+            for value in node.grid.iter().chain(node.block.iter()) {
+                blob.extend_from_slice(&value.to_le_bytes());
+            }
+            blob.extend_from_slice(&node.shared_mem.to_le_bytes());
+            blob.extend_from_slice(&module_handoff_len(node.params.len())?);
+            for param in &node.params {
+                blob.extend_from_slice(&module_handoff_len(param.len())?);
+                blob.extend_from_slice(param);
+            }
+        }
+        blob.extend_from_slice(&module_handoff_len(graph.edges.len())?);
+        for &(from, to) in &graph.edges {
+            blob.extend_from_slice(&from.to_le_bytes());
+            blob.extend_from_slice(&to.to_le_bytes());
+        }
+    }
+    // Library-handle creates for the worker to replay:
+    //   [u32 n]([u8 lib][u16 func][u64 handle][u32 len][args])*
+    blob.extend_from_slice(&module_handoff_len(lib_handles.len())?);
+    for (library, function, handle, args) in &lib_handles {
+        blob.push(*library);
+        blob.extend_from_slice(&function.to_le_bytes());
+        blob.extend_from_slice(&handle.to_le_bytes());
+        blob.extend_from_slice(&module_handoff_len(args.len())?);
+        blob.extend_from_slice(args);
+    }
+    // P3b: capture-replay op-logs. Per graph:
+    //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
+    blob.extend_from_slice(&module_handoff_len(oplogs.len())?);
+    for (graph_vh, exec_vh, ops) in &oplogs {
+        blob.extend_from_slice(&graph_vh.to_le_bytes());
+        blob.extend_from_slice(&exec_vh.to_le_bytes());
+        blob.extend_from_slice(&module_handoff_len(ops.len())?);
+        for op in ops {
+            blob.extend_from_slice(&module_handoff_len(op.len())?);
+            blob.extend_from_slice(op);
+        }
+    }
+    if blob.len() as u64 > MAX_MODULE_HANDOFF_BLOB_BYTES {
+        return Err(io::Error::other("CUDA module handoff exceeds cache limit"));
+    }
+    Ok(Some((revision, blob)))
 }
 
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
@@ -4406,116 +4783,31 @@ fn spawn_clone_worker(
         }
         (golden_dev, layout, export_fds)
     };
-    // M3a: serialize the golden's modules (images) + functions to a temp file for
-    // the worker to reload + remap. Images are MB-scale, so a file, not env.
-    let mut modpath: Option<String> = None;
-    if let Some((modules, funcs, streams, events, graphs, lib_handles)) =
-        smolvm_cuda::host::module_handoff_snapshot(token)
-    {
-        tracing::info!(
-            modules = modules.len(),
-            funcs = funcs.len(),
-            streams = streams.len(),
-            events = events.len(),
-            graphs = graphs.len(),
-            lib_handles = lib_handles.len(),
-            "M3a: gathered golden modules/functions/streams/events"
-        );
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&(modules.len() as u32).to_le_bytes());
-        for (h, img) in &modules {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&(img.len() as u32).to_le_bytes());
-            blob.extend_from_slice(img);
-        }
-        blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
-        for (h, m, n, attrs) in &funcs {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&m.to_le_bytes());
-            blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
-            blob.extend_from_slice(n.as_bytes());
-            // Per-function attribute replays ([i32 attr][i32 value] each) —
-            // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
-            blob.extend_from_slice(&(attrs.len() as u32).to_le_bytes());
-            for &(a, v) in attrs {
-                blob.extend_from_slice(&a.to_le_bytes());
-                blob.extend_from_slice(&v.to_le_bytes());
+    // Serialize immutable module state once per live lineage. Linux workers
+    // inherit a read-only descriptor for an unnamed file; other Unix hosts keep
+    // the legacy unique-path handoff.
+    #[cfg(target_os = "linux")]
+    let module_blob = match module_blob_for_token(token) {
+        Ok(blob) => blob,
+        Err(error) => {
+            for &fd in &export_fds {
+                unsafe { libc::close(fd) };
             }
+            return Err(error);
         }
-        // Streams + events: [u64 golden handle][u32 create flags] each.
-        blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
-        for (h, flags) in &streams {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&flags.to_le_bytes());
-        }
-        blob.extend_from_slice(&(events.len() as u32).to_le_bytes());
-        for (h, flags) in &events {
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&flags.to_le_bytes());
-        }
-        // M3b: captured graphs. Per graph: [u64 graph_vh][u64 exec_vh]
-        //   [u32 nnodes]([u64 func][u32*3 grid][u32*3 block][u32 shmem]
-        //                [u32 nparams]([u32 len][bytes])* )*
-        //   [u32 nedges]([u32 from][u32 to])*
-        blob.extend_from_slice(&(graphs.len() as u32).to_le_bytes());
-        for (graph_vh, exec_vh, g) in &graphs {
-            blob.extend_from_slice(&graph_vh.to_le_bytes());
-            blob.extend_from_slice(&exec_vh.to_le_bytes());
-            blob.extend_from_slice(&(g.nodes.len() as u32).to_le_bytes());
-            for nd in &g.nodes {
-                blob.extend_from_slice(&nd.func.to_le_bytes());
-                for x in nd.grid.iter().chain(nd.block.iter()) {
-                    blob.extend_from_slice(&x.to_le_bytes());
-                }
-                blob.extend_from_slice(&nd.shared_mem.to_le_bytes());
-                blob.extend_from_slice(&(nd.params.len() as u32).to_le_bytes());
-                for p in &nd.params {
-                    blob.extend_from_slice(&(p.len() as u32).to_le_bytes());
-                    blob.extend_from_slice(p);
-                }
-            }
-            blob.extend_from_slice(&(g.edges.len() as u32).to_le_bytes());
-            for &(f, t) in &g.edges {
-                blob.extend_from_slice(&f.to_le_bytes());
-                blob.extend_from_slice(&t.to_le_bytes());
-            }
-        }
-        // Library-handle creates for the worker to replay:
-        //   [u32 n]([u8 lib][u16 func][u64 handle][u32 len][args])*
-        blob.extend_from_slice(&(lib_handles.len() as u32).to_le_bytes());
-        for (lib, func, h, args) in &lib_handles {
-            blob.push(*lib);
-            blob.extend_from_slice(&func.to_le_bytes());
-            blob.extend_from_slice(&h.to_le_bytes());
-            blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
-            blob.extend_from_slice(args);
-        }
-        // P3b: capture-replay op-logs. Per graph:
-        //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
-        let oplogs = smolvm_cuda::host::graph_oplogs_snapshot(token);
-        blob.extend_from_slice(&(oplogs.len() as u32).to_le_bytes());
-        for (graph_vh, exec_vh, ops) in &oplogs {
-            blob.extend_from_slice(&graph_vh.to_le_bytes());
-            blob.extend_from_slice(&exec_vh.to_le_bytes());
-            blob.extend_from_slice(&(ops.len() as u32).to_le_bytes());
-            for op in ops {
-                blob.extend_from_slice(&(op.len() as u32).to_le_bytes());
-                blob.extend_from_slice(op);
-            }
-        }
-        let _ = std::fs::create_dir_all("/tmp/smolvm");
-        // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
-        // soon as the daemon closes a spawned worker's copy, so two clones forked
-        // near-simultaneously collide on the same path — and each worker deletes
-        // its blob after staging, leaving the second worker 0 modules (its kernel
-        // launches then use raw golden handles → SIGSEGV in cuLaunchKernel).
+    };
+    #[cfg(not(target_os = "linux"))]
+    let modpath = if let Some((_revision, blob)) = serialize_module_handoff(token)? {
+        let directory = std::env::temp_dir().join("smolvm");
+        std::fs::create_dir_all(&directory)?;
         static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mp = format!("/tmp/smolvm/clone-mods-{token}-{seq}.bin");
-        if std::fs::write(&mp, &blob).is_ok() {
-            modpath = Some(mp);
-        }
-    }
+        let path = directory.join(format!("clone-mods-{token}-{seq}.bin"));
+        std::fs::write(&path, blob)?;
+        Some(path)
+    } else {
+        None
+    };
     // Control channel for late-attached guest channels: the daemon keeps sp[0]
     // and SCM_RIGHTS-sends each additional connection fd from the same clone;
     // the worker inherits sp[1] and serves every received fd in-process.
@@ -4549,7 +4841,35 @@ fn spawn_clone_worker(
     }
     let ctrl_slot = 4 + export_fds.len() as i32;
     let publish_slot = ctrl_slot + 1;
+    #[cfg(target_os = "linux")]
+    let module_slot = publish_slot + i32::from(publish_enabled);
+    #[cfg(target_os = "linux")]
+    let source_minimum = module_slot + i32::from(module_blob.is_some());
+    #[cfg(not(target_os = "linux"))]
     let source_minimum = publish_slot + i32::from(publish_enabled);
+    #[cfg(target_os = "linux")]
+    let module_child = if let Some(blob) = &module_blob {
+        let fd =
+            unsafe { libc::fcntl(blob.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, source_minimum) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(sp[1]);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                    libc::close(publish_sp[1]);
+                }
+            }
+            for fd in export_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        fd
+    } else {
+        -1
+    };
     // Lift the control source and every exported-memory source above the whole
     // dup2 destination range. Hundreds of VMM chunks can extend beyond any
     // fixed descriptor floor.
@@ -4566,6 +4886,10 @@ fn spawn_clone_worker(
                 libc::close(publish_sp[1]);
             }
         }
+        #[cfg(target_os = "linux")]
+        if module_child >= 0 {
+            unsafe { libc::close(module_child) };
+        }
         for fd in export_fds {
             unsafe { libc::close(fd) };
         }
@@ -4580,6 +4904,10 @@ fn spawn_clone_worker(
                 libc::close(sp[0]);
                 libc::close(ctrl_child);
                 libc::close(publish_sp[0]);
+            }
+            #[cfg(target_os = "linux")]
+            if module_child >= 0 {
+                unsafe { libc::close(module_child) };
             }
             for fd in export_fds {
                 unsafe { libc::close(fd) };
@@ -4599,6 +4927,10 @@ fn spawn_clone_worker(
                 if publish_enabled {
                     libc::close(publish_sp[0]);
                     libc::close(publish_child);
+                }
+                #[cfg(target_os = "linux")]
+                if module_child >= 0 {
+                    libc::close(module_child);
                 }
             }
             return Err(error);
@@ -4635,6 +4967,11 @@ fn spawn_clone_worker(
     if let Some(setting) = clone_worker_share_env(share_weights, configured_sharing.as_deref()) {
         cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", setting);
     }
+    #[cfg(target_os = "linux")]
+    if module_blob.is_some() {
+        cmd.env("SMOLVM_CUDA_CLONE_MODULES_FD", module_slot.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
     }
@@ -4684,6 +5021,15 @@ fn spawn_clone_worker(
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            #[cfg(target_os = "linux")]
+            if module_child >= 0 {
+                if libc::dup2(module_child, module_slot) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(module_slot, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
@@ -4699,6 +5045,11 @@ fn spawn_clone_worker(
     if publish_enabled {
         // SAFETY: as above for the dedicated publication child-end.
         unsafe { libc::close(publish_child) };
+    }
+    #[cfg(target_os = "linux")]
+    if module_child >= 0 {
+        // SAFETY: the child inherited its own copy at module_slot.
+        unsafe { libc::close(module_child) };
     }
     match spawned {
         Ok(pid) => {
@@ -4810,9 +5161,9 @@ mod mps_tests {
         daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
         encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
         host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count, mps_enabled,
-        ordinary_regions_are_reserved, range_is_reserved, read_host_snapshot, recv_fd,
-        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
-        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        ordinary_regions_are_reserved, prepare_module_blob, range_is_reserved, read_host_snapshot,
+        read_module_blob_fd, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
+        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         unique_live_clone_worker, validate_tensor_bundle_metadata, TENSOR_CONSUME_MAGIC,
     };
@@ -4842,6 +5193,32 @@ mod mps_tests {
             file.read_exact(&mut got).unwrap();
             assert_eq!(got, [value]);
         }
+    }
+
+    #[test]
+    fn module_blob_fd_reads_are_offset_independent() {
+        use std::io::{Seek as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+
+        let expected = b"immutable cuda module handoff";
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(expected).unwrap();
+        assert_eq!(file.stream_position().unwrap(), expected.len() as u64);
+        let first = unsafe { libc::dup(file.as_raw_fd()) };
+        let second = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(first >= 0 && second >= 0);
+
+        assert_eq!(read_module_blob_fd(first).unwrap(), expected);
+        assert_eq!(read_module_blob_fd(second).unwrap(), expected);
+        assert_eq!(file.stream_position().unwrap(), expected.len() as u64);
+    }
+
+    #[test]
+    fn dead_lineages_do_not_retain_module_blobs() {
+        let token = u64::MAX - 91;
+        let blob = prepare_module_blob(token, 0, b"short-lived module state").unwrap();
+        assert_eq!(blob.bytes, 24);
+        assert!(super::cached_module_blob(token).is_none());
     }
 
     #[test]
