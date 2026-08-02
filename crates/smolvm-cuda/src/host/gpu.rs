@@ -739,6 +739,16 @@ impl Backend for GpuBackend {
         };
         Ok(out)
     }
+    fn memcpy_dtoh_into(&mut self, dptr: u64, output: &mut [u8], stream: u64) -> CuResult<()> {
+        self.wait_stream(stream)?;
+        unsafe {
+            chk((self.memcpy_dtoh)(
+                output.as_mut_ptr().cast(),
+                dptr,
+                output.len(),
+            ))
+        }
+    }
     fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> CuResult<()> {
         unsafe { chk((self.memcpy_dtod)(dst, src, bytes as usize)) }
     }
