@@ -1302,6 +1302,28 @@ fn start_vm_named_with_db(
             features.packed_layers_dir = Some(dir);
         }
     }
+    // Host-side image store: pull + extract a registry image ONCE into shared
+    // overlay lowerdirs, so this and every other machine on that image skips both
+    // the in-guest pull and the per-VM flatten.
+    //
+    // Only on a machine's FIRST boot: once `init_completed` is set the layers are
+    // already established, and re-resolving would make every later start depend on
+    // the registry being reachable. `ensure_image_blocking` returns `None` on any
+    // failure — it is a cache, so a miss falls through to the in-guest pull rather
+    // than failing the machine.
+    if features.packed_layers_dir.is_none() && !record.init_completed {
+        if let Some(image) = record.image.as_deref() {
+            if let Some(dir) = smolvm::image_store::ensure_image_blocking(
+                image,
+                &smolvm::registry::PullAuth::FromConfig,
+            ) {
+                // The store is root-owned and the VMM drops to a per-VM uid before
+                // serving virtiofs, so it needs the same idmap the pack store uses.
+                features.pack_idmap_source = Some(dir.clone());
+                features.packed_layers_dir = Some(dir);
+            }
+        }
+    }
 
     // First boot pulls the base image in-guest, subject to the egress filter —
     // fold the image's registry into the enforced policy so a hostname scope

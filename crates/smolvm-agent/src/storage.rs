@@ -335,6 +335,35 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     }
 }
 
+/// Filename a layer producer drops beside `layer-order` to declare which xattr
+/// namespace its opaque-directory markers use.
+///
+/// Absent means `trusted.overlay.*` — the long-standing representation every
+/// existing `.smolmachine` uses — so older artifacts keep working untouched.
+const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
+/// Whether the mounted packed layers use `user.overlay.*` opaque markers, which
+/// the overlay must then be mounted with `userxattr` to honor.
+///
+/// Layers extracted on the HOST are served to us over virtiofs by a VMM that has
+/// dropped privileges, and an unprivileged reader cannot see a `trusted.*` xattr
+/// at all — so those layers use `user.*`. Getting this pairing wrong fails
+/// SILENTLY: the kernel ignores markers from the other namespace and stale lower
+/// content shows through with no error, which is why the producer declares it
+/// rather than the consumer guessing.
+pub fn packed_layers_use_userxattr() -> bool {
+    static USERXATTR: OnceLock<bool> = OnceLock::new();
+    *USERXATTR.get_or_init(|| {
+        get_packed_layers_dir()
+            .map(|d| {
+                std::fs::read_to_string(d.join(OPAQUE_XATTR_MARKER))
+                    .map(|v| v.trim() == "user")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Get the packed layers directory if available.
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
@@ -3393,6 +3422,13 @@ fn mount_overlay_fsconfig(
     // Preserve prior semantics: index=off disables the inode-index feature.
     fsconfig_set_string(fs.as_fd(), "index", "off")
         .map_err(|e| StorageError::new(format!("fsconfig index=off failed: {e}")))?;
+    // Host-extracted layers mark opaque dirs in the `user.*` namespace, because
+    // the unprivileged virtiofs server that serves them cannot see `trusted.*`.
+    // The kernel only consults that namespace when mounted with `userxattr`.
+    if packed_layers_use_userxattr() {
+        rustix::mount::fsconfig_set_flag(fs.as_fd(), "userxattr")
+            .map_err(|e| StorageError::new(format!("fsconfig userxattr failed: {e}")))?;
+    }
 
     fsconfig_create(fs.as_fd())
         .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;

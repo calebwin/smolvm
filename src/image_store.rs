@@ -125,6 +125,12 @@ const CONFIG_FILE: &str = "config.json";
 /// The layer-stacking index, bottom-most layer first.
 const LAYER_ORDER_FILE: &str = "layer-order";
 
+/// Declares which xattr namespace this entry's opaque-directory markers use, so
+/// the guest can mount the overlay with a matching `userxattr` setting. Read by
+/// the agent; absent means `trusted.*`, which is what every pre-existing packed
+/// artifact uses.
+const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
 /// An entry is usable only once its `layer-order` index exists. It is written
 /// last, so its presence means every layer and the config are already in place —
 /// a crash mid-fill can never present a partial entry as a hit.
@@ -584,6 +590,13 @@ async fn materialize_entry(
         &staging.join(CONFIG_FILE),
     )
     .await?;
+
+    // Declare the opaque-marker namespace these layers use, so the guest mounts
+    // the overlay with `userxattr` and actually honors them. The layers describe
+    // themselves rather than relying on an out-of-band signal, which keeps every
+    // existing artifact correct by absence: no marker means `trusted.*`.
+    std::fs::write(staging.join(OPAQUE_XATTR_MARKER), b"user")
+        .map_err(|e| Error::config("image-store", e.to_string()))?;
 
     // Written LAST: its presence is what `is_intact` treats as "complete".
     std::fs::write(staging.join(LAYER_ORDER_FILE), order.join("\n"))
