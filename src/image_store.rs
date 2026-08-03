@@ -131,6 +131,21 @@ const LAYER_ORDER_FILE: &str = "layer-order";
 /// artifact uses.
 const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
 
+/// Whether the layers beside `layer_dir` record opaque markers in the `user.*`
+/// namespace, as written by [`OPAQUE_XATTR_MARKER`].
+///
+/// Absence means `trusted.*` — every artifact produced before the host-side store
+/// existed — so a missing or unreadable marker is a safe "no" rather than an
+/// error. Callers mounting these layers must match, or the merge silently misses
+/// opaque directories and shows files a replaced directory removed.
+pub fn opaque_xattr_namespace(layer_dir: &Path) -> bool {
+    layer_dir
+        .parent()
+        .map(|d| d.join(OPAQUE_XATTR_MARKER))
+        .and_then(|marker| std::fs::read_to_string(marker).ok())
+        .is_some_and(|value| value.trim() == "user")
+}
+
 /// An entry is usable only once its `layer-order` index exists. It is written
 /// last, so its presence means every layer and the config are already in place —
 /// a crash mid-fill can never present a partial entry as a hit.

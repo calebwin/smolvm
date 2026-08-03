@@ -485,6 +485,13 @@ fn flatten_and_export(
     let mut stack: Vec<String> = vec![upper];
     stack.extend(lowers.iter().rev().cloned());
 
+    // The producer of these layers declares its opaque-marker namespace in a file
+    // beside them (host-extracted layers use `user.*`, pre-existing packs
+    // `trusted.*`). The flatten mount must match, or the merged view shows content
+    // a replaced directory had removed — and this tar becomes an exported
+    // artifact, so those files would travel to a registry.
+    let opaque_xattr = crate::image_store::opaque_xattr_namespace(std::path::Path::new(&lowers[0]));
+
     println!(
         "Flattening {} layer(s) + container overlay...",
         lowers.len()
@@ -492,7 +499,7 @@ fn flatten_and_export(
     // Driven agent-side rather than through `mount(8)` over VmExec: `mount(8)`
     // rejects a `lowerdir=` value past ~255 bytes, which any image with four or
     // more layers exceeds.
-    client.flatten_layers(&stack, "/storage/flat-export.tar")?;
+    client.flatten_layers(&stack, "/storage/flat-export.tar", opaque_xattr)?;
 
     // Stream the flattened tar to disk (never buffered whole in memory), then
     // content-address it. Stage in the layers dir so the final rename is

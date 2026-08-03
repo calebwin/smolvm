@@ -340,6 +340,17 @@ pub enum AgentRequest {
         lowerdirs: Vec<String>,
         /// Guest path to write the tar archive to.
         output: String,
+        /// Mount the merge with `userxattr`, i.e. read opaque markers from
+        /// `user.overlay.*` instead of `trusted.*`.
+        ///
+        /// Host-extracted layers (the host-side image store) record their
+        /// markers in the user namespace; packs predating that use `trusted.*`.
+        /// Mounting with the wrong one silently resurrects files a replaced
+        /// directory removed — and this tar is an exported artifact, so those
+        /// files would travel to a registry. Defaults false so an older host
+        /// keeps today's behaviour.
+        #[serde(default)]
+        userxattr: bool,
     },
 
     /// Execute a command directly in the VM (not in a container).

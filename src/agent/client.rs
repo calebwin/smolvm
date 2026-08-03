@@ -919,10 +919,16 @@ impl AgentClient {
     ///
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
-    pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+    pub fn flatten_layers(
+        &mut self,
+        lowerdirs: &[String],
+        output: &str,
+        userxattr: bool,
+    ) -> Result<()> {
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
             output: output.to_string(),
+            userxattr,
         })?;
         expect_ok(resp, "flatten layers")
     }

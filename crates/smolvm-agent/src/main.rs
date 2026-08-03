@@ -2141,9 +2141,11 @@ fn handle_request(
 
         AgentRequest::StorageStatus => handle_storage_status(),
 
-        AgentRequest::FlattenLayers { lowerdirs, output } => {
-            handle_flatten_layers(&lowerdirs, &output)
-        }
+        AgentRequest::FlattenLayers {
+            lowerdirs,
+            output,
+            userxattr,
+        } => handle_flatten_layers(&lowerdirs, &output, userxattr),
 
         AgentRequest::NetworkTest { url } => {
             info!(url = %url, "testing network connectivity directly from agent");
@@ -5611,9 +5613,9 @@ fn handle_cleanup_overlay(workload_id: &str) -> AgentResponse {
 }
 
 /// Handle a request to merge layer directories into one tar archive.
-fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
-    info!(layer_count = lowerdirs.len(), output = %output, "flattening layers");
-    match storage::flatten_layers_to_tar(lowerdirs, std::path::Path::new(output)) {
+fn handle_flatten_layers(lowerdirs: &[String], output: &str, userxattr: bool) -> AgentResponse {
+    info!(layer_count = lowerdirs.len(), output = %output, userxattr, "flattening layers");
+    match storage::flatten_layers_to_tar(lowerdirs, std::path::Path::new(output), userxattr) {
         Ok(_) => AgentResponse::ok(None),
         Err(e) => AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
     }

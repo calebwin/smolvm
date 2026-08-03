@@ -3539,6 +3539,13 @@ fn mount_overlay_fsconfig(
             .map_err(|e| StorageError::new(format!("fsconfig userxattr failed: {e}")))?;
     }
 
+    if userxattr {
+        // Layers extracted on the host record opaque markers in `user.overlay.*`;
+        // without this the merge reads `trusted.*` and misses them.
+        fsconfig_set_string(fs.as_fd(), "userxattr", "").map_err(|e| {
+            StorageError::new(format!("fsconfig userxattr failed: {e}"))
+        })?;
+    }
     fsconfig_create(fs.as_fd())
         .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;
 
@@ -3599,7 +3606,7 @@ fn mount_overlay_fsconfig(
 /// overlayfs rejects a lowerdir that does not exist. A single surviving directory
 /// is tarred directly, since overlayfs requires two lower layers when there is no
 /// upperdir.
-pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path, userxattr: bool) -> Result<()> {
     let present = mountable_lowerdirs(lowerdirs);
 
     let source = match present.len() {
@@ -3614,7 +3621,7 @@ pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> 
             let merged = Path::new(STORAGE_ROOT).join("flatten-merged");
             let _ = std::fs::remove_dir_all(&merged);
             std::fs::create_dir_all(&merged)?;
-            mount_overlay_lowers_only(&present, &merged)?;
+            mount_overlay_lowers_only(&present, &merged, userxattr)?;
             merged
         }
     };
@@ -3675,7 +3682,11 @@ fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
 /// its own `lowerdir+` is the whole point: a single `lowerdir=` string caps out
 /// at ~255 bytes through `mount(8)`, which is only about three layer paths.
 #[cfg(target_os = "linux")]
-fn mount_overlay_lowers_only(lowerdirs: &[String], merged_path: &Path) -> Result<()> {
+fn mount_overlay_lowers_only(
+    lowerdirs: &[String],
+    merged_path: &Path,
+    userxattr: bool,
+) -> Result<()> {
     use rustix::fd::AsFd;
     use rustix::mount::{
         fsconfig_create, fsconfig_set_string, fsmount, fsopen, move_mount, FsMountFlags,
@@ -3730,7 +3741,11 @@ fn mount_overlay_lowers_only(lowerdirs: &[String], merged_path: &Path) -> Result
 
 /// Non-Linux stub: overlayfs is Linux-only.
 #[cfg(not(target_os = "linux"))]
-fn mount_overlay_lowers_only(_lowerdirs: &[String], _merged_path: &Path) -> Result<()> {
+fn mount_overlay_lowers_only(
+    _lowerdirs: &[String],
+    _merged_path: &Path,
+    _userxattr: bool,
+) -> Result<()> {
     Err(StorageError::new(
         "overlay mount is only supported on Linux".to_string(),
     ))
