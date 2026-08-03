@@ -439,6 +439,15 @@ fn flatten_and_export(
     // overlayfs wants topmost-first in `lowerdir=`.
     let base_chain: Vec<&str> = lowers.iter().rev().map(String::as_str).collect();
     let base_chain = base_chain.join(":");
+    // NOTE on the bind-mounts in the script below: `mount(8)` caps its option
+    // string near 255 bytes, and a lowerdir chain of real layer paths blows past
+    // that — `/storage/layers/<64-hex>` alone is 80 bytes, so three layers plus
+    // the container overlay reach ~290 and the mount fails with the famously
+    // unhelpful "wrong fs type, bad option". Binding each lower to a short
+    // `/tmp/lN` first keeps the option string tiny no matter how many layers an
+    // image has. (The guest's own overlay mount sidesteps this differently, via
+    // `fsconfig` + repeated `lowerdir+`, which the shell has no access to.)
+    //
     // The producer of these layers declares its opaque-marker namespace in a file
     // beside them; the layer dirs are siblings under one parent, so derive it from
     // the first lower. Absent → `trusted.*`, i.e. every pre-existing pack.
@@ -466,9 +475,15 @@ fn flatten_and_export(
            mkdir -p /tmp/flatview\n\
            xopt=\"\"\n\
            if [ \"$(cat {marker} 2>/dev/null)\" = user ]; then xopt=\",userxattr\"; fi\n\
-           mount -t overlay overlay -o lowerdir=\"$low\"\"$xopt\" /tmp/flatview\n\
+           i=0; short=\"\"\n\
+           for l in $(echo \"$low\" | tr : \" \"); do\n\
+             mkdir -p /tmp/l$i && mount --bind \"$l\" /tmp/l$i || exit 33\n\
+             short=\"${{short:+$short:}}/tmp/l$i\"; i=$((i+1))\n\
+           done\n\
+           mount -t overlay overlay -o lowerdir=\"$short\"\"$xopt\" /tmp/flatview\n\
            tar cf /storage/flat-export.tar -C /tmp/flatview .\n\
            umount /tmp/flatview\n\
+           j=0; while [ $j -lt $i ]; do umount /tmp/l$j 2>/dev/null; j=$((j+1)); done\n\
          fi\n\
          echo FLAT_OK\n",
         n = lowers.len(),
