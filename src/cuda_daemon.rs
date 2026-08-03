@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Stable host-device enumeration shared with device-scoped admission.
+const CUDA_DEVICE_ORDER: &str = "PCI_BUS_ID";
+
 /// Control-socket path for the shared daemon, under the smolvm data dir (so the
 /// daemon and every boot subprocess agree on one location).
 pub fn socket_path() -> PathBuf {
@@ -30,6 +33,154 @@ pub fn socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("smolvm"));
     root.join("cuda-daemon.sock")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloneWorkerStatus {
+    Ready,
+    Failed,
+}
+
+fn clone_worker_status_path(vm_pid: u32) -> PathBuf {
+    socket_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("cuda-worker-ready")
+        .join(vm_pid.to_string())
+}
+
+fn encode_clone_worker_status(start_time: u64, status: CloneWorkerStatus) -> String {
+    let status = match status {
+        CloneWorkerStatus::Ready => "ready",
+        CloneWorkerStatus::Failed => "failed",
+    };
+    format!("{start_time} {status}\n")
+}
+
+fn decode_clone_worker_status(value: &str) -> Option<(u64, CloneWorkerStatus)> {
+    let mut fields = value.split_whitespace();
+    let start_time = fields.next()?.parse().ok()?;
+    let status = match fields.next()? {
+        "ready" => CloneWorkerStatus::Ready,
+        "failed" => CloneWorkerStatus::Failed,
+        _ => return None,
+    };
+    fields.next().is_none().then_some((start_time, status))
+}
+
+fn publish_clone_worker_status(vm_pid: u32, status: CloneWorkerStatus) -> io::Result<()> {
+    let start_time = crate::process::process_start_time(vm_pid as i32).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("clone VM process {vm_pid} exited before CUDA worker readiness"),
+        )
+    })?;
+    let path = clone_worker_status_path(vm_pid);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("CUDA worker status path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{vm_pid}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, encode_clone_worker_status(start_time, status))?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn prune_dead_clone_worker_statuses() {
+    let Some(directory) = clone_worker_status_path(0).parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Publication uses a same-directory temporary file so rename is
+        // atomic. Do not race that write: only reap a stranded temporary after
+        // it is far older than the sub-millisecond publication window.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= Duration::from_secs(60));
+            if stale {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
+        let live = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .zip(
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|value| decode_clone_worker_status(&value))
+                    .map(|(started, _)| started),
+            )
+            .is_some_and(|(pid, started)| {
+                crate::process::is_our_process_strict(pid, Some(started))
+            });
+        if !live {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn wait_for_clone_worker_ready(
+    vm_pid: i32,
+    vm_start_time: u64,
+    timeout: Duration,
+) -> io::Result<()> {
+    let vm_pid_u32 = u32::try_from(vm_pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid clone VM pid"))?;
+    let path = clone_worker_status_path(vm_pid_u32);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(value) => {
+                if let Some((start_time, status)) = decode_clone_worker_status(&value) {
+                    if start_time == vm_start_time {
+                        let _ = std::fs::remove_file(&path);
+                        return match status {
+                            CloneWorkerStatus::Ready => Ok(()),
+                            CloneWorkerStatus::Failed => Err(io::Error::other(
+                                "CUDA clone worker failed during reconstruction",
+                            )),
+                        };
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !crate::process::is_our_process_strict(vm_pid, Some(vm_start_time)) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "clone VM exited before its CUDA worker became ready",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "CUDA clone worker did not become ready within {}s",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 const TENSOR_PUBLISH_MAGIC: [u8; 4] = *b"TBP1";
@@ -42,6 +193,8 @@ const TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(60);
 static TENSOR_BUNDLE_SERVICE_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 const MAX_MODULE_HANDOFF_BLOB_BYTES: u64 = 32 << 30;
+#[cfg(unix)]
+const EXTERNAL_MODULE_IMAGES_MAGIC: [u8; 4] = *b"MHI2";
 
 #[derive(Debug)]
 struct PendingTensorBundle {
@@ -872,6 +1025,7 @@ fn spawn_child_reaper() {
             // Long-lived daemons use IDLE_SECS=0, but their completed fork
             // lineages must still release retained descriptors and metadata.
             prune_dead_metadata_layout_waiters();
+            prune_dead_clone_worker_statuses();
             let _ = live_clone_worker_count();
             let _ = live_host_snapshot_count();
             thread::sleep(Duration::from_secs(2));
@@ -1035,6 +1189,10 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 
 /// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
+    // Admission maps logical CUDA ordinals to NVML devices without loading
+    // libcuda in the control plane. Pinning the daemon to PCI order makes that
+    // mapping deterministic while still honoring CUDA_VISIBLE_DEVICES order.
+    std::env::set_var("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER);
     // Become our own process-group leader so a clean-shutdown signal can take the
     // whole group (this daemon + its clone workers) down together without ever
     // touching the shell/ssh session that launched us. The `ensure_running` spawn
@@ -1593,6 +1751,51 @@ type CloneChannelSeed = (
     Vec<(u64, u64, u64)>,
 );
 
+struct CloneWorkerReadiness {
+    vm_pid: Option<u32>,
+    published: bool,
+}
+
+impl CloneWorkerReadiness {
+    fn new(vm_pid: Option<u32>) -> Self {
+        Self {
+            vm_pid,
+            published: false,
+        }
+    }
+
+    fn publish_ready(&mut self) {
+        let Some(vm_pid) = self.vm_pid else {
+            return;
+        };
+        match publish_clone_worker_status(vm_pid, CloneWorkerStatus::Ready) {
+            Ok(()) => self.published = true,
+            Err(error) => {
+                tracing::warn!(vm_pid, %error, "failed to publish CUDA clone-worker readiness")
+            }
+        }
+    }
+}
+
+impl Drop for CloneWorkerReadiness {
+    fn drop(&mut self) {
+        let Some(vm_pid) = self.vm_pid else {
+            return;
+        };
+        let path = clone_worker_status_path(vm_pid);
+        if self.published && !path.exists() {
+            return;
+        }
+        if self.published && crate::process::process_start_time(vm_pid as i32).is_none() {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        if let Err(error) = publish_clone_worker_status(vm_pid, CloneWorkerStatus::Failed) {
+            tracing::debug!(vm_pid, %error, "failed to publish CUDA clone-worker failure");
+        }
+    }
+}
+
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
 /// process. A per-clone process has its own CUDA primary context and thus its own
 /// UVA space, so it can place memory at the golden's exact virtual addresses
@@ -1605,6 +1808,9 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     install_crash_handler("cuda-clone-worker");
     // File-ring transport (per-worker: one worker == one clone VM == one dir).
     smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
+    let clone_procmem = procmem_from_env();
+    let clone_vm_pid = clone_procmem.as_ref().map(|(pid, _)| *pid);
+    let mut readiness = CloneWorkerReadiness::new(clone_vm_pid);
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
@@ -1647,8 +1853,6 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
     // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
     // guest RAM via /proc/<pid>/mem instead of the ring-copy fallback.
-    let clone_procmem = procmem_from_env();
-    let clone_vm_pid = clone_procmem.as_ref().map(|(pid, _)| *pid);
     if let Some((pid, regions)) = clone_procmem {
         let n = regions.len();
         if regions.is_empty() {
@@ -1720,6 +1924,27 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         };
     #[cfg(not(target_os = "linux"))]
     let inherited_module_blob: Option<smolvm_cuda::host::ModuleHandoffBytes> = None;
+    #[cfg(target_os = "linux")]
+    let inherited_module_images =
+        if let Some(value) = std::env::var_os("SMOLVM_CUDA_CLONE_MODULE_IMAGES_FD") {
+            let value = value.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module image-store fd is not valid UTF-8",
+                )
+            })?;
+            let image_fd = value.parse::<std::os::fd::RawFd>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CUDA module image-store fd is invalid",
+                )
+            })?;
+            Some(map_module_blob_fd(image_fd)?)
+        } else {
+            None
+        };
+    #[cfg(not(target_os = "linux"))]
+    let inherited_module_images: Option<smolvm_cuda::host::ModuleHandoffBytes> = None;
     let module_blob = if inherited_module_blob.is_some() {
         inherited_module_blob
     } else if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
@@ -1731,7 +1956,11 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     };
     if let Some(module_blob) = module_blob {
         let (mod_images, func_meta, streams, events, graphs, lib_handles) =
-            reconstruct_golden_modules(backend.as_mut(), &module_blob);
+            reconstruct_golden_modules(
+                backend.as_mut(),
+                &module_blob,
+                inherited_module_images.as_ref(),
+            )?;
         let (nm, nf, ns, ne, ng, nlh) = (
             mod_images.len(),
             func_meta.len(),
@@ -1792,6 +2021,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     } else {
         None
     };
+    readiness.publish_ready();
     // The handed-off connection may be a local UDS (VM on this host) or a TCP
     // socket (remote client driving this GPU host) — wrap by actual domain.
     // (getsockname is portable unix; SO_DOMAIN would be Linux-only.)
@@ -2788,14 +3018,15 @@ fn map_module_blob_fd(fd: std::os::fd::RawFd) -> io::Result<smolvm_cuda::host::M
 fn reconstruct_golden_modules(
     b: &mut dyn Backend,
     source: &smolvm_cuda::host::ModuleHandoffBytes,
-) -> (
+    external_module_images: Option<&smolvm_cuda::host::ModuleHandoffBytes>,
+) -> io::Result<(
     Vec<(u64, smolvm_cuda::host::ModuleHandoffBytes)>,
     Vec<smolvm_cuda::host::FuncMeta>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
     Vec<(u8, u16, u64, Vec<u8>)>,
-) {
+)> {
     let buf = source.as_slice();
     let mut mod_images = Vec::new();
     let mut func_meta = Vec::new();
@@ -2806,15 +3037,11 @@ fn reconstruct_golden_modules(
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
-            if p + $n > buf.len() {
-                return (
-                    mod_images,
-                    func_meta,
-                    stream_trans,
-                    event_trans,
-                    graphs,
-                    lib_handles,
-                );
+            if p.checked_add($n).is_none_or(|end| end > buf.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module handoff is truncated",
+                ));
             }
         };
     }
@@ -2834,15 +3061,44 @@ fn reconstruct_golden_modules(
             v
         }};
     }
+    let uses_external_images = buf.starts_with(&EXTERNAL_MODULE_IMAGES_MAGIC);
+    if uses_external_images {
+        p += EXTERNAL_MODULE_IMAGES_MAGIC.len();
+        if external_module_images.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CUDA module handoff requires a missing external image store",
+            ));
+        }
+    }
     // Modules: just STAGE the images (reloaded lazily on first use in the worker).
     let nmods = ru32!();
     for _ in 0..nmods {
         let gh = ru64!();
-        let ilen = ru32!() as usize;
-        need!(ilen);
-        // `need!` proved this range is within the immutable source.
-        mod_images.push((gh, source.slice(p, ilen).unwrap()));
-        p += ilen;
+        if uses_external_images {
+            let offset = usize::try_from(ru64!()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module image offset does not fit in address space",
+                )
+            })?;
+            let length = ru32!() as usize;
+            let image = external_module_images
+                .and_then(|images| images.slice(offset, length))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CUDA module image range exceeds its external store",
+                    )
+                })?;
+            mod_images.push((gh, image));
+        } else {
+            let ilen = ru32!() as usize;
+            need!(ilen);
+            // `need!` proved this range is within the immutable source.
+            mod_images.push((gh, source.slice(p, ilen).unwrap()));
+            p += ilen;
+        }
     }
     // Functions: stage golden fn → (golden module, name); resolved lazily.
     let nfuncs = ru32!();
@@ -2979,14 +3235,14 @@ fn reconstruct_golden_modules(
         lib_handles = lib_handles.len(),
         "M3a: staged golden modules/functions for lazy reload + recreated streams/events"
     );
-    (
+    Ok((
         mod_images,
         func_meta,
         stream_trans,
         event_trans,
         graphs,
         lib_handles,
-    )
+    ))
 }
 
 /// Strip a fork-clone connection preamble (magic + clone id) if present,
@@ -3386,6 +3642,22 @@ fn clone_worker_share_env(requested: bool, configured: Option<&str>) -> Option<&
     }
 }
 
+#[cfg(unix)]
+fn clone_worker_spawn_pace(pool_size: Option<u32>) -> Duration {
+    #[cfg(target_os = "linux")]
+    if pool_size.is_some_and(|size| size > 4) {
+        // Launching more than four reconstructed CUDA contexts in one burst
+        // can starve concurrent KVM first-entry long enough to exhaust its
+        // bounded transient-ENOMEM retry window. The old fork/exec path paced
+        // workers accidentally while copying the daemon's page tables; retain
+        // only the measured minimum interval after switching to posix_spawn.
+        return Duration::from_millis(20);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pool_size;
+    Duration::ZERO
+}
+
 /// Decide whether a clone-marked connection should bypass worker routing when
 /// worker mode is disabled. Real channels fall through to ordinary serving;
 /// warm dials carry no Init and must be consumed instead of parking forever.
@@ -3449,6 +3721,11 @@ fn route_clone_connection(
         }
         let tokens = smolvm_cuda::host::layout_tokens();
         if tokens.is_empty() {
+            if let Some((vm_pid, _)) = procmem.as_ref() {
+                if let Err(error) = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Ready) {
+                    tracing::warn!(vm_pid, %error, "failed to publish empty CUDA clone readiness");
+                }
+            }
             tracing::info!(
                 clone_id,
                 "warm dial: no golden process layouts yet; deferring spawn to first real channel"
@@ -3469,6 +3746,15 @@ fn route_clone_connection(
             }
         }
         let [token] = memory_tokens.as_slice() else {
+            if memory_tokens.is_empty() {
+                if let Some((vm_pid, _)) = procmem.as_ref() {
+                    if let Err(error) =
+                        publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Ready)
+                    {
+                        tracing::warn!(vm_pid, %error, "failed to publish metadata-only CUDA clone readiness");
+                    }
+                }
+            }
             tracing::info!(
                 clone_id,
                 layouts = memory_tokens.len(),
@@ -3492,10 +3778,14 @@ fn route_clone_connection(
                     worker_pid = pid,
                     "warm dial: spawned clone process worker ahead of its first CUDA call"
                 );
+                std::thread::sleep(clone_worker_spawn_pace(options.fork_pool_size));
                 maybe_evict_frozen_golden(*token, options, &reg);
                 true
             }
             Err(e) => {
+                if let Some((vm_pid, _)) = procmem.as_ref() {
+                    let _ = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Failed);
+                }
                 tracing::warn!(error = %e, token, clone_id, "warm dial: process worker spawn failed");
                 true
             }
@@ -3668,6 +3958,9 @@ fn route_clone_connection(
             maybe_evict_frozen_golden(token, options, &reg);
         }
         Err(e) => {
+            if let Some((vm_pid, _)) = procmem.as_ref() {
+                let _ = publish_clone_worker_status(*vm_pid, CloneWorkerStatus::Failed);
+            }
             // REJECT rather than serve in-process: this IS an isolating clone
             // (preamble matched), and the legacy shared path can't serve it —
             // its inherited pointers are garbage in a fresh context, so the
@@ -3977,6 +4270,15 @@ struct CachedModuleBlob {
     file: std::fs::File,
     bytes: u64,
     revision: u64,
+    image_file: Option<std::fs::File>,
+    image_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl CachedModuleBlob {
+    fn total_bytes(&self) -> u64 {
+        self.bytes.saturating_add(self.image_bytes)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4099,14 +4401,14 @@ fn prune_module_blob_cache(cache: &mut std::collections::HashMap<u64, Arc<Cached
     let before = cache.len();
     let before_bytes = cache
         .values()
-        .fold(0u64, |total, blob| total.saturating_add(blob.bytes));
+        .fold(0u64, |total, blob| total.saturating_add(blob.total_bytes()));
     cache.retain(|token, blob| {
         smolvm_cuda::host::module_handoff_revision(*token) == Some(blob.revision)
     });
     if cache.len() != before {
         let retained_bytes = cache
             .values()
-            .fold(0u64, |total, blob| total.saturating_add(blob.bytes));
+            .fold(0u64, |total, blob| total.saturating_add(blob.total_bytes()));
         tracing::info!(
             entries = before - cache.len(),
             bytes = before_bytes.saturating_sub(retained_bytes),
@@ -4140,7 +4442,7 @@ fn prepare_module_blob(
     std::fs::create_dir_all(&directory)?;
     let mut writable = tempfile::tempfile_in(&directory)?;
     writable.write_all(bytes)?;
-    finish_module_blob(token, revision, writable, bytes.len() as u64)
+    finish_module_blob(token, revision, writable, bytes.len() as u64, None)
 }
 
 #[cfg(target_os = "linux")]
@@ -4149,6 +4451,7 @@ fn prepare_streamed_module_blob(
     revision: u64,
     snapshot: &CapturedModuleHandoff,
     oplogs: &CapturedGraphOplogs,
+    module_images: Option<smolvm_cuda::host::ModuleImageStoreSnapshot>,
 ) -> io::Result<Arc<CachedModuleBlob>> {
     if let Some(blob) = cached_module_blob(token) {
         return Ok(blob);
@@ -4158,11 +4461,11 @@ fn prepare_streamed_module_blob(
     let mut writable = tempfile::tempfile_in(&directory)?;
     let bytes = {
         let mut output = std::io::BufWriter::with_capacity(1 << 20, &mut writable);
-        let bytes = write_module_handoff(&mut output, snapshot, oplogs)?;
+        let bytes = write_module_handoff(&mut output, snapshot, oplogs, module_images.as_ref())?;
         output.flush()?;
         bytes
     };
-    finish_module_blob(token, revision, writable, bytes)
+    finish_module_blob(token, revision, writable, bytes, module_images)
 }
 
 #[cfg(target_os = "linux")]
@@ -4171,6 +4474,7 @@ fn finish_module_blob(
     revision: u64,
     writable: std::fs::File,
     bytes: u64,
+    module_images: Option<smolvm_cuda::host::ModuleImageStoreSnapshot>,
 ) -> io::Result<Arc<CachedModuleBlob>> {
     let read_path = format!("/proc/self/fd/{}", writable.as_raw_fd());
     let file = std::fs::OpenOptions::new().read(true).open(read_path)?;
@@ -4178,6 +4482,8 @@ fn finish_module_blob(
         file,
         bytes,
         revision,
+        image_bytes: module_images.as_ref().map_or(0, |store| store.bytes),
+        image_file: module_images.map(|store| store.file),
     });
     drop(writable);
 
@@ -4191,19 +4497,20 @@ fn finish_module_blob(
     }) {
         return Ok(existing);
     }
-    let cached_bytes = cache
-        .values()
-        .fold(0u64, |total, entry| total.saturating_add(entry.bytes));
+    let cached_bytes = cache.values().fold(0u64, |total, entry| {
+        total.saturating_add(entry.total_bytes())
+    });
     let revision_current = smolvm_cuda::host::module_handoff_revision(token) == Some(revision);
     if revision_current
         && cache.len() < MAX_CACHED_MODULE_BLOBS
-        && cached_bytes.saturating_add(blob.bytes) <= MAX_MODULE_HANDOFF_BLOB_BYTES
+        && cached_bytes.saturating_add(blob.total_bytes()) <= MAX_MODULE_HANDOFF_BLOB_BYTES
     {
         cache.insert(token, blob.clone());
     } else if revision_current {
         tracing::warn!(
             token,
-            bytes = blob.bytes,
+            metadata_bytes = blob.bytes,
+            image_bytes = blob.image_bytes,
             cached_bytes,
             "CUDA module handoff cache is full; retaining this source for one worker"
         );
@@ -4216,7 +4523,8 @@ fn module_blob_for_token(token: u64) -> io::Result<Option<Arc<CachedModuleBlob>>
     if let Some(blob) = cached_module_blob(token) {
         tracing::info!(
             token,
-            bytes = blob.bytes,
+            metadata_bytes = blob.bytes,
+            image_bytes = blob.image_bytes,
             "reusing serialized CUDA module handoff"
         );
         return Ok(Some(blob));
@@ -4229,7 +4537,8 @@ fn module_blob_for_token(token: u64) -> io::Result<Option<Arc<CachedModuleBlob>>
     if let Some(blob) = cached_module_blob(token) {
         tracing::info!(
             token,
-            bytes = blob.bytes,
+            metadata_bytes = blob.bytes,
+            image_bytes = blob.image_bytes,
             "reusing serialized CUDA module handoff after concurrent build"
         );
         return Ok(Some(blob));
@@ -4238,12 +4547,18 @@ fn module_blob_for_token(token: u64) -> io::Result<Option<Arc<CachedModuleBlob>>
         let Some((revision, snapshot, oplogs)) = capture_module_handoff(token)? else {
             return Ok(None);
         };
-        let blob = prepare_streamed_module_blob(token, revision, &snapshot, &oplogs)?;
+        let module_images = smolvm_cuda::host::module_image_store_snapshot(token)?;
+        if smolvm_cuda::host::module_handoff_revision(token) != Some(revision) {
+            continue;
+        }
+        let blob =
+            prepare_streamed_module_blob(token, revision, &snapshot, &oplogs, module_images)?;
         if smolvm_cuda::host::module_handoff_revision(token) == Some(revision) {
             tracing::info!(
                 token,
                 revision,
-                bytes = blob.bytes,
+                metadata_bytes = blob.bytes,
+                image_bytes = blob.image_bytes,
                 "prepared reusable CUDA module handoff"
             );
             return Ok(Some(blob));
@@ -4451,6 +4766,7 @@ fn write_module_handoff(
     mut output: impl Write,
     snapshot: &CapturedModuleHandoff,
     oplogs: &CapturedGraphOplogs,
+    #[cfg(target_os = "linux")] module_images: Option<&smolvm_cuda::host::ModuleImageStoreSnapshot>,
 ) -> io::Result<u64> {
     let (modules, funcs, streams, events, graphs, lib_handles) = snapshot;
     let mut written = 0_u64;
@@ -4467,9 +4783,35 @@ fn write_module_handoff(
         }};
     }
 
+    #[cfg(target_os = "linux")]
+    if module_images.is_some() {
+        put!(&EXTERNAL_MODULE_IMAGES_MAGIC);
+    }
     put!(&module_handoff_len(modules.len())?);
     for (handle, image) in modules {
         put!(&handle.to_le_bytes());
+        #[cfg(target_os = "linux")]
+        if let Some(store) = module_images {
+            let &(offset, length) = store.ranges.get(handle).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module image is missing from its append-only store",
+                )
+            })?;
+            if length != image.len() as u64
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > store.bytes)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CUDA module image store range does not match its captured image",
+                ));
+            }
+            put!(&offset.to_le_bytes());
+            put!(&module_handoff_len(image.len())?);
+            continue;
+        }
         put!(&module_handoff_len(image.len())?);
         put!(image);
     }
@@ -4560,6 +4902,148 @@ fn serialize_module_handoff(token: u64) -> io::Result<Option<(u64, Vec<u8>)>> {
     Ok(Some((revision, blob)))
 }
 
+#[cfg(unix)]
+struct PosixSpawnActions(libc::posix_spawn_file_actions_t);
+
+#[cfg(unix)]
+impl PosixSpawnActions {
+    fn new() -> io::Result<Self> {
+        let mut actions = unsafe { std::mem::zeroed() };
+        // SAFETY: `actions` points to writable storage of the libc-declared type.
+        let error = unsafe { libc::posix_spawn_file_actions_init(&mut actions) };
+        if error == 0 {
+            Ok(Self(actions))
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+
+    fn dup2(&mut self, source: i32, destination: i32) -> io::Result<()> {
+        // SAFETY: the actions object is initialized and both descriptors are
+        // copied by value into the action list.
+        let error =
+            unsafe { libc::posix_spawn_file_actions_adddup2(&mut self.0, source, destination) };
+        if error == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(error))
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PosixSpawnActions {
+    fn drop(&mut self) {
+        // SAFETY: this object is constructed only after a successful init and
+        // destroyed exactly once here.
+        unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
+    }
+}
+
+#[cfg(unix)]
+struct CloneWorkerSpawnFds<'a> {
+    connection: i32,
+    exports: &'a [i32],
+    control: (i32, i32),
+    publish: Option<(i32, i32)>,
+    module: Option<(i32, i32)>,
+    module_images: Option<(i32, i32)>,
+}
+
+/// Launch a clone worker without copying the CUDA daemon's large address space.
+///
+/// `Command::pre_exec` forces fork/exec, whose page-table copy becomes visible
+/// once the daemon retains multi-gigabyte CUDA snapshots. `posix_spawn`
+/// preserves the exact descriptor and environment contract while Linux libc
+/// can use its vfork-style path.
+#[cfg(unix)]
+fn posix_spawn_clone_worker(
+    exe: &Path,
+    env_overrides: &[(std::ffi::OsString, std::ffi::OsString)],
+    fds: CloneWorkerSpawnFds<'_>,
+) -> io::Result<u32> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut actions = PosixSpawnActions::new()?;
+    actions.dup2(fds.connection, 3)?;
+    for (index, source) in fds.exports.iter().copied().enumerate() {
+        actions.dup2(source, 4 + index as i32)?;
+    }
+    actions.dup2(fds.control.0, fds.control.1)?;
+    if let Some((source, slot)) = fds.publish {
+        actions.dup2(source, slot)?;
+    }
+    if let Some((source, slot)) = fds.module {
+        actions.dup2(source, slot)?;
+    }
+    if let Some((source, slot)) = fds.module_images {
+        actions.dup2(source, slot)?;
+    }
+
+    let exe = std::ffi::CString::new(exe.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clone-worker executable path contains NUL",
+        )
+    })?;
+    let argv_storage = [
+        exe.clone(),
+        std::ffi::CString::new("_cuda-clone-worker").unwrap(),
+        std::ffi::CString::new("3").unwrap(),
+    ];
+    let mut argv = argv_storage
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+
+    let mut environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    for (key, value) in env_overrides {
+        environment.insert(key.clone(), value.clone());
+    }
+    let env_storage = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let key = key.as_os_str().as_bytes();
+            let value = value.as_os_str().as_bytes();
+            let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
+            entry.extend_from_slice(key);
+            entry.push(b'=');
+            entry.extend_from_slice(value);
+            std::ffi::CString::new(entry).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "clone-worker environment contains NUL",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut envp = env_storage
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+
+    let mut pid = 0;
+    // SAFETY: all C strings and pointer arrays live through the call, are NUL
+    // terminated, and the initialized action list contains valid descriptors.
+    let error = unsafe {
+        libc::posix_spawn(
+            &mut pid,
+            exe.as_ptr(),
+            &actions.0,
+            std::ptr::null(),
+            argv.as_mut_ptr(),
+            envp.as_mut_ptr(),
+        )
+    };
+    if error == 0 {
+        u32::try_from(pid).map_err(|_| io::Error::other("clone-worker pid is out of range"))
+    } else {
+        Err(io::Error::from_raw_os_error(error))
+    }
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
@@ -4573,7 +5057,6 @@ fn spawn_clone_worker(
     procmem: Option<ProcMemAdvert>,
     options: ServeOptions,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let eviction_mode = std::env::var("SMOLVM_CUDA_GOLDEN_EVICT").ok();
     let configured_sharing = std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").ok();
@@ -4583,6 +5066,25 @@ fn spawn_clone_worker(
         golden_eviction_enabled(eviction_mode.as_deref(), options.fork_pool_size),
         sharing_active,
     );
+    #[cfg(target_os = "linux")]
+    let module_blob_build = if cached_module_blob(token).is_none() {
+        // Capturing module metadata briefly shares the frozen layout lock, but
+        // writing the immutable images is independent of the device-to-host
+        // memory snapshot below. Overlap both first-worker costs; later workers
+        // continue to use the two single-flight caches.
+        match std::thread::Builder::new()
+            .name("cuda-module-handoff".into())
+            .spawn(move || module_blob_for_token(token))
+        {
+            Ok(build) => Some(build),
+            Err(error) => {
+                tracing::warn!(%error, token, "could not parallelize CUDA module handoff");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let (golden_dev, layout, export_fds) = if let Some(cached) = cached_host_snapshot(token) {
         tracing::info!(
             token,
@@ -4854,7 +5356,20 @@ fn spawn_clone_worker(
     // inherit a read-only descriptor for an unnamed file; other Unix hosts keep
     // the legacy unique-path handoff.
     #[cfg(target_os = "linux")]
-    let module_blob = match module_blob_for_token(token) {
+    let module_blob_result = match module_blob_build {
+        Some(build) => match build.join() {
+            Ok(result) => result,
+            Err(_) => {
+                for &fd in &export_fds {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(io::Error::other("CUDA module handoff builder panicked"));
+            }
+        },
+        None => module_blob_for_token(token),
+    };
+    #[cfg(target_os = "linux")]
+    let module_blob = match module_blob_result {
         Ok(blob) => blob,
         Err(error) => {
             for &fd in &export_fds {
@@ -4911,7 +5426,13 @@ fn spawn_clone_worker(
     #[cfg(target_os = "linux")]
     let module_slot = publish_slot + i32::from(publish_enabled);
     #[cfg(target_os = "linux")]
-    let source_minimum = module_slot + i32::from(module_blob.is_some());
+    let module_images_slot = module_slot + i32::from(module_blob.is_some());
+    #[cfg(target_os = "linux")]
+    let has_module_images = module_blob
+        .as_ref()
+        .is_some_and(|blob| blob.image_file.is_some());
+    #[cfg(target_os = "linux")]
+    let source_minimum = module_images_slot + i32::from(has_module_images);
     #[cfg(not(target_os = "linux"))]
     let source_minimum = publish_slot + i32::from(publish_enabled);
     #[cfg(target_os = "linux")]
@@ -4926,6 +5447,34 @@ fn spawn_clone_worker(
                 if publish_enabled {
                     libc::close(publish_sp[0]);
                     libc::close(publish_sp[1]);
+                }
+            }
+            for fd in export_fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(error);
+        }
+        fd
+    } else {
+        -1
+    };
+    #[cfg(target_os = "linux")]
+    let module_images_child = if let Some(file) = module_blob
+        .as_ref()
+        .and_then(|blob| blob.image_file.as_ref())
+    {
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, source_minimum) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(sp[0]);
+                libc::close(sp[1]);
+                if publish_enabled {
+                    libc::close(publish_sp[0]);
+                    libc::close(publish_sp[1]);
+                }
+                if module_child >= 0 {
+                    libc::close(module_child);
                 }
             }
             for fd in export_fds {
@@ -4957,6 +5506,10 @@ fn spawn_clone_worker(
         if module_child >= 0 {
             unsafe { libc::close(module_child) };
         }
+        #[cfg(target_os = "linux")]
+        if module_images_child >= 0 {
+            unsafe { libc::close(module_images_child) };
+        }
         for fd in export_fds {
             unsafe { libc::close(fd) };
         }
@@ -4975,6 +5528,10 @@ fn spawn_clone_worker(
             #[cfg(target_os = "linux")]
             if module_child >= 0 {
                 unsafe { libc::close(module_child) };
+            }
+            #[cfg(target_os = "linux")]
+            if module_images_child >= 0 {
+                unsafe { libc::close(module_images_child) };
             }
             for fd in export_fds {
                 unsafe { libc::close(fd) };
@@ -4999,108 +5556,120 @@ fn spawn_clone_worker(
                 if module_child >= 0 {
                     libc::close(module_child);
                 }
+                #[cfg(target_os = "linux")]
+                if module_images_child >= 0 {
+                    libc::close(module_images_child);
+                }
             }
             return Err(error);
         }
     };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("_cuda-clone-worker").arg("3");
-    cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
-    cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
-    cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    let mut worker_env = vec![
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_LAYOUT"),
+            std::ffi::OsString::from(layout),
+        ),
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_DEVICE"),
+            std::ffi::OsString::from(golden_dev.to_string()),
+        ),
+        (
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_CTRL"),
+            std::ffi::OsString::from(ctrl_slot.to_string()),
+        ),
+    ];
     if publish_enabled {
-        cmd.env("SMOLVM_CUDA_CLONE_PUBLISH_CTRL", publish_slot.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PUBLISH_CTRL"),
+            std::ffi::OsString::from(publish_slot.to_string()),
+        ));
     }
     if let Some(limit) = options.vram_limit_bytes {
-        cmd.env("SMOLVM_CUDA_VRAM_LIMIT_BYTES", limit.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_VRAM_LIMIT_BYTES"),
+            std::ffi::OsString::from(limit.to_string()),
+        ));
     }
     if let Some(pool) = options.fork_pool_size {
-        cmd.env("SMOLVM_CUDA_FORK_POOL_SIZE", pool.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_FORK_POOL_SIZE"),
+            std::ffi::OsString::from(pool.to_string()),
+        ));
     }
     // Clone live-RAM transport: hand the worker our (pid, gpa, host_va, len) so
     // it can pread/pwrite /proc/<pid>/mem for D2H/H2D instead of ring-copying.
     if let Some((pid, regions)) = &procmem {
-        cmd.env("SMOLVM_CUDA_CLONE_PROCMEM", procmem_to_env(*pid, regions));
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PROCMEM"),
+            std::ffi::OsString::from(procmem_to_env(*pid, regions)),
+        ));
     }
     if let Some(rd) = ring_dir {
         // File-ring transport: the worker resolves RingSetupFile names
         // against the clone VM's advertised host ring dir.
-        cmd.env("SMOLVM_CUDA_CLONE_RING_DIR", rd);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_RING_DIR"),
+            std::ffi::OsString::from(rd),
+        ));
     }
     // Per-fork density: --share-weights requests sharing, but the documented
     // daemon kill switch remains authoritative. This is needed for safe
     // all-private controls and emergency rollback; blindly replacing an
     // inherited "0" here made SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0 ineffective.
     if let Some(setting) = clone_worker_share_env(share_weights, configured_sharing.as_deref()) {
-        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", setting);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_FORK_SHARE_WEIGHTS"),
+            std::ffi::OsString::from(setting),
+        ));
     }
     #[cfg(target_os = "linux")]
     if module_blob.is_some() {
-        cmd.env("SMOLVM_CUDA_CLONE_MODULES_FD", module_slot.to_string());
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULES_FD"),
+            std::ffi::OsString::from(module_slot.to_string()),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if has_module_images {
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULE_IMAGES_FD"),
+            std::ffi::OsString::from(module_images_slot.to_string()),
+        ));
     }
     #[cfg(not(target_os = "linux"))]
     if let Some(mp) = &modpath {
-        cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_CLONE_MODULES"),
+            mp.as_os_str().to_os_string(),
+        ));
     }
     // Parent copies of the exported-physical fds, to close once the child has
-    // forked (it inherits its own set). Every open export fd holds a DRIVER
+    // spawned (it inherits its own set). Every open export fd holds a DRIVER
     // REFERENCE on the golden's physical allocation — leaking them in the
     // daemon pins the golden's VRAM long after the golden is torn down and its
     // session reclaimed (found: two dead goldens left ~3.2 GB resident).
     let parent_fds = export_fds.clone();
-    // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
-    // fork. Connection → fd 3; each exported physical → fd 4+idx.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(conn_fd, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (i, efd) in export_fds.iter().enumerate() {
-                if libc::dup2(*efd, 4 + i as i32) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            // The export fds from cuMemExportToShareableHandle are O_CLOEXEC. dup2 to
-            // a DIFFERENT fd clears CLOEXEC, but dup2(fd, fd) — when an export fd
-            // already sits at its destination (commonly the first, fd 4) — is a
-            // no-op that does NOT clear it, so that fd would be closed on exec and
-            // the worker's import fails e=999 (a region left uninitialized → a later
-            // read of a weight there faults). Clear CLOEXEC on every handed-off fd.
-            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for i in 0..export_fds.len() as i32 {
-                if libc::fcntl(4 + i, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            if libc::dup2(ctrl_child, ctrl_slot) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(ctrl_slot, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if publish_enabled {
-                if libc::dup2(publish_child, publish_slot) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(publish_slot, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            #[cfg(target_os = "linux")]
-            if module_child >= 0 {
-                if libc::dup2(module_child, module_slot) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(module_slot, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    let spawned = cmd.spawn().map(|child| child.id());
+    #[cfg(target_os = "linux")]
+    let module_action = (module_child >= 0).then_some((module_child, module_slot));
+    #[cfg(not(target_os = "linux"))]
+    let module_action = None;
+    #[cfg(target_os = "linux")]
+    let module_images_action =
+        (module_images_child >= 0).then_some((module_images_child, module_images_slot));
+    #[cfg(not(target_os = "linux"))]
+    let module_images_action = None;
+    let spawned = posix_spawn_clone_worker(
+        &exe,
+        &worker_env,
+        CloneWorkerSpawnFds {
+            connection: conn_fd,
+            exports: &export_fds,
+            control: (ctrl_child, ctrl_slot),
+            publish: publish_enabled.then_some((publish_child, publish_slot)),
+            module: module_action,
+            module_images: module_images_action,
+        },
+    );
     // The child (if any) forked with its own copies; drop ours either way so
     // the golden's physicals can actually be released at teardown.
     for efd in parent_fds {
@@ -5117,6 +5686,11 @@ fn spawn_clone_worker(
     if module_child >= 0 {
         // SAFETY: the child inherited its own copy at module_slot.
         unsafe { libc::close(module_child) };
+    }
+    #[cfg(target_os = "linux")]
+    if module_images_child >= 0 {
+        // SAFETY: the child inherited its own copy at module_images_slot.
+        unsafe { libc::close(module_images_child) };
     }
     match spawned {
         Ok(pid) => {
@@ -5175,6 +5749,7 @@ pub fn ensure_running() -> io::Result<PathBuf> {
     };
     Command::new(exe)
         .args(["_cuda-daemon", &sock.to_string_lossy()])
+        .env("CUDA_DEVICE_ORDER", CUDA_DEVICE_ORDER)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
@@ -5223,24 +5798,90 @@ impl Drop for FileLock {
 mod mps_tests {
     use super::{
         clone_layout_reservation_envelopes, clone_worker_idle_expired,
-        clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_vm_is_alive,
-        consume_procmem_preamble, create_host_snapshot_memfd, create_private_mps_paths,
-        daemon_has_live_cuda_clients, decode_attach_procmem, disabled_worker_route,
-        encode_attach_procmem, fork_snapshot_enabled, golden_eviction_enabled, host_snapshot_fits,
-        host_snapshot_reconstructable, lift_owned_fds, live_host_snapshot_count,
-        map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved, prepare_module_blob,
-        prepare_streamed_module_blob, range_is_reserved, read_host_snapshot,
-        reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
-        select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
+        clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
+        clone_worker_vm_is_alive, consume_procmem_preamble, create_host_snapshot_memfd,
+        create_private_mps_paths, daemon_has_live_cuda_clients, decode_attach_procmem,
+        decode_clone_worker_status, disabled_worker_route, encode_attach_procmem,
+        encode_clone_worker_status, fork_snapshot_enabled, golden_eviction_enabled,
+        host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
+        live_host_snapshot_count, map_module_blob_fd, mps_enabled, ordinary_regions_are_reserved,
+        posix_spawn_clone_worker, prepare_module_blob, prepare_streamed_module_blob,
+        range_is_reserved, read_host_snapshot, reconstruct_golden_modules, recv_fd,
+        redeem_tensor_bundle_from_stream, seal_host_snapshot, select_golden_owner, send_fd,
+        send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
-        TENSOR_CONSUME_MAGIC,
+        CloneWorkerSpawnFds, CloneWorkerStatus, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn high_fanout_clone_workers_keep_a_bounded_spawn_interval() {
+        assert_eq!(clone_worker_spawn_pace(None), Duration::ZERO);
+        assert_eq!(clone_worker_spawn_pace(Some(4)), Duration::ZERO);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(clone_worker_spawn_pace(Some(5)), Duration::from_millis(20));
+            assert_eq!(clone_worker_spawn_pace(Some(64)), Duration::from_millis(20));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(clone_worker_spawn_pace(Some(5)), Duration::ZERO);
+            assert_eq!(clone_worker_spawn_pace(Some(64)), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn clone_worker_posix_spawn_preserves_the_descriptor_contract() {
+        let mut connection = [-1; 2];
+        let mut control = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET,
+                    0,
+                    connection.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, control.as_mut_ptr())
+            },
+            0
+        );
+        let pid = posix_spawn_clone_worker(
+            std::path::Path::new("/bin/true"),
+            &[("SMOLVM_SPAWN_TEST".into(), "1".into())],
+            CloneWorkerSpawnFds {
+                connection: connection[1],
+                exports: &[],
+                control: (control[1], 4),
+                publish: None,
+                module: None,
+                module_images: None,
+            },
+        )
+        .unwrap();
+        unsafe {
+            for fd in connection.into_iter().chain(control) {
+                libc::close(fd);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, 0) },
+            pid as i32
+        );
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
 
     #[test]
     fn worker_fd_sources_are_lifted_above_every_dup_destination() {
@@ -5328,7 +5969,7 @@ mod mps_tests {
         let source = map_module_blob_fd(file.into_raw_fd()).unwrap();
         let mut backend = smolvm_cuda::host::CpuBackend::default();
         let (images, functions, streams, events, graphs, handles) =
-            reconstruct_golden_modules(&mut backend, &source);
+            reconstruct_golden_modules(&mut backend, &source, None).unwrap();
         drop(source);
 
         assert_eq!(images.len(), 1);
@@ -5339,6 +5980,85 @@ mod mps_tests {
         assert!(events.is_empty());
         assert!(graphs.is_empty());
         assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn external_module_image_store_keeps_handoff_metadata_small() {
+        use std::io::Write as _;
+        use std::os::fd::IntoRawFd as _;
+
+        let image: Arc<[u8]> = b"external-module-image".as_slice().into();
+        let snapshot = (
+            vec![(0x1234, image.clone())],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut image_file = tempfile::tempfile().unwrap();
+        image_file.write_all(&image).unwrap();
+        let image_store = smolvm_cuda::host::ModuleImageStoreSnapshot {
+            file: image_file.try_clone().unwrap(),
+            ranges: std::collections::HashMap::from([(0x1234, (0, image.len() as u64))]),
+            bytes: image.len() as u64,
+        };
+        let mut metadata = Vec::new();
+        write_module_handoff(&mut metadata, &snapshot, &Vec::new(), Some(&image_store)).unwrap();
+        assert!(metadata.starts_with(&super::EXTERNAL_MODULE_IMAGES_MAGIC));
+        assert!(!metadata
+            .windows(image.len())
+            .any(|window| window == image.as_ref()));
+
+        let mut metadata_file = tempfile::tempfile().unwrap();
+        metadata_file.write_all(&metadata).unwrap();
+        let metadata_source = map_module_blob_fd(metadata_file.into_raw_fd()).unwrap();
+        let image_source = map_module_blob_fd(image_file.into_raw_fd()).unwrap();
+        let mut backend = smolvm_cuda::host::CpuBackend::default();
+        assert_eq!(
+            reconstruct_golden_modules(&mut backend, &metadata_source, None)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut invalid_range = metadata.clone();
+        invalid_range[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        let invalid_range = smolvm_cuda::host::ModuleHandoffBytes::from_owned(invalid_range);
+        assert_eq!(
+            reconstruct_golden_modules(&mut backend, &invalid_range, Some(&image_source))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let (images, functions, streams, events, graphs, handles) =
+            reconstruct_golden_modules(&mut backend, &metadata_source, Some(&image_source))
+                .unwrap();
+        drop(metadata_source);
+        drop(image_source);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, 0x1234);
+        assert_eq!(images[0].1.as_slice(), image.as_ref());
+        assert!(functions.is_empty());
+        assert!(streams.is_empty());
+        assert!(events.is_empty());
+        assert!(graphs.is_empty());
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn truncated_module_handoff_fails_closed() {
+        let source = smolvm_cuda::host::ModuleHandoffBytes::from_owned(vec![1, 0, 0]);
+        let mut backend = smolvm_cuda::host::CpuBackend::default();
+        assert_eq!(
+            reconstruct_golden_modules(&mut backend, &source, None)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -5377,7 +6097,7 @@ mod mps_tests {
         let oplogs = vec![(0x50, 0x51, vec![vec![7, 6, 5]])];
 
         let mut actual = Vec::new();
-        let written = write_module_handoff(&mut actual, &snapshot, &oplogs).unwrap();
+        let written = write_module_handoff(&mut actual, &snapshot, &oplogs, None).unwrap();
 
         fn u16_field(output: &mut Vec<u8>, value: u16) {
             output.extend_from_slice(&value.to_le_bytes());
@@ -5444,7 +6164,7 @@ mod mps_tests {
         assert_eq!(actual, expected);
 
         let token = u64::MAX - 92;
-        let blob = prepare_streamed_module_blob(token, 0, &snapshot, &oplogs).unwrap();
+        let blob = prepare_streamed_module_blob(token, 0, &snapshot, &oplogs, None).unwrap();
         assert_eq!(blob.bytes, expected.len() as u64);
         assert_eq!(blob.file.metadata().unwrap().len(), expected.len() as u64);
         let mapped = unsafe {
@@ -5827,6 +6547,17 @@ mod mps_tests {
         assert_eq!(clone_worker_share_env(true, Some("false")), Some("0"));
         assert_eq!(clone_worker_share_env(true, Some("off")), Some("0"));
         assert_eq!(clone_worker_share_env(false, None), None);
+    }
+
+    #[test]
+    fn clone_worker_status_round_trips_and_rejects_ambiguous_records() {
+        for status in [CloneWorkerStatus::Ready, CloneWorkerStatus::Failed] {
+            let encoded = encode_clone_worker_status(42, status);
+            assert_eq!(decode_clone_worker_status(&encoded), Some((42, status)));
+        }
+        assert_eq!(decode_clone_worker_status("42 ready trailing"), None);
+        assert_eq!(decode_clone_worker_status("42 unknown"), None);
+        assert_eq!(decode_clone_worker_status("ready"), None);
     }
 
     #[test]

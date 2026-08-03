@@ -26,8 +26,11 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use futures_util::StreamExt;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount, PortMapping};
 use crate::api::error::ApiError;
@@ -1373,26 +1376,50 @@ pub(crate) async fn fork_machine_inner(
         state,
         clone,
         prep,
-        req_share_weights,
-        fork_env,
-        wait_ready,
-        req_hold,
+        PreparedForkBoot {
+            share_weights: req_share_weights,
+            fork_env,
+            wait_ready,
+            hold: req_hold,
+            cuda_worker_ready_timeout: None,
+            boot_permit: None,
+        },
     )
     .await
 }
 
 /// Prepare several clean held workers from one golden checkpoint and boot them
-/// concurrently. Preparation is all-or-nothing; once booting begins, successful
-/// workers remain usable and each failed worker is reported independently.
+/// through a bounded queue. Preparation is all-or-nothing; once booting begins,
+/// each result is reported as soon as it completes so successful workers can be
+/// leased while the remainder of the batch is still restoring.
+pub(crate) struct ForkBatchOutcome {
+    pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
+}
+
+pub(crate) struct ForkHeldBatch {
+    pub golden: String,
+    pub clones: Vec<String>,
+    pub share_weights: bool,
+    pub ready_timeout: std::time::Duration,
+    pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
+    pub max_parallel: usize,
+}
+
 pub(crate) async fn fork_held_machines_inner(
     state: Arc<ApiState>,
-    golden: String,
-    clones: Vec<String>,
-    share_weights: bool,
-    ready_timeout: std::time::Duration,
-) -> Result<Vec<(String, Result<MachineInfo, ApiError>)>, ApiError> {
+    batch: ForkHeldBatch,
+    result_tx: UnboundedSender<(String, Result<MachineInfo, ApiError>)>,
+) -> Result<ForkBatchOutcome, ApiError> {
+    let ForkHeldBatch {
+        golden,
+        clones,
+        share_weights,
+        ready_timeout,
+        retained_snapshot,
+        max_parallel,
+    } = batch;
     if clones.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ForkBatchOutcome { retained_snapshot });
     }
 
     let golden_for_wait = golden.clone();
@@ -1431,37 +1458,69 @@ pub(crate) async fn fork_held_machines_inner(
                     hold: true,
                 })
                 .collect();
-            crate::agent::fork::prepare_forks(&db, &golden_for_prep, &specs)
+            crate::agent::fork::prepare_forks_reusing(
+                &db,
+                &golden_for_prep,
+                &specs,
+                retained_snapshot.as_ref(),
+            )
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {e}")))?
         .map_err(classify_fork_error)?
     };
 
-    let snapshot_dir = prepared[0].snapshot_dir.clone();
-    let resume_golden_on_rollback = prepared[0].resume_golden_on_rollback;
-    let boots = prepared.into_iter().zip(clones).map(|(prep, clone)| {
+    let snapshot_dir = prepared.forks[0].snapshot_dir.clone();
+    let resume_golden_on_rollback = prepared.forks[0].resume_golden_on_rollback;
+    let snapshot_reused = prepared.snapshot_reused;
+    let reusable_snapshot = prepared.retained_snapshot;
+    let pending_boots = prepared.forks.len();
+    let boot_slots = Arc::new(tokio::sync::Semaphore::new(max_parallel.max(1)));
+    let boots = prepared.forks.into_iter().zip(clones).map(|(prep, clone)| {
         let state = state.clone();
+        let boot_slots = boot_slots.clone();
         async move {
-            let result = boot_prepared_fork_inner(
-                state,
-                clone.clone(),
-                prep,
-                share_weights,
-                Vec::new(),
-                true,
-                true,
-            )
-            .await;
+            let result = match boot_slots.acquire_owned().await {
+                Ok(boot_permit) => {
+                    boot_prepared_fork_inner(
+                        state,
+                        clone.clone(),
+                        prep,
+                        PreparedForkBoot {
+                            share_weights,
+                            fork_env: Vec::new(),
+                            wait_ready: true,
+                            hold: true,
+                            cuda_worker_ready_timeout: Some(ready_timeout),
+                            boot_permit: Some(boot_permit),
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(ApiError::internal(format!(
+                    "fork boot scheduler closed: {error}"
+                ))),
+            };
             (clone, result)
         }
     });
-    let results = futures_util::future::join_all(boots).await;
+    // Poll every boot future so an agent-ready clone can release its launch
+    // permit and wait for CUDA reconstruction without blocking the next VM.
+    // The semaphore, not this result stream, preserves the qualified launch
+    // width; completed results are still reported as soon as each is usable.
+    let any_succeeded = run_bounded_futures(boots, pending_boots, |result| {
+        let succeeded = result.1.is_ok();
+        if result_tx.send(result).is_err() {
+            tracing::warn!("fork pool result receiver closed before provisioning completed");
+        }
+        succeeded
+    })
+    .await;
 
     // If every restore failed, no clone depends on this checkpoint and an
     // initially-running golden can safely resume for a later retry. A partial
     // success must retain the paused golden and shared snapshot.
-    if results.iter().all(|(_, result)| result.is_err()) {
+    if !any_succeeded && !snapshot_reused {
         if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
             tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
         }
@@ -1473,18 +1532,50 @@ pub(crate) async fn fork_held_machines_inner(
     }
 
     drop(guards);
-    Ok(results)
+    Ok(ForkBatchOutcome {
+        retained_snapshot: any_succeeded.then_some(reusable_snapshot).flatten(),
+    })
+}
+
+async fn run_bounded_futures<F, T>(
+    futures: impl IntoIterator<Item = F>,
+    max_parallel: usize,
+    mut on_complete: impl FnMut(T) -> bool,
+) -> bool
+where
+    F: Future<Output = T>,
+{
+    let mut pending = futures_util::stream::iter(futures).buffer_unordered(max_parallel.max(1));
+    let mut any_succeeded = false;
+    while let Some(result) = pending.next().await {
+        any_succeeded |= on_complete(result);
+    }
+    any_succeeded
+}
+
+struct PreparedForkBoot {
+    share_weights: bool,
+    fork_env: Vec<(String, String)>,
+    wait_ready: bool,
+    hold: bool,
+    cuda_worker_ready_timeout: Option<std::time::Duration>,
+    boot_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 async fn boot_prepared_fork_inner(
     state: Arc<ApiState>,
     clone: String,
     prep: crate::agent::fork::PreparedFork,
-    share_weights: bool,
-    fork_env: Vec<(String, String)>,
-    wait_ready: bool,
-    hold: bool,
+    boot: PreparedForkBoot,
 ) -> Result<MachineInfo, ApiError> {
+    let PreparedForkBoot {
+        share_weights,
+        fork_env,
+        wait_ready,
+        hold,
+        cuda_worker_ready_timeout,
+        mut boot_permit,
+    } = boot;
     // Phase 2: boot the clone from the golden's in-memory snapshot (warm — its
     // processes are already running in the restored RAM, so unlike a cold start
     // there is no image workload to launch), then rejuvenate its identity.
@@ -1520,6 +1611,8 @@ async fn boot_prepared_fork_inner(
             return Err(format!("failed to boot clone: {}", e));
         }
 
+        let pid = manager.child_pid();
+
         // Give the clone a fresh on-disk identity (hostname, machine-id, SSH
         // host keys, RNG) so it does not carry the golden's per-machine secrets
         // into a (possibly different) tenant. FAIL-CLOSED: if the reset can't be
@@ -1542,6 +1635,36 @@ async fn boot_prepared_fork_inner(
             teardown,
         )
         .map_err(|e| format!("fork env delivery failed: {}", e))?;
+
+        // Preserve the measured VM-launch bound, but do not make CUDA
+        // reconstruction occupy that scarce slot. At this point the guest
+        // agent and per-clone setup are complete, so another VM can safely
+        // boot while this clone finishes rebuilding its isolated GPU state.
+        drop(boot_permit.take());
+        #[cfg(unix)]
+        if record.cuda
+            && cuda_worker_ready_timeout.is_some()
+            && std::env::var_os("SMOLVM_CUDA_DAEMON").is_none()
+            && std::env::var("SMOLVM_CUDA_WARM_DIAL").as_deref() != Ok("0")
+        {
+            let worker_ready = pid
+                .and_then(|pid| process_start_time(pid).map(|started| (pid, started)))
+                .ok_or_else(|| "clone process identity unavailable for CUDA readiness".to_string())
+                .and_then(|(pid, started)| {
+                    crate::cuda_daemon::wait_for_clone_worker_ready(
+                        pid,
+                        started,
+                        cuda_worker_ready_timeout.expect("checked above"),
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            if let Err(error) = worker_ready {
+                teardown();
+                return Err(format!("CUDA clone worker readiness failed: {error}"));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = cuda_worker_ready_timeout;
         if wait_ready && !hold {
             crate::agent::fork::fail_closed_on_rejuvenation(
                 crate::agent::fork::release_forkpoint(&clone_b),
@@ -1550,7 +1673,6 @@ async fn boot_prepared_fork_inner(
             .map_err(|e| format!("forkpoint release failed: {e}"))?;
         }
 
-        let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
     })
     .await
@@ -2546,7 +2668,141 @@ mod tests {
 
     use super::*;
     use crate::db::SmolvmDb;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn bounded_futures_stream_results_without_exceeding_the_limit() {
+        const TOTAL: usize = 8;
+        const WIDTH: usize = 4;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
+        let jobs = (0..TOTAL)
+            .map(|index| {
+                let active = active.clone();
+                let peak = peak.clone();
+                let gate = gate.clone();
+                let started_tx = started_tx.clone();
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now_active, Ordering::SeqCst);
+                    started_tx.send_modify(|started| *started += 1);
+                    let permit = gate.acquire().await.expect("test gate closed");
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    index
+                }
+            })
+            .collect::<Vec<_>>();
+        drop(started_tx);
+
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = tokio::spawn(async move {
+            run_bounded_futures(jobs, WIDTH, move |result| {
+                result_tx.send(result).expect("result receiver open");
+                true
+            })
+            .await
+        });
+
+        while *started_rx.borrow() < WIDTH {
+            started_rx.changed().await.expect("workers still pending");
+        }
+        assert_eq!(*started_rx.borrow(), WIDTH);
+        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+        assert!(!runner.is_finished());
+
+        gate.add_permits(1);
+        let first = result_rx.recv().await.expect("first result");
+        assert!(first < TOTAL);
+        while *started_rx.borrow() < WIDTH + 1 {
+            started_rx.changed().await.expect("workers still pending");
+        }
+        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+
+        gate.add_permits(TOTAL);
+        let mut received = 1;
+        while received < TOTAL {
+            result_rx.recv().await.expect("remaining result");
+            received += 1;
+        }
+        assert!(runner.await.expect("runner task"));
+        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn boot_slots_release_while_prior_workers_wait_for_readiness() {
+        const TOTAL: usize = 8;
+        const WIDTH: usize = 2;
+
+        let boot_slots = Arc::new(tokio::sync::Semaphore::new(WIDTH));
+        let boot_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let readiness_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
+        let jobs = (0..TOTAL)
+            .map(|index| {
+                let boot_slots = boot_slots.clone();
+                let boot_release = boot_release.clone();
+                let readiness_release = readiness_release.clone();
+                let active = active.clone();
+                let peak = peak.clone();
+                let started_tx = started_tx.clone();
+                async move {
+                    let boot_permit = boot_slots.acquire_owned().await.expect("scheduler open");
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now_active, Ordering::SeqCst);
+                    started_tx.send_modify(|started| *started += 1);
+
+                    let permit = boot_release.acquire().await.expect("test gate open");
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    drop(boot_permit);
+
+                    let permit = readiness_release
+                        .acquire()
+                        .await
+                        .expect("readiness gate open");
+                    permit.forget();
+                    index
+                }
+            })
+            .collect::<Vec<_>>();
+        drop(started_tx);
+
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = tokio::spawn(async move {
+            run_bounded_futures(jobs, TOTAL, move |result| {
+                result_tx.send(result).expect("result receiver open");
+                true
+            })
+            .await
+        });
+
+        for expected in (WIDTH..=TOTAL).step_by(WIDTH) {
+            while *started_rx.borrow() < expected {
+                started_rx.changed().await.expect("boots still pending");
+            }
+            assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+            boot_release.add_permits(WIDTH);
+        }
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!runner.is_finished());
+        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+
+        readiness_release.add_permits(TOTAL);
+        for _ in 0..TOTAL {
+            result_rx.recv().await.expect("remaining result");
+        }
+        assert!(runner.await.expect("runner task"));
+    }
 
     #[test]
     fn ssrf_prone_registry_host_flags_loopback_linklocal_and_private() {

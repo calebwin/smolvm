@@ -20,7 +20,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.7.2"
+version = "1.7.4"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -37,16 +37,16 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network", version = "1.7.2" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.2" }
-smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.2" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.7.2" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.7.2" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.7.4" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.4" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.4" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.7.4" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.7.4" }
 # Shared OCI layer extraction. The host image store fills content-addressed
 # overlay lowerdirs through the SAME code the guest agent uses, with the
 # host-shared options (see `ExtractOptions::HOST_SHARED`).
-smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.7.2" }
-smolfile = { path = "crates/smolvm-smolfile", version = "1.7.2" }
+smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.7.4" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.7.4" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -130,7 +130,7 @@ windows-sys = { version = "0.60", features = [
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.2" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.4" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

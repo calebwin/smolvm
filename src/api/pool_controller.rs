@@ -5,12 +5,22 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::api::handlers::machines::{delete_one, fork_held_machines_inner};
+use crate::api::handlers::machines::{delete_one, fork_held_machines_inner, ForkHeldBatch};
 use crate::api::state::ApiState;
 use crate::pool::{ForkPoolRecord, ForkPoolSlotState};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_PROVISIONS_PER_POOL_TICK: usize = 4;
+// Prepare enough workers to amortize one golden checkpoint across practical
+// GPU pool sizes, while bounding the number of registered-but-unbooted clones.
+const MAX_PREPARED_POOL_WORKERS: usize = 32;
+// Limit simultaneous KVM/CUDA restores to avoid transient host-resource
+// exhaustion. A continuous queue preserves that bound without introducing
+// four-worker checkpoint barriers.
+const MAX_CONCURRENT_POOL_BOOTS: usize = 4;
+
+type RetainedSnapshotMap = Arc<
+    parking_lot::Mutex<std::collections::HashMap<String, crate::agent::fork::RetainedForkSnapshot>>,
+>;
 
 /// Maintains each pool's clean-worker target and reaps finished leases.
 pub struct ForkPoolController {
@@ -20,6 +30,7 @@ pub struct ForkPoolController {
     filling: std::collections::HashSet<String>,
     nvml: Option<crate::api::admission::NvmlSampler>,
     host_cpu: crate::api::admission::HostCpuSampler,
+    retained_snapshots: RetainedSnapshotMap,
 }
 
 impl ForkPoolController {
@@ -39,6 +50,7 @@ impl ForkPoolController {
             filling: std::collections::HashSet::new(),
             nvml,
             host_cpu: crate::api::admission::HostCpuSampler::default(),
+            retained_snapshots: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -53,12 +65,25 @@ impl ForkPoolController {
 
         let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let reconcile_notify = self.state.pool_reconcile_notify();
         tracing::info!("fork pool controller started");
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     self.reap_fill_tasks();
-                    if let Err(error) = self.reconcile_once().await {
+                    if let Err(error) = self.reconcile_once(true).await {
+                        tracing::warn!(%error, "fork pool reconciliation failed");
+                    }
+                }
+                _ = reconcile_notify.notified() => {
+                    self.reap_fill_tasks();
+                    if let Err(error) = self.reconcile_once(false).await {
+                        tracing::warn!(%error, "fork pool reconciliation failed");
+                    }
+                }
+                result = self.fills.join_next(), if !self.fills.is_empty() => {
+                    self.handle_fill_task(result);
+                    if let Err(error) = self.reconcile_once(false).await {
                         tracing::warn!(%error, "fork pool reconciliation failed");
                     }
                 }
@@ -73,20 +98,25 @@ impl ForkPoolController {
         }
     }
 
+    fn handle_fill_task(&mut self, result: Option<Result<String, tokio::task::JoinError>>) {
+        match result {
+            Some(Ok(pool_name)) => {
+                self.filling.remove(&pool_name);
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "fork pool fill task failed");
+                // A panic loses the task's return value, so conservatively
+                // allow every pool to be scheduled again. Slot reservations
+                // still prevent overfill if another task is winding down.
+                self.filling.clear();
+            }
+            None => {}
+        }
+    }
+
     fn reap_fill_tasks(&mut self) {
         while let Some(result) = self.fills.try_join_next() {
-            match result {
-                Ok(pool_name) => {
-                    self.filling.remove(&pool_name);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "fork pool fill task failed");
-                    // A panic loses the task's return value, so conservatively
-                    // allow every pool to be scheduled again. Slot reservations
-                    // still prevent overfill even if another task is winding down.
-                    self.filling.clear();
-                }
-            }
+            self.handle_fill_task(Some(result));
         }
     }
 
@@ -142,7 +172,7 @@ impl ForkPoolController {
         Ok(())
     }
 
-    async fn reconcile_once(&mut self) -> Result<(), String> {
+    async fn reconcile_once(&mut self, sample_admission: bool) -> Result<(), String> {
         let now = crate::util::current_timestamp();
         let db = self.state.db().clone();
         let expired = tokio::task::spawn_blocking(move || db.expire_fork_leases(now))
@@ -173,7 +203,15 @@ impl ForkPoolController {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-        self.update_admission(&pools).await?;
+        let active_goldens = pools
+            .iter()
+            .filter(|pool| !pool.deleting)
+            .map(|pool| pool.golden.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.retained_snapshots
+            .lock()
+            .retain(|golden, _| active_goldens.contains(golden.as_str()));
+        self.update_admission(&pools, sample_admission).await?;
         for pool in pools.into_iter().filter(|pool| !pool.deleting) {
             if self.filling.contains(&pool.name) {
                 continue;
@@ -187,9 +225,10 @@ impl ForkPoolController {
                     .map_err(|e| e.to_string())?;
             if deficit > 0 && self.filling.insert(pool.name.clone()) {
                 let state = self.state.clone();
+                let retained_snapshots = self.retained_snapshots.clone();
                 let pool_name = pool.name.clone();
                 self.fills.spawn(async move {
-                    Self::fill_pool(state, pool).await;
+                    Self::fill_pool(state, pool, retained_snapshots).await;
                     pool_name
                 });
             }
@@ -197,20 +236,19 @@ impl ForkPoolController {
         Ok(())
     }
 
-    async fn update_admission(&mut self, pools: &[ForkPoolRecord]) -> Result<(), String> {
-        let gpu = self.nvml.as_mut().and_then(|nvml| nvml.sample());
-        let host_cpu = self.host_cpu.sample();
-        let names = pools
-            .iter()
-            .map(|pool| pool.name.clone())
-            .collect::<std::collections::HashSet<_>>();
-        self.state.admission().retain_pools(&names);
-
+    async fn update_admission(
+        &mut self,
+        pools: &[ForkPoolRecord],
+        sample: bool,
+    ) -> Result<(), String> {
+        let gpu = if sample {
+            self.nvml.as_mut().and_then(|nvml| nvml.sample())
+        } else {
+            None
+        };
+        let host_cpu = if sample { self.host_cpu.sample() } else { None };
+        let mut observations = Vec::with_capacity(pools.len());
         for pool in pools.iter().filter(|pool| !pool.deleting) {
-            if !pool.auto_admission {
-                self.state.admission().observe(pool, 0, 0, gpu, host_cpu);
-                continue;
-            }
             let db = self.state.db().clone();
             let pool_name = pool.name.clone();
             let (active, completed) =
@@ -218,12 +256,30 @@ impl ForkPoolController {
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())?;
+            observations.push((pool.clone(), active, completed));
+        }
+        if sample {
             self.state
                 .admission()
-                .observe(pool, active, completed, gpu, host_cpu);
+                .observe_pools(&observations, gpu.as_ref(), host_cpu);
+        } else {
+            // Mutations and fill completions need an immediate capacity pass,
+            // but admission's telemetry windows retain their periodic cadence.
+            self.state.admission().ensure_pools(&observations);
+        }
+
+        for pool in pools
+            .iter()
+            .filter(|pool| !pool.deleting && pool.auto_admission)
+        {
             if let Some(snapshot) = self.state.admission().snapshot(pool) {
                 metrics::gauge!("smolvm_pool_admission_limit", "pool" => pool.name.clone())
                     .set(f64::from(snapshot.effective_limit));
+                metrics::gauge!(
+                    "smolvm_cuda_device_admission_limit",
+                    "device" => snapshot.device_ordinal.to_string()
+                )
+                .set(f64::from(snapshot.device_limit));
                 if let Some(utilization) = snapshot.gpu_utilization_percent {
                     metrics::gauge!("smolvm_pool_gpu_utilization_percent", "pool" => pool.name.clone())
                         .set(utilization);
@@ -352,12 +408,22 @@ impl ForkPoolController {
         Ok(())
     }
 
-    async fn fill_pool(state: Arc<ApiState>, pool: ForkPoolRecord) {
+    async fn fill_pool(
+        state: Arc<ApiState>,
+        pool: ForkPoolRecord,
+        retained_snapshots: RetainedSnapshotMap,
+    ) {
+        // A golden can produce only one RAM checkpoint at a time. Keep the
+        // lifecycle lock through snapshot publication so another pool sharing
+        // this golden reads the proven retained checkpoint instead of issuing
+        // a second FORK command after the first caller has paused the VM.
+        let _golden_guard = state.lifecycle_lock(&pool.golden).lock_owned().await;
+
         // Bound each pool's work so a large cold fill cannot starve expiry and
         // cleanup for every other pool. Reserve the bounded deficit first so all
         // workers in this tick can share one golden checkpoint.
         let mut machines = Vec::new();
-        for _ in 0..MAX_PROVISIONS_PER_POOL_TICK {
+        for _ in 0..MAX_PREPARED_POOL_WORKERS {
             let suffix = crate::util::generate_short_id();
             // Pool names are validated ASCII. Keep room for `pool-`, `-`, and
             // the random suffix under MAX_VM_NAME_LENGTH.
@@ -395,67 +461,94 @@ impl ForkPoolController {
             return;
         }
 
-        let results = match fork_held_machines_inner(
+        let retained_snapshot = retained_snapshots.lock().get(&pool.golden).cloned();
+        let retained_snapshot_hint = retained_snapshot.clone();
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let provision = fork_held_machines_inner(
             state.clone(),
-            pool.golden.clone(),
-            machines.clone(),
-            pool.share_weights,
-            Duration::from_secs(pool.ready_timeout_secs),
-        )
-        .await
-        {
-            Ok(results) => results,
+            ForkHeldBatch {
+                golden: pool.golden.clone(),
+                clones: machines.clone(),
+                share_weights: pool.share_weights,
+                ready_timeout: Duration::from_secs(pool.ready_timeout_secs),
+                retained_snapshot,
+                max_parallel: MAX_CONCURRENT_POOL_BOOTS,
+            },
+            result_tx,
+        );
+        let process_results = async {
+            let mut completed = std::collections::HashSet::new();
+            while let Some((machine, result)) = result_rx.recv().await {
+                completed.insert(machine.clone());
+                Self::finish_provision(&state, &pool, machine, result).await;
+            }
+            completed
+        };
+        let (provision_result, completed) = tokio::join!(provision, process_results);
+
+        match provision_result {
+            Ok(outcome) => {
+                update_retained_snapshot(
+                    &mut retained_snapshots.lock(),
+                    &pool.golden,
+                    retained_snapshot_hint.as_ref(),
+                    outcome.retained_snapshot,
+                );
+            }
             Err(error) => {
                 tracing::warn!(pool = %pool.name, error = ?error, workers = machines.len(), "failed to prepare fork pool worker batch");
                 for machine in machines {
-                    Self::retire_failed_provision(&state, machine, format!("{error:?}")).await;
-                }
-                return;
-            }
-        };
-
-        for (machine, result) in results {
-            let retirement_reason = match result {
-                Ok(info) if info.forkpoint_held => {
-                    let db = state.db().clone();
-                    let machine_ready = machine.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        db.mark_fork_pool_slot_ready(
-                            &machine_ready,
-                            crate::util::current_timestamp(),
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(true)) => {
-                            tracing::info!(pool = %pool.name, machine = %machine, "fork pool worker ready");
-                            continue;
-                        }
-                        Ok(Ok(false)) => {
-                            tracing::info!(pool = %pool.name, machine = %machine, "pool changed while worker was provisioning; retiring worker");
-                            "pool changed while worker was provisioning".into()
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(pool = %pool.name, machine = %machine, %error, "failed to mark fork pool worker ready");
-                            error.to_string()
-                        }
-                        Err(error) => {
-                            tracing::warn!(pool = %pool.name, machine = %machine, %error, "fork pool ready task failed");
-                            error.to_string()
-                        }
+                    if !completed.contains(&machine) {
+                        Self::retire_failed_provision(&state, machine, format!("{error:?}")).await;
                     }
                 }
-                Ok(_) => {
-                    tracing::warn!(pool = %pool.name, machine = %machine, "forked pool worker was not held");
-                    "forked pool worker was not held".into()
-                }
-                Err(error) => {
-                    tracing::warn!(pool = %pool.name, machine = %machine, error = ?error, "failed to provision fork pool worker");
-                    format!("{error:?}")
-                }
-            };
-            Self::retire_failed_provision(&state, machine, retirement_reason).await;
+            }
         }
+    }
+
+    async fn finish_provision(
+        state: &Arc<ApiState>,
+        pool: &ForkPoolRecord,
+        machine: String,
+        result: Result<crate::api::types::MachineInfo, crate::api::error::ApiError>,
+    ) {
+        let retirement_reason = match result {
+            Ok(info) if info.forkpoint_held => {
+                let db = state.db().clone();
+                let machine_ready = machine.clone();
+                match tokio::task::spawn_blocking(move || {
+                    db.mark_fork_pool_slot_ready(&machine_ready, crate::util::current_timestamp())
+                })
+                .await
+                {
+                    Ok(Ok(true)) => {
+                        tracing::info!(pool = %pool.name, machine = %machine, "fork pool worker ready");
+                        return;
+                    }
+                    Ok(Ok(false)) => {
+                        tracing::info!(pool = %pool.name, machine = %machine, "pool changed while worker was provisioning; retiring worker");
+                        "pool changed while worker was provisioning".into()
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(pool = %pool.name, machine = %machine, %error, "failed to mark fork pool worker ready");
+                        error.to_string()
+                    }
+                    Err(error) => {
+                        tracing::warn!(pool = %pool.name, machine = %machine, %error, "fork pool ready task failed");
+                        error.to_string()
+                    }
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(pool = %pool.name, machine = %machine, "forked pool worker was not held");
+                "forked pool worker was not held".into()
+            }
+            Err(error) => {
+                tracing::warn!(pool = %pool.name, machine = %machine, error = ?error, "failed to provision fork pool worker");
+                format!("{error:?}")
+            }
+        };
+        Self::retire_failed_provision(state, machine, retirement_reason).await;
     }
 
     async fn retire_failed_provision(state: &Arc<ApiState>, machine: String, message: String) {
@@ -468,5 +561,53 @@ impl ForkPoolController {
             )
         })
         .await;
+    }
+}
+
+fn update_retained_snapshot(
+    snapshots: &mut std::collections::HashMap<String, crate::agent::fork::RetainedForkSnapshot>,
+    golden: &str,
+    prior_hint: Option<&crate::agent::fork::RetainedForkSnapshot>,
+    proven: Option<crate::agent::fork::RetainedForkSnapshot>,
+) {
+    if let Some(snapshot) = proven {
+        snapshots.insert(golden.to_string(), snapshot);
+    } else if snapshots.get(golden) == prior_hint {
+        snapshots.remove(golden);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn snapshot(id: &str, pid: i32) -> crate::agent::fork::RetainedForkSnapshot {
+        crate::agent::fork::RetainedForkSnapshot {
+            path: PathBuf::from(format!("/golden/s/{id}")),
+            golden_pid: pid,
+            golden_pid_start_time: pid as u64 * 10,
+        }
+    }
+
+    #[test]
+    fn successful_batch_records_the_proven_snapshot() {
+        let mut snapshots = std::collections::HashMap::new();
+        let proven = snapshot("12345678", 1);
+        update_retained_snapshot(&mut snapshots, "golden", None, Some(proven.clone()));
+        assert_eq!(snapshots.get("golden"), Some(&proven));
+    }
+
+    #[test]
+    fn failed_reuse_drops_only_the_snapshot_that_was_attempted() {
+        let prior = snapshot("12345678", 1);
+        let newer = snapshot("abcdef01", 2);
+        let mut snapshots = std::collections::HashMap::from([("golden".into(), prior.clone())]);
+        update_retained_snapshot(&mut snapshots, "golden", Some(&prior), None);
+        assert!(!snapshots.contains_key("golden"));
+
+        snapshots.insert("golden".into(), newer.clone());
+        update_retained_snapshot(&mut snapshots, "golden", Some(&prior), None);
+        assert_eq!(snapshots.get("golden"), Some(&newer));
     }
 }

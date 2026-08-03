@@ -6,7 +6,7 @@ use axum::{
 };
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::api::error::ApiError;
 use crate::api::state::ApiState;
@@ -31,6 +31,7 @@ const MAX_LEASE_PAYLOAD_FILES: usize = 32;
 const MAX_LEASE_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_LEASE_PAYLOAD_PATH_BYTES: usize = 512;
 const DEFAULT_LEASE_PAYLOAD_MODE: u32 = 0o644;
+const LEASE_PAYLOAD_STAGE_ATTEMPTS: usize = 2;
 
 #[derive(Clone)]
 struct StagedLeaseFile {
@@ -129,6 +130,53 @@ fn lease_info(lease: ForkLeaseRecord) -> ForkLeaseInfo {
     }
 }
 
+fn retry_transient_lease_stage(
+    mut operation: impl FnMut() -> crate::Result<()>,
+) -> crate::Result<()> {
+    for attempt in 1..=LEASE_PAYLOAD_STAGE_ATTEMPTS {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < LEASE_PAYLOAD_STAGE_ATTEMPTS
+                    && crate::util::is_transient_network_error(&error.to_string()) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = LEASE_PAYLOAD_STAGE_ATTEMPTS,
+                    %error,
+                    "lease payload staging reply was ambiguous; retrying atomically"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("lease payload staging retry loop always returns")
+}
+
+fn stage_lease_payload(machine: &str, files: &[StagedLeaseFile]) -> crate::Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let socket = crate::agent::vm_data_dir(machine).join("agent.sock");
+    retry_transient_lease_stage(|| {
+        // Reconnect for every attempt. FileWrite installs with an atomic rename,
+        // so repeating the same validated bytes after a lost acknowledgment is
+        // safe even when the first request committed inside the guest.
+        let mut client = crate::agent::AgentClient::connect_with_retry(&socket)
+            .map_err(|e| crate::Error::agent("stage lease payload", e.to_string()))?;
+        for file in files {
+            let path = format!("/workspace/{}", file.path);
+            client
+                .write_file(&path, &file.data, Some(file.mode))
+                .map_err(|e| {
+                    crate::Error::agent("stage lease payload", format!("write '{path}': {e}"))
+                })?;
+        }
+        Ok(())
+    })
+}
+
 async fn activate_claimed_lease(
     state: Arc<ApiState>,
     lease: ForkLeaseRecord,
@@ -148,25 +196,14 @@ async fn activate_claimed_lease(
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
+            state.notify_pool_reconcile();
             return Err(message);
         }
         Err(error) => return Err(format!("pool worker lookup failed: {error:?}")),
     };
     let machine = lease.machine_name.clone();
     let activation = tokio::task::spawn_blocking(move || {
-        if !files.is_empty() {
-            let socket = crate::agent::vm_data_dir(&machine).join("agent.sock");
-            let mut client = crate::agent::AgentClient::connect_with_retry(&socket)
-                .map_err(|e| crate::Error::agent("stage lease payload", e.to_string()))?;
-            for file in files {
-                let path = format!("/workspace/{}", file.path);
-                client
-                    .write_file(&path, &file.data, Some(file.mode))
-                    .map_err(|e| {
-                        crate::Error::agent("stage lease payload", format!("write '{path}': {e}"))
-                    })?;
-            }
-        }
+        stage_lease_payload(&machine, &files)?;
         crate::agent::fork::activate_held_fork(&machine, &record, &assignment)
     })
     .await
@@ -182,6 +219,7 @@ async fn activate_claimed_lease(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
+        state.notify_pool_reconcile();
         return Err(format!(
             "pool worker was consumed and will be replaced after activation failed: {message}"
         ));
@@ -206,6 +244,7 @@ async fn activate_claimed_lease(
 
 async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInfo, ApiError> {
     let admission = state.admission().snapshot(&pool);
+    let cuda_device_ordinal = pool.admission_device_ordinal();
     let db = state.db().clone();
     let pool_name = pool.name.clone();
     let slots = tokio::task::spawn_blocking(move || db.list_fork_pool_slots(&pool_name))
@@ -233,6 +272,8 @@ async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInf
         max_active: pool.max_active,
         auto_admission: pool.auto_admission,
         effective_active_limit: admission.as_ref().map(|state| state.effective_limit),
+        effective_device_limit: admission.as_ref().map(|state| state.device_limit),
+        cuda_device_ordinal,
         admission_reason: admission.as_ref().map(|state| state.reason.clone()),
         admission_calibrating: admission.as_ref().map(|state| state.calibrating),
         gpu_utilization_percent: admission
@@ -347,12 +388,18 @@ pub async fn create_pool(
             req.golden
         )));
     }
+    let cuda_device_ordinal = if golden.cuda {
+        Some(crate::pool::cuda_device_ordinal_from_env(&golden.env).map_err(ApiError::BadRequest)?)
+    } else {
+        None
+    };
     let pool = ForkPoolRecord {
         name: req.name,
         golden: req.golden,
         desired_ready: req.desired_ready,
         max_active: req.max_active,
         auto_admission,
+        cuda_device_ordinal,
         share_weights: req.share_weights,
         ready_timeout_secs,
         lease_ttl_secs,
@@ -372,7 +419,9 @@ pub async fn create_pool(
             pool.name
         )));
     }
-    Ok(Json(pool_info(&state, pool).await?))
+    let info = pool_info(&state, pool).await?;
+    state.notify_pool_reconcile();
+    Ok(Json(info))
 }
 
 /// List automatic fork pools.
@@ -464,7 +513,9 @@ pub async fn resize_pool(
             "fork pool '{name}' is deleting"
         )));
     }
-    Ok(Json(pool_info(&state, pool).await?))
+    let info = pool_info(&state, pool).await?;
+    state.notify_pool_reconcile();
+    Ok(Json(info))
 }
 
 /// Begin asynchronous pool deletion.
@@ -500,7 +551,10 @@ pub async fn delete_pool(
         Some(false) => Err(ApiError::Conflict(format!(
             "fork pool '{name}' has active leases; complete them or use force=true"
         ))),
-        Some(true) => Ok(Json(DeleteResponse { deleted: name })),
+        Some(true) => {
+            state.notify_pool_reconcile();
+            Ok(Json(DeleteResponse { deleted: name }))
+        }
     }
 }
 
@@ -543,6 +597,16 @@ pub async fn acquire_lease(
         .map_err(|e| ApiError::internal(format!("pool lookup task failed: {e}")))?
         .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("fork pool '{pool_name}' not found")))?;
+    if pool.admission_device_ordinal().is_some()
+        && assignment
+            .iter()
+            .any(|(key, _)| key == "SMOLVM_CUDA_DEVICE")
+    {
+        return Err(ApiError::BadRequest(
+            "SMOLVM_CUDA_DEVICE is inherited from the pool golden and cannot be changed by a lease"
+                .into(),
+        ));
+    }
     let ttl = validate_ttl(req.ttl_secs.unwrap_or(pool.lease_ttl_secs))?;
     let lease_id = format!(
         "lease-{}{}",
@@ -593,7 +657,9 @@ pub async fn acquire_lease(
         }
         ClaimForkPoolSlot::AtCapacity => {
             state.admission().note_blocked(&pool_name);
-            let limit = admission_limit.or(pool.max_active);
+            let limit = admission_limit
+                .map(|limit| limit.pool)
+                .or(pool.max_active);
             return Err(ApiError::Conflict(format!(
                 "fork pool '{pool_name}' reached active lease limit{}",
                 limit.map(|value| format!(" ({value})")).unwrap_or_default()
@@ -617,7 +683,6 @@ pub async fn acquire_lease(
         }
         ClaimForkPoolSlot::Claimed(lease) => lease,
     };
-
     // Reflect the durable claim in the in-memory fast path before publishing
     // the guest release marker. The authoritative held bit is already false in
     // SQLite, so a restart cannot resurrect this worker as ready.
@@ -636,6 +701,10 @@ pub async fn acquire_lease(
     .await
     .map_err(|e| ApiError::internal(format!("pool activation task failed: {e}")))?
     .map_err(ApiError::Internal)?;
+    // The durable claim removed one ready slot. Refill it only after payload
+    // staging and guest release complete: starting replacement VMs earlier can
+    // starve the held workers' control channels during a concurrent lease wave.
+    state.notify_pool_reconcile();
     Ok(Json(lease_info(active)))
 }
 
@@ -725,6 +794,7 @@ pub async fn heartbeat_lease(
         .await
         .map_err(|e| ApiError::internal(format!("failed lease task failed: {e}")))?
         .map_err(ApiError::database)?;
+        state.notify_pool_reconcile();
         return Err(ApiError::Conflict(format!(
             "fork lease '{lease_id}' worker is no longer running"
         )));
@@ -771,6 +841,7 @@ pub async fn complete_lease(
             lease.state.as_str()
         )));
     }
+    state.notify_pool_reconcile();
     Ok(Json(lease_info(lease)))
 }
 
@@ -792,6 +863,36 @@ mod tests {
             ApiError::BadRequest(message) => message,
             other => panic!("expected bad request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lease_payload_stage_retries_an_ambiguous_agent_reply() {
+        let mut attempts = 0;
+        retry_transient_lease_stage(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(crate::Error::agent(
+                    "write file",
+                    "Resource temporarily unavailable (os error 11)",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn lease_payload_stage_does_not_retry_a_guest_rejection() {
+        let mut attempts = 0;
+        let error = retry_transient_lease_stage(|| {
+            attempts += 1;
+            Err(crate::Error::agent("write file", "permission denied"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("permission denied"));
     }
 
     #[test]

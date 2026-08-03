@@ -33,6 +33,11 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn should_retry_kvm_enomem(cpus: u8, fork_clone: bool) -> bool {
+    cpus == 1 || fork_clone
+}
+
 /// Running VM configuration persisted to disk so new CLI invocations
 /// can restore the actual config of a detached VM.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1759,19 +1764,25 @@ impl AgentManager {
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
             }
-            // Some KVM kernels return a spurious ENOMEM when a one-vCPU VM
-            // enters KVM too soon after vCPU creation. Delay that first entry
-            // and retain bounded retries without delaying normal guest exits.
+            let fork_clone = features.snapshot_dir.is_some();
+            let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
+            // Some KVM kernels return a spurious ENOMEM while concurrent fork
+            // clones enter KVM. Keep the first-entry delay specific to one-vCPU
+            // guests, but enable the bounded retry path for every fork clone;
+            // retries add no delay unless KVM actually returns ENOMEM.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             if resources_for_config.cpus == 1 {
                 v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
+            }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if should_retry_kvm_enomem(resources_for_config.cpus, fork_clone) {
                 v.push(("KRUN_ENOMEM_RETRY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
             // /worker: the proc-mem live-RAM transport preads /proc/<pid>/mem for
             // D2H/H2D, so the clone must NOT harden to dumpable=0. Same same-uid
             // exposure the forkable golden already accepts (single-tenant).
-            if features.snapshot_dir.is_some() && (features.cuda || resources_for_config.cuda) {
+            if cuda_clone {
                 v.push(("SMOLVM_CUDA_CLONE_PTRACEABLE", "1".to_string()));
             }
             // Shared CUDA daemon: forward an explicit operator setting as-is.
@@ -2006,6 +2017,43 @@ impl AgentManager {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        // libkrun dlopen()s libkrunfw by bare soname at krun_start_enter time and
+        // carries no rpath, so the dynamic linker must be told where to look
+        // BEFORE the child launches — the loader caches its search path at
+        // process start, so the set_var the launcher does inside the child is too
+        // late for that inner dlopen. Point it at the dirs holding the libs: an
+        // explicit SMOLVM_LIB_DIR, the directory next to the boot binary (the
+        // bundled SDK ships smol-vmm beside libkrun/libkrunfw), and that dir's
+        // `lib/` subdir (the CLI tarball layout). Existing value is preserved.
+        // Without this, in-process embedders that don't inherit a wrapper's
+        // DYLD_LIBRARY_PATH (the Node/Bun SDK) fail every local boot with
+        // "Couldn't find or load libkrunfw" → krun_start_enter -2.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut search: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(dir) = std::env::var_os("SMOLVM_LIB_DIR") {
+                search.push(std::path::PathBuf::from(dir));
+            }
+            if let Some(parent) = boot_exe.parent() {
+                search.push(parent.to_path_buf());
+                search.push(parent.join("lib"));
+            }
+            let var = if cfg!(target_os = "macos") {
+                "DYLD_LIBRARY_PATH"
+            } else {
+                "LD_LIBRARY_PATH"
+            };
+            if let Some(existing) = std::env::var_os(var) {
+                if !existing.is_empty() {
+                    search.push(std::path::PathBuf::from(existing));
+                }
+            }
+            if !search.is_empty() {
+                if let Ok(joined) = std::env::join_paths(search) {
+                    cmd.env(var, joined);
+                }
+            }
+        }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
@@ -2792,6 +2840,14 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn kvm_enomem_retries_cover_multi_vcpu_fork_clones() {
+        assert!(should_retry_kvm_enomem(1, false));
+        assert!(should_retry_kvm_enomem(3, true));
+        assert!(!should_retry_kvm_enomem(3, false));
+    }
 
     // The distro-package case: the rootfs directory is not writable by the user
     // running smolvm, so the guest's marker write can never succeed. Detecting

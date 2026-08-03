@@ -70,6 +70,10 @@ pub struct ApiState {
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
+    /// Advisory wake-up for the automatic fork-pool reconciler. Durable SQLite
+    /// state remains authoritative; this only removes the polling delay after a
+    /// pool mutation while the periodic pass remains the recovery fallback.
+    pool_reconcile: Arc<tokio::sync::Notify>,
     /// Runtime registry for framework-aware fused rollout executors.
     rollout: crate::api::rollout::RolloutRegistry,
 }
@@ -236,6 +240,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         })
     }
@@ -253,6 +258,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         }
     }
@@ -261,6 +267,18 @@ impl ApiState {
     /// the atomic lease claim path.
     pub fn admission(&self) -> &crate::api::admission::AdmissionRegistry {
         &self.admission
+    }
+
+    /// Wake the automatic pool controller after durable pool state changes.
+    /// Notifications coalesce intentionally because every pass reconciles all
+    /// pools from SQLite and reservation transactions prevent overfill.
+    pub fn notify_pool_reconcile(&self) {
+        self.pool_reconcile.notify_one();
+    }
+
+    /// Shared notification consumed by the automatic pool controller.
+    pub(crate) fn pool_reconcile_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.pool_reconcile.clone()
     }
 
     /// Framework-aware fused rollout executors registered on this node.
@@ -1551,6 +1569,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt as _;
     use tempfile::TempDir;
 
     /// Create an ApiState with a temporary database for testing.
@@ -1559,6 +1578,18 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&path).unwrap();
         (dir, ApiState::with_db(db))
+    }
+
+    #[test]
+    fn pool_reconcile_notifications_are_retained_and_coalesced() {
+        let (_dir, state) = temp_api_state();
+        let notify = state.pool_reconcile_notify();
+
+        state.notify_pool_reconcile();
+        state.notify_pool_reconcile();
+
+        assert!(notify.notified().now_or_never().is_some());
+        assert!(notify.notified().now_or_never().is_none());
     }
 
     #[test]
