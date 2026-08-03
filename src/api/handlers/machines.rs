@@ -408,6 +408,11 @@ pub async fn create_machine(
             Some(token) => crate::registry::PullAuth::Identity(token.to_string()),
             None => crate::registry::PullAuth::Anonymous,
         };
+        // Reconcile claims against the machines that actually exist, so a
+        // discarded database cannot pin entries against the LRU forever.
+        if let Ok(vms) = state.db().list_vms() {
+            crate::image_store::sweep_refs(vms.iter().map(|(n, _)| n.as_str()));
+        }
         let machine = name.clone();
         // Blocking pull + extract; keep it off the async worker threads.
         let _ = tokio::task::spawn_blocking(move || {
@@ -2218,6 +2223,10 @@ pub(crate) async fn delete_one(
     let state_rm = state.clone();
     let name_rm = name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        // Release this machine's claim on its shared store entry, so the LRU may
+        // reclaim it once nothing boots from it. The entry itself is shared and
+        // stays. Mirrors the CLI delete path.
+        crate::image_store::forget_entry(&name_rm);
         match state_rm.remove_machine(&name_rm) {
             Ok(_) => Ok(()),
             Err(ApiError::NotFound(_)) => {
