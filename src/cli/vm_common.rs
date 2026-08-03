@@ -1304,19 +1304,9 @@ fn start_vm_named_with_db(
     }
     // Host-side image store: pull + extract a registry image ONCE into shared
     // overlay lowerdirs, so this and every other machine on that image skips both
-    // the in-guest pull and the per-VM flatten.
-    //
-    // On EVERY boot, not just the first: packed layers are a per-boot mount, not
-    // persistent machine state (the local-archive path above re-derives its dir
-    // the same way). A machine whose layers came from the store has no in-guest
-    // image to fall back on, so presenting them only once would leave every later
-    // start with no rootfs at all.
-    //
-    // Prefer the entry this machine already booted from — it is on disk, so a warm
-    // restart needs no registry round-trip and survives an outage. Re-resolve only
-    // when that entry is gone (first boot, or evicted). `ensure_image_blocking`
-    // returns `None` on any failure: it is a cache, so a miss falls through to the
-    // in-guest pull rather than failing the machine.
+    // the in-guest pull and the per-VM flatten. `prepare_layers` is the same
+    // implementation the API start path uses; a local caller gates with the
+    // host's own configured credentials.
     if features.packed_layers_dir.is_none() {
         if let Some(image) = record.image.as_deref() {
             // Reconcile claims against the machines that actually exist, so a
@@ -1324,28 +1314,13 @@ fn start_vm_named_with_db(
             if let Ok(vms) = db.list_vms() {
                 smolvm::image_store::sweep_refs(vms.iter().map(|(n, _)| n.as_str()));
             }
-            let entry = smolvm::image_store::remembered_entry(name).or_else(|| {
-                smolvm::image_store::ensure_image_blocking(
-                    image,
-                    &smolvm::registry::PullAuth::FromConfig,
-                )
-            });
-            if let Some(dir) = entry {
-                // Present it exactly as the pack store does: `packed_layers_dir`
-                // is an EMPTY per-machine mountpoint and `pack_idmap_source` is
-                // the shared content. While the uid drop is active `internal_boot`
-                // idmap-binds the source onto that mountpoint, mapping on-disk
-                // uid 0 to the VM's uid; pointing both at the same directory would
-                // ask it to bind the store onto itself. Without the drop the
-                // manager collapses the indirection on its own.
-                let mountpoint = smolvm::agent::machine_layers_cache_dir(name);
-                if let Err(e) = std::fs::create_dir_all(&mountpoint) {
-                    tracing::warn!(error = %e, "image store skipped: no layers mountpoint");
-                } else {
-                    smolvm::image_store::remember_entry(name, &dir);
-                    features.pack_idmap_source = Some(dir);
-                    features.packed_layers_dir = Some(mountpoint);
-                }
+            if let Some(layers) = smolvm::image_store::prepare_layers(
+                name,
+                Some(image),
+                Some(&smolvm::registry::PullAuth::FromConfig),
+            ) {
+                features.pack_idmap_source = Some(layers.idmap_source);
+                features.packed_layers_dir = Some(layers.mountpoint);
             }
         }
     }

@@ -265,6 +265,65 @@ where
     }
 }
 
+/// The shared layers to present to a machine, in the shape the packed-layers
+/// path already consumes.
+pub struct PreparedLayers {
+    /// The shared, content-addressed entry holding the extracted layers.
+    pub idmap_source: PathBuf,
+    /// The machine's own EMPTY mountpoint the source is bound onto.
+    pub mountpoint: PathBuf,
+}
+
+/// Resolve the layers `machine` should boot from, filling the store if needed.
+///
+/// The single implementation behind both the CLI and the API start paths — they
+/// differ only in the credential they gate with, never in the mechanics.
+///
+/// Call this on EVERY boot, not just the first: packed layers are a per-boot
+/// mount, not persistent machine state. A machine whose layers came from the
+/// store has no in-guest image to fall back on, so presenting them once would
+/// leave every later start with no rootfs at all.
+///
+/// Only a *fill* needs `image` and `auth`. Re-presenting the entry this machine
+/// already booted from needs neither: it is keyed by the machine, it passed the
+/// gate when it was filled, and it belongs to this machine alone. That is what
+/// lets a start path with no image reference in hand — an exec autostart, a
+/// supervisor restart — keep a store-backed machine bootable, and what lets a
+/// warm restart survive a registry outage.
+///
+/// `auth` is `None` when the caller holds no credential it may gate a fill with.
+/// That declines the fill rather than falling back to ambient host credentials,
+/// which on a shared node would authorize one tenant's cache hit with another's
+/// rights.
+///
+/// Returns `None` whenever the store cannot serve this machine. It is a cache,
+/// never a hard dependency, so every miss falls through to the in-guest pull.
+pub fn prepare_layers(
+    machine: &str,
+    image: Option<&str>,
+    auth: Option<&PullAuth>,
+) -> Option<PreparedLayers> {
+    let entry = match remembered_entry(machine) {
+        Some(entry) => entry,
+        None => ensure_image_blocking(image?, auth?)?,
+    };
+    // `mountpoint` must be an EMPTY per-machine directory and `idmap_source` the
+    // shared content. While the uid drop is active `internal_boot` idmap-binds
+    // the source onto that mountpoint, mapping on-disk uid 0 to the VM's uid;
+    // pointing both at the same directory would ask it to bind the store onto
+    // itself. Without the drop the manager collapses the indirection on its own.
+    let mountpoint = crate::agent::machine_layers_cache_dir(machine);
+    if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+        tracing::warn!(error = %e, "image store skipped: no layers mountpoint");
+        return None;
+    }
+    remember_entry(machine, &entry);
+    Some(PreparedLayers {
+        idmap_source: entry,
+        mountpoint,
+    })
+}
+
 /// Entry directory names that some machine still boots from.
 fn entries_in_use(root: &Path) -> std::collections::HashSet<std::ffi::OsString> {
     let mut used = std::collections::HashSet::new();
