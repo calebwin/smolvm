@@ -148,6 +148,7 @@ async fn activate_claimed_lease(
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
+            state.notify_pool_reconcile();
             return Err(message);
         }
         Err(error) => return Err(format!("pool worker lookup failed: {error:?}")),
@@ -182,6 +183,7 @@ async fn activate_claimed_lease(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
+        state.notify_pool_reconcile();
         return Err(format!(
             "pool worker was consumed and will be replaced after activation failed: {message}"
         ));
@@ -372,7 +374,9 @@ pub async fn create_pool(
             pool.name
         )));
     }
-    Ok(Json(pool_info(&state, pool).await?))
+    let info = pool_info(&state, pool).await?;
+    state.notify_pool_reconcile();
+    Ok(Json(info))
 }
 
 /// List automatic fork pools.
@@ -464,7 +468,9 @@ pub async fn resize_pool(
             "fork pool '{name}' is deleting"
         )));
     }
-    Ok(Json(pool_info(&state, pool).await?))
+    let info = pool_info(&state, pool).await?;
+    state.notify_pool_reconcile();
+    Ok(Json(info))
 }
 
 /// Begin asynchronous pool deletion.
@@ -500,7 +506,10 @@ pub async fn delete_pool(
         Some(false) => Err(ApiError::Conflict(format!(
             "fork pool '{name}' has active leases; complete them or use force=true"
         ))),
-        Some(true) => Ok(Json(DeleteResponse { deleted: name })),
+        Some(true) => {
+            state.notify_pool_reconcile();
+            Ok(Json(DeleteResponse { deleted: name }))
+        }
     }
 }
 
@@ -617,6 +626,10 @@ pub async fn acquire_lease(
         }
         ClaimForkPoolSlot::Claimed(lease) => lease,
     };
+    // The durable claim removed one ready slot. Start its replacement while
+    // payload staging and guest activation proceed instead of waiting for the
+    // next periodic controller pass.
+    state.notify_pool_reconcile();
 
     // Reflect the durable claim in the in-memory fast path before publishing
     // the guest release marker. The authoritative held bit is already false in
@@ -725,6 +738,7 @@ pub async fn heartbeat_lease(
         .await
         .map_err(|e| ApiError::internal(format!("failed lease task failed: {e}")))?
         .map_err(ApiError::database)?;
+        state.notify_pool_reconcile();
         return Err(ApiError::Conflict(format!(
             "fork lease '{lease_id}' worker is no longer running"
         )));
@@ -771,6 +785,7 @@ pub async fn complete_lease(
             lease.state.as_str()
         )));
     }
+    state.notify_pool_reconcile();
     Ok(Json(lease_info(lease)))
 }
 
