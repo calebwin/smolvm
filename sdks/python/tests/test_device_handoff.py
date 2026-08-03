@@ -102,7 +102,7 @@ class DeviceHandoffTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             deadline = time.monotonic() + 2
-            while not path.exists():
+            while not server.ready:
                 if time.monotonic() > deadline:
                     self.fail("device adapter server did not bind")
                 time.sleep(0.01)
@@ -189,7 +189,7 @@ class DeviceHandoffTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             deadline = time.monotonic() + 2
-            while not path.exists():
+            while not server.ready:
                 if time.monotonic() > deadline:
                     self.fail("device adapter server did not bind")
                 time.sleep(0.01)
@@ -256,7 +256,7 @@ class DeviceHandoffTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             deadline = time.monotonic() + 2
-            while not path.exists():
+            while not server.ready:
                 if time.monotonic() > deadline:
                     self.fail("device adapter server did not bind")
                 time.sleep(0.01)
@@ -315,7 +315,7 @@ class DeviceHandoffTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             deadline = time.monotonic() + 2
-            while not path.exists():
+            while not server.ready:
                 if time.monotonic() > deadline:
                     self.fail("device adapter server did not bind")
                 time.sleep(0.01)
