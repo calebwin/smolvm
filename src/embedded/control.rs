@@ -131,6 +131,21 @@ pub(crate) struct StartedVm {
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
 fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<StartedVm> {
     let mut features = features;
+    // Present the host image store's shared layers, through the same
+    // `prepare_layers` the CLI and API start paths use. An embedded host is the
+    // machine's own owner, so it gates a fill with its configured credentials —
+    // and a machine already filled elsewhere is re-presented from its
+    // back-reference, which it must be: those layers are its only rootfs.
+    if features.packed_layers_dir.is_none() {
+        if let Some(layers) = crate::image_store::prepare_layers(
+            &record.name,
+            record.image.as_deref(),
+            Some(&crate::registry::PullAuth::FromConfig),
+        ) {
+            features.pack_idmap_source = Some(layers.idmap_source);
+            features.packed_layers_dir = Some(layers.mountpoint);
+        }
+    }
     if record.forkable_on_start() {
         features.forkable = true;
     }
