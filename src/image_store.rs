@@ -151,6 +151,8 @@ pub fn can_extract() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Non-Unix hosts cannot create the device nodes overlayfs whiteouts require,
+/// so the store never serves them and the caller keeps the in-guest pull.
 #[cfg(not(unix))]
 pub fn can_extract() -> bool {
     false
