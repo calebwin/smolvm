@@ -439,6 +439,15 @@ fn flatten_and_export(
     // overlayfs wants topmost-first in `lowerdir=`.
     let base_chain: Vec<&str> = lowers.iter().rev().map(String::as_str).collect();
     let base_chain = base_chain.join(":");
+    // The producer of these layers declares its opaque-marker namespace in a file
+    // beside them; the layer dirs are siblings under one parent, so derive it from
+    // the first lower. Absent → `trusted.*`, i.e. every pre-existing pack.
+    let marker_path = std::path::Path::new(&lowers[0])
+        .parent()
+        .map(|d| d.join("opaque-xattr"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+        .display()
+        .to_string();
 
     println!(
         "Flattening {} layer(s) + container overlay...",
@@ -455,12 +464,22 @@ fn flatten_and_export(
            tar cf /storage/flat-export.tar -C \"${{low%%:*}}\" .\n\
          else\n\
            mkdir -p /tmp/flatview\n\
-           mount -t overlay overlay -o lowerdir=\"$low\" /tmp/flatview\n\
+           xopt=\"\"\n\
+           if [ \"$(cat {marker} 2>/dev/null)\" = user ]; then xopt=\",userxattr\"; fi\n\
+           mount -t overlay overlay -o lowerdir=\"$low\"\"$xopt\" /tmp/flatview\n\
            tar cf /storage/flat-export.tar -C /tmp/flatview .\n\
            umount /tmp/flatview\n\
          fi\n\
          echo FLAT_OK\n",
         n = lowers.len(),
+        // Layers extracted on the HOST mark opaque directories in the `user.*`
+        // namespace (the unprivileged virtiofs server that serves them cannot see
+        // `trusted.*`), and the kernel only consults that namespace under
+        // `userxattr`. Without matching here the merged view would silently show
+        // content a replaced directory had removed — and this tar becomes an
+        // exported artifact, so those files would travel to a registry.
+        // No marker means `trusted.*`, which is every pre-existing pack.
+        marker = marker_path,
     );
     let (exit_code, stdout, stderr) = client.vm_exec(
         vec!["sh".to_string(), "-c".to_string(), script],
