@@ -200,6 +200,104 @@ pub fn ensure_image_blocking(reference: &str, auth: &PullAuth) -> Option<PathBuf
     }
 }
 
+/// A machine's back-reference file: records which entry served it.
+///
+/// The name is dot-prefixed so `prune_store` skips it as a non-content entry,
+/// the same way it skips the fill locks.
+fn ref_path(machine: &str) -> PathBuf {
+    let safe: String = machine
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    ImageStore::shared().root.join(format!(".ref-{safe}"))
+}
+
+/// Record that `machine` boots from `entry`, so later starts can re-present the
+/// same layers without a registry round-trip, and so the LRU knows the entry is
+/// in use.
+pub fn remember_entry(machine: &str, entry: &Path) {
+    let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if let Err(e) = std::fs::write(ref_path(machine), name) {
+        tracing::debug!(error = %e, "image store: could not record machine back-reference");
+    }
+}
+
+/// The entry `machine` last booted from, if it is still present.
+///
+/// Returning it lets a warm restart re-present layers that are already on disk,
+/// so a machine survives a registry outage instead of depending on it.
+pub fn remembered_entry(machine: &str) -> Option<PathBuf> {
+    let name = std::fs::read_to_string(ref_path(machine)).ok()?;
+    let name = name.trim();
+    // Reject anything that is not a bare entry directory name: the file is
+    // host-local, but a path component here would escape the store root.
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    let dir = ImageStore::shared().root.join(name);
+    dir.is_dir().then_some(dir)
+}
+
+/// Drop `machine`'s claim on its entry, so the LRU may reclaim it.
+pub fn forget_entry(machine: &str) {
+    let _ = std::fs::remove_file(ref_path(machine));
+}
+
+/// Drop claims held by machines that no longer exist.
+///
+/// `delete_vm` releases a claim on the normal path, but a machine can also
+/// vanish without it — a restored or discarded database, a data dir removed by
+/// hand. A claim left behind pins its entry against the LRU forever, which is
+/// exactly the unbounded growth the size cap exists to prevent, so reconcile
+/// against the live machine list on start.
+pub fn sweep_refs<I, S>(live: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let live: std::collections::HashSet<PathBuf> =
+        live.into_iter().map(|m| ref_path(m.as_ref())).collect();
+    let root = ImageStore::shared().root;
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if !e.file_name().to_string_lossy().starts_with(".ref-") {
+            continue;
+        }
+        if !live.contains(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Entry directory names that some machine still boots from.
+fn entries_in_use(root: &Path) -> std::collections::HashSet<std::ffi::OsString> {
+    let mut used = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return used;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().starts_with(".ref-") {
+            continue;
+        }
+        if let Ok(target) = std::fs::read_to_string(e.path()) {
+            used.insert(std::ffi::OsString::from(target.trim()));
+        }
+    }
+    used
+}
+
 /// The outcome of the auth gate.
 struct Resolved {
     client: smolvm_registry::RegistryClient,
@@ -421,11 +519,19 @@ fn prune_store(root: &Path, max_bytes: u64, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
+    // Entries a machine still boots from are pinned. Evicting one does not just
+    // cost a re-pull: the machine's layers ARE those directories, so removing
+    // them leaves it unable to start with nothing to fall back on.
+    let in_use = entries_in_use(root);
     let mut items: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     let mut total = 0u64;
     for e in entries.flatten() {
         let path = e.path();
         let name = e.file_name();
+        if in_use.contains(&name) {
+            total += dir_size(&path);
+            continue;
+        }
         let name = name.to_string_lossy();
         // Only content entries participate; locks and staging are not evictable.
         if name.starts_with('.') || !path.is_dir() {
