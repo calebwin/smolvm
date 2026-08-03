@@ -424,13 +424,13 @@ mod tests {
         // Guest: privileged local reader, so trusted.* — and it must keep image
         // ownership, since it is root and images ship non-root-owned paths.
         assert_eq!(ExtractOptions::GUEST.opaque_xattr, OpaqueXattr::Trusted);
-        assert!(ExtractOptions::GUEST.preserve_ownership);
+        const { assert!(ExtractOptions::GUEST.preserve_ownership) };
         assert_eq!(OpaqueXattr::Trusted.name(), "trusted.overlay.opaque");
 
         // Host-shared: read by an UNPRIVILEGED virtiofs server through an
         // idmapped mount, so user.* and no ownership preservation.
         assert_eq!(ExtractOptions::HOST_SHARED.opaque_xattr, OpaqueXattr::User);
-        assert!(!ExtractOptions::HOST_SHARED.preserve_ownership);
+        const { assert!(!ExtractOptions::HOST_SHARED.preserve_ownership) };
         assert_eq!(OpaqueXattr::User.name(), "user.overlay.opaque");
     }
 
