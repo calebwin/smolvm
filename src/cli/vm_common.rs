@@ -1427,6 +1427,11 @@ fn start_vm_named_with_db(
         }
     }
 
+    // Whether the guest's layers are already mounted via virtiofs. Captured here
+    // because `features` is moved into the launch below, and the in-guest pull
+    // further down must be skipped exactly when this is true.
+    let uses_packed_layers = features.packed_layers_dir.is_some();
+
     // First boot pulls the base image in-guest, subject to the egress filter —
     // fold the image's registry into the enforced policy so a hostname scope
     // doesn't block its own pull. Subsequent starts skip the pull, so they keep
@@ -1467,11 +1472,12 @@ fn start_vm_named_with_db(
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let uses_packed_layers = record.source_smolmachine.is_some()
-            || record
-                .image
-                .as_deref()
-                .is_some_and(smolvm::data::image_source::is_local_ref);
+        // `uses_packed_layers` comes from the launch features (captured above), not
+        // re-derived from the record: `packed_layers_dir` is the one place that
+        // knows whether layers are already mounted, and it is set from three
+        // sources (a `.smolmachine`, a local image archive, and the image store).
+        // Re-deriving here would miss any source it does not enumerate, and the
+        // machine would pull in-guest even though the layers are already there.
         let image_info = if uses_packed_layers {
             // Layers already mounted via virtiofs — no pull needed.
             None
