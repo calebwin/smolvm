@@ -1533,8 +1533,25 @@ pub(crate) async fn fork_held_machines_inner(
 
     drop(guards);
     Ok(ForkBatchOutcome {
-        retained_snapshot: any_succeeded.then_some(reusable_snapshot).flatten(),
+        retained_snapshot: retained_snapshot_after_boots(
+            snapshot_reused,
+            any_succeeded,
+            reusable_snapshot,
+        ),
     })
+}
+
+fn retained_snapshot_after_boots(
+    snapshot_reused: bool,
+    any_succeeded: bool,
+    reusable_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
+) -> Option<crate::agent::fork::RetainedForkSnapshot> {
+    // A failed boot does not invalidate a checkpoint that preparation just
+    // verified against the paused golden. Keep it so a transient KVM or guest
+    // readiness failure cannot strand that golden without a refill path.
+    (snapshot_reused || any_succeeded)
+        .then_some(reusable_snapshot)
+        .flatten()
 }
 
 async fn run_bounded_futures<F, T>(
@@ -2670,6 +2687,40 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    fn retained_snapshot() -> crate::agent::fork::RetainedForkSnapshot {
+        crate::agent::fork::RetainedForkSnapshot {
+            path: std::path::PathBuf::from("/golden/s/12345678"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        }
+    }
+
+    #[test]
+    fn failed_reused_checkpoint_remains_available_for_retry() {
+        let snapshot = retained_snapshot();
+        assert_eq!(
+            retained_snapshot_after_boots(true, false, Some(snapshot.clone())),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn failed_new_checkpoint_is_not_retained() {
+        assert_eq!(
+            retained_snapshot_after_boots(false, false, Some(retained_snapshot())),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_new_checkpoint_is_retained() {
+        let snapshot = retained_snapshot();
+        assert_eq!(
+            retained_snapshot_after_boots(false, true, Some(snapshot.clone())),
+            Some(snapshot)
+        );
+    }
 
     #[tokio::test]
     async fn bounded_futures_stream_results_without_exceeding_the_limit() {
