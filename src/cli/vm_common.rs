@@ -1306,17 +1306,31 @@ fn start_vm_named_with_db(
     // overlay lowerdirs, so this and every other machine on that image skips both
     // the in-guest pull and the per-VM flatten.
     //
-    // Only on a machine's FIRST boot: once `init_completed` is set the layers are
-    // already established, and re-resolving would make every later start depend on
-    // the registry being reachable. `ensure_image_blocking` returns `None` on any
-    // failure — it is a cache, so a miss falls through to the in-guest pull rather
-    // than failing the machine.
-    if features.packed_layers_dir.is_none() && !record.init_completed {
+    // On EVERY boot, not just the first: packed layers are a per-boot mount, not
+    // persistent machine state (the local-archive path above re-derives its dir
+    // the same way). A machine whose layers came from the store has no in-guest
+    // image to fall back on, so presenting them only once would leave every later
+    // start with no rootfs at all.
+    //
+    // Prefer the entry this machine already booted from — it is on disk, so a warm
+    // restart needs no registry round-trip and survives an outage. Re-resolve only
+    // when that entry is gone (first boot, or evicted). `ensure_image_blocking`
+    // returns `None` on any failure: it is a cache, so a miss falls through to the
+    // in-guest pull rather than failing the machine.
+    if features.packed_layers_dir.is_none() {
         if let Some(image) = record.image.as_deref() {
-            if let Some(dir) = smolvm::image_store::ensure_image_blocking(
-                image,
-                &smolvm::registry::PullAuth::FromConfig,
-            ) {
+            // Reconcile claims against the machines that actually exist, so a
+            // discarded database cannot pin entries against the LRU forever.
+            if let Ok(vms) = db.list_vms() {
+                smolvm::image_store::sweep_refs(vms.iter().map(|(n, _)| n.as_str()));
+            }
+            let entry = smolvm::image_store::remembered_entry(name).or_else(|| {
+                smolvm::image_store::ensure_image_blocking(
+                    image,
+                    &smolvm::registry::PullAuth::FromConfig,
+                )
+            });
+            if let Some(dir) = entry {
                 // Present it exactly as the pack store does: `packed_layers_dir`
                 // is an EMPTY per-machine mountpoint and `pack_idmap_source` is
                 // the shared content. While the uid drop is active `internal_boot`
@@ -1328,6 +1342,7 @@ fn start_vm_named_with_db(
                 if let Err(e) = std::fs::create_dir_all(&mountpoint) {
                     tracing::warn!(error = %e, "image store skipped: no layers mountpoint");
                 } else {
+                    smolvm::image_store::remember_entry(name, &dir);
                     features.pack_idmap_source = Some(dir);
                     features.packed_layers_dir = Some(mountpoint);
                 }
@@ -2094,6 +2109,10 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             name,
         ));
     }
+
+    // Release this machine's claim on its shared store entry, so the LRU may
+    // reclaim it once nothing boots from it. The entry itself is shared and stays.
+    smolvm::image_store::forget_entry(name);
 
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
