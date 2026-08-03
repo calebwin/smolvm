@@ -1419,10 +1419,20 @@ fn start_vm_named_with_db(
                 image,
                 &smolvm::registry::PullAuth::FromConfig,
             ) {
-                // The store is root-owned and the VMM drops to a per-VM uid before
-                // serving virtiofs, so it needs the same idmap the pack store uses.
-                features.pack_idmap_source = Some(dir.clone());
-                features.packed_layers_dir = Some(dir);
+                // Present it exactly as the pack store does: `packed_layers_dir`
+                // is an EMPTY per-machine mountpoint and `pack_idmap_source` is
+                // the shared content. While the uid drop is active `internal_boot`
+                // idmap-binds the source onto that mountpoint, mapping on-disk
+                // uid 0 to the VM's uid; pointing both at the same directory would
+                // ask it to bind the store onto itself. Without the drop the
+                // manager collapses the indirection on its own.
+                let mountpoint = smolvm::agent::machine_layers_cache_dir(name);
+                if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+                    tracing::warn!(error = %e, "image store skipped: no layers mountpoint");
+                } else {
+                    features.pack_idmap_source = Some(dir);
+                    features.packed_layers_dir = Some(mountpoint);
+                }
             }
         }
     }
