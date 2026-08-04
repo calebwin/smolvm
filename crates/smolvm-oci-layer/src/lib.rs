@@ -321,6 +321,14 @@ pub fn extract_oci_layer<R: Read>(
     archive.set_preserve_ownerships(opts.preserve_ownership);
     archive.set_overwrite(true);
 
+    // Directory modes are restored AFTER all entries are written. The loop below
+    // force-opens each parent to 0755 so restrictive directories cannot block the
+    // extraction of their own contents; without this deferred pass those widened
+    // modes would be what the image ships with, silently turning a 0700 directory
+    // (a private PGDATA, an .ssh, a secrets dir) world-readable.
+    #[cfg(unix)]
+    let mut deferred_dir_modes: Vec<(std::path::PathBuf, u32)> = Vec::new();
+
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -388,6 +396,13 @@ pub fn extract_oci_layer<R: Read>(
             }
         }
 
+        #[cfg(unix)]
+        if entry.header().entry_type() == tar::EntryType::Directory {
+            if let Ok(mode) = entry.header().mode() {
+                deferred_dir_modes.push((full_path.clone(), mode));
+            }
+        }
+
         if let Err(e) = entry.unpack_in(dest) {
             // Regular files and directories failing is a real error; non-regular
             // entries (symlinks, device nodes, fifos) can fail benignly — skip.
@@ -404,6 +419,19 @@ pub fn extract_oci_layer<R: Read>(
                 _ => {
                     warn!(path = %path.display(), error = %e, "skipping non-regular layer entry");
                 }
+            }
+        }
+    }
+
+    // Deepest first: a parent re-tightened before its children were written would
+    // block them, so this runs only once every entry is on disk.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        deferred_dir_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+        for (path, mode) in deferred_dir_modes {
+            if path.is_dir() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
             }
         }
     }
@@ -562,5 +590,42 @@ mod tests {
                 .collect();
             assert_eq!(names, vec!["hello".to_string()], "{label} entry list");
         }
+    }
+
+    /// A layer that ships a 0700 directory containing a file must keep 0700 after
+    /// extraction. The extractor force-opens parents to 0755 so restrictive
+    /// directories cannot block their own contents; without the deferred restore
+    /// that widening is what survives, silently exposing private directories.
+    #[cfg(unix)]
+    #[test]
+    fn restrictive_directory_modes_survive_extraction() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_mode(0o700);
+        dir.set_size(0);
+        tar.append_data(&mut dir, "private/", std::io::empty()).unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_mode(0o600);
+        file.set_size(3);
+        tar.append_data(&mut file, "private/secret", &b"hi\n"[..]).unwrap();
+        let archive = tar.into_inner().unwrap();
+
+        extract_oci_layer(
+            std::io::Cursor::new(archive),
+            &dest,
+            ExtractOptions::HOST_SHARED,
+        )
+        .unwrap();
+
+        let got = std::fs::metadata(dest.join("private")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(got, 0o700, "directory mode widened to {got:o}");
+        assert!(dest.join("private/secret").is_file(), "contents still extracted");
     }
 }
