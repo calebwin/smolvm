@@ -7,8 +7,10 @@ import json
 import os
 import ssl
 import struct
+import threading
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -57,7 +59,13 @@ def adapter_sha256(directory: str | os.PathLike[str]) -> str:
 
 
 class RolloutClient:
-    """Synchronous rollout client designed for framework generation boundaries."""
+    """Synchronous rollout client designed for framework generation boundaries.
+
+    Direct smolvm batch forks automatically form one rollout cohort per call.
+    Automatic cohorts release the members that arrive within a bounded window
+    so one straggler cannot stall the rest of the batch. Set
+    ``auto_fork_cohort=False`` when batch members intentionally diverge.
+    """
 
     def __init__(
         self,
@@ -66,11 +74,84 @@ class RolloutClient:
         *,
         timeout: float = 300.0,
         ssl_context: ssl.SSLContext | None = None,
+        auto_fork_cohort: bool = True,
+        auto_fork_cohort_max_wait_ms: int | None = 250,
     ) -> None:
+        if not isinstance(auto_fork_cohort, bool):
+            raise ValueError("auto_fork_cohort must be a boolean")
+        if auto_fork_cohort_max_wait_ms is not None and (
+            not isinstance(auto_fork_cohort_max_wait_ms, int)
+            or isinstance(auto_fork_cohort_max_wait_ms, bool)
+            or not 1 <= auto_fork_cohort_max_wait_ms <= 60_000
+        ):
+            raise ValueError(
+                "auto_fork_cohort_max_wait_ms must be between 1 and 60000"
+            )
         self.api_url = api_url.rstrip("/")
         self.executor = executor
         self.timeout = timeout
         self.ssl_context = ssl_context
+        self.auto_fork_cohort = auto_fork_cohort
+        self.auto_fork_cohort_max_wait_ms = auto_fork_cohort_max_wait_ms
+        self._fork_cohort_lock = threading.Lock()
+        self._fork_cohort_round = 0
+        self._fork_cohorts: OrderedDict[
+            str, tuple[str, int, int | None]
+        ] = OrderedDict()
+
+    def _automatic_fork_cohort(
+        self, idempotency_key: str
+    ) -> tuple[str, int, int | None] | None:
+        if not self.auto_fork_cohort:
+            return None
+        batch_id = os.environ.get("SMOLVM_FORK_BATCH_ID")
+        batch_size_text = os.environ.get("SMOLVM_FORK_BATCH_SIZE")
+        if batch_id is None and batch_size_text is None:
+            return None
+        if not batch_id or batch_size_text is None:
+            raise ValueError(
+                "SMOLVM_FORK_BATCH_ID and SMOLVM_FORK_BATCH_SIZE must be set together"
+            )
+        try:
+            batch_size = int(batch_size_text)
+        except ValueError as error:
+            raise ValueError("SMOLVM_FORK_BATCH_SIZE must be an integer") from error
+        if not 2 <= batch_size <= 1024:
+            raise ValueError("SMOLVM_FORK_BATCH_SIZE must be between 2 and 1024")
+        group_index = 0
+        group_size = batch_size
+        if batch_size > 256:
+            fork_index_text = os.environ.get("SMOLVM_FORK_INDEX")
+            try:
+                fork_index = int(fork_index_text or "")
+            except ValueError as error:
+                raise ValueError(
+                    "SMOLVM_FORK_INDEX is required for batches larger than 256"
+                ) from error
+            if not 0 <= fork_index < batch_size:
+                raise ValueError("SMOLVM_FORK_INDEX is outside the fork batch")
+            group_index = fork_index // 256
+            group_size = min(256, batch_size - group_index * 256)
+
+        with self._fork_cohort_lock:
+            cached = self._fork_cohorts.get(idempotency_key)
+            if cached is not None:
+                self._fork_cohorts.move_to_end(idempotency_key)
+                return cached
+            round_index = self._fork_cohort_round
+            self._fork_cohort_round += 1
+            digest = hashlib.sha256(
+                f"{batch_id}\0{self.executor}\0{group_index}\0{round_index}".encode()
+            ).hexdigest()
+            cohort = (
+                f"fork-{digest[:32]}",
+                group_size,
+                self.auto_fork_cohort_max_wait_ms,
+            )
+            self._fork_cohorts[idempotency_key] = cohort
+            if len(self._fork_cohorts) > 1024:
+                self._fork_cohorts.popitem(last=False)
+            return cohort
 
     def _request(
         self,
@@ -267,6 +348,7 @@ class RolloutClient:
         deadline_ms: int | None = None,
         cohort_id: str | None = None,
         cohort_size: int | None = None,
+        cohort_max_wait_ms: int | None = None,
         **sampling: Any,
     ) -> dict[str, Any]:
         """Build a generation job for `generate` or a cross-policy cohort."""
@@ -300,6 +382,8 @@ class RolloutClient:
             job["deadlineMs"] = deadline_ms
         if (cohort_id is None) != (cohort_size is None):
             raise ValueError("cohort_id and cohort_size must be set together")
+        if cohort_id is None and cohort_max_wait_ms is not None:
+            raise ValueError("cohort_max_wait_ms requires a cohort")
         if cohort_id is not None:
             if not cohort_id:
                 raise ValueError("cohort_id cannot be empty")
@@ -307,11 +391,28 @@ class RolloutClient:
                 raise ValueError("cohort_size must be an integer")
             if not 1 <= cohort_size <= 256:
                 raise ValueError("cohort_size must be between 1 and 256")
+            if cohort_max_wait_ms is not None and (
+                not isinstance(cohort_max_wait_ms, int)
+                or isinstance(cohort_max_wait_ms, bool)
+                or not 1 <= cohort_max_wait_ms <= 60_000
+            ):
+                raise ValueError("cohort_max_wait_ms must be between 1 and 60000")
             job["cohort"] = {"id": cohort_id, "size": cohort_size}
+            if cohort_max_wait_ms is not None:
+                job["cohort"]["maxWaitMs"] = cohort_max_wait_ms
         return job
 
     def generate(self, **job: Any) -> dict[str, Any]:
         """Generate through one policy, returning exact token IDs and logprobs."""
+
+        if not {"cohort_id", "cohort_size", "cohort_max_wait_ms"}.intersection(job):
+            cohort = self._automatic_fork_cohort(job.get("idempotency_key", ""))
+            if cohort is not None:
+                (
+                    job["cohort_id"],
+                    job["cohort_size"],
+                    job["cohort_max_wait_ms"],
+                ) = cohort
 
         return self._request(
             "POST",
