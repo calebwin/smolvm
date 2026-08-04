@@ -53,6 +53,30 @@ pub fn control_socket_cmd(sock: &Path, cmd: &str) -> Result<String> {
     Ok(reply)
 }
 
+/// Workload preparation choices inherited by every clone of one golden.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ForkpointProfile {
+    /// Load the golden's staged CUDA modules while each clone worker boots.
+    pub cuda_preload_modules: bool,
+}
+
+fn parse_forkpoint_profile(marker: &[u8]) -> ForkpointProfile {
+    let hint = smolvm_protocol::forkpoint::CUDA_PRELOAD_MODULES_HINT.as_bytes();
+    ForkpointProfile {
+        cuda_preload_modules: marker.split(|byte| *byte == b'\n').any(|line| line == hint),
+    }
+}
+
+fn persist_forkpoint_profile(golden: &str, profile: ForkpointProfile) -> Result<()> {
+    let updated = SmolvmDb::open()?.update_vm(golden, |record| {
+        record.cuda_preload_modules = profile.cuda_preload_modules;
+    })?;
+    if updated.is_none() {
+        return Err(Error::vm_not_found(golden));
+    }
+    Ok(())
+}
+
 /// Wait until the golden workload reaches the standard live-fork boundary.
 ///
 /// The workload signals this by calling `smolvm-fork-ready`, which writes the
@@ -78,8 +102,8 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("wait for forkpoint", format!("agent connect: {e}")))?;
     let script = format!(
-        "while [ ! -f '{}' ]; do sleep 0.05; done",
-        smolvm_protocol::forkpoint::READY_PATH
+        "while [ ! -f '{ready}' ]; do sleep 0.05; done; cat '{ready}'",
+        ready = smolvm_protocol::forkpoint::READY_PATH,
     );
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), script],
@@ -88,7 +112,11 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
         Some(timeout),
         None,
     ) {
-        Ok((0, _, _)) => Ok(()),
+        Ok((0, stdout, _)) => {
+            let profile = parse_forkpoint_profile(&stdout);
+            persist_forkpoint_profile(golden, profile)?;
+            Ok(())
+        }
         Ok((code, _, stderr)) => Err(Error::agent(
             "wait for forkpoint",
             format!(
@@ -1322,6 +1350,19 @@ mod tests {
         assert!(fork_base_already_paused("OK paused\n"));
         assert!(!fork_base_already_paused("OK running\n"));
         assert!(!fork_base_already_paused("ERR not forkable\n"));
+    }
+
+    #[test]
+    fn forkpoint_profile_parses_optional_cuda_preload_hint() {
+        assert_eq!(
+            parse_forkpoint_profile(b"smolvm-forkpoint-v1\n"),
+            ForkpointProfile::default()
+        );
+        assert!(
+            parse_forkpoint_profile(b"smolvm-forkpoint-v1\ncuda-preload-modules\n")
+                .cuda_preload_modules
+        );
+        assert!(!parse_forkpoint_profile(b"cuda-preload-modules-extra\n").cuda_preload_modules);
     }
 
     #[test]

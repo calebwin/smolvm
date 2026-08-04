@@ -3890,6 +3890,7 @@ fn route_clone_connection(
         return consumed;
     }
     let share_weights = flags & 1 != 0;
+    let preload_modules = flags & 4 != 0;
     // Warm dial (flag bit 1): the clone VM's proxy dials at STARTUP so worker
     // spawn (CUDA init + memory reconstruction + module/graph pre-warm) runs
     // concurrent with guest resume instead of on the guest's first CUDA call.
@@ -3956,6 +3957,7 @@ fn route_clone_connection(
             fd,
             *token,
             share_weights,
+            preload_modules,
             ring_dir,
             procmem.clone(),
             *options,
@@ -4131,6 +4133,7 @@ fn route_clone_connection(
         fd,
         token,
         share_weights,
+        preload_modules,
         ring_dir,
         procmem.clone(),
         *options,
@@ -5243,6 +5246,7 @@ fn spawn_clone_worker(
     conn_fd: std::os::unix::io::RawFd,
     token: u64,
     share_weights: bool,
+    preload_modules: bool,
     ring_dir: Option<&str>,
     procmem: Option<ProcMemAdvert>,
     options: ServeOptions,
@@ -5768,6 +5772,12 @@ fn spawn_clone_worker(
             std::ffi::OsString::from(ctrl_slot.to_string()),
         ),
     ];
+    if preload_modules {
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_PRELOAD_MODULES"),
+            std::ffi::OsString::from("1"),
+        ));
+    }
     if publish_enabled {
         worker_env.push((
             std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PUBLISH_CTRL"),

@@ -6,6 +6,12 @@ pub const STATE_DIR: &str = "/run/smolvm/forkpoint";
 /// Marker written by the workload when it reaches a safe fork boundary.
 pub const READY_PATH: &str = "/run/smolvm/forkpoint/ready";
 
+/// First line of every supported forkpoint readiness marker.
+pub const READY_VERSION: &str = "smolvm-forkpoint-v1";
+
+/// Optional readiness-marker capability requesting eager clone module loading.
+pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
+
 /// Marker written after a restored clone can safely enter ordinary timed waits.
 pub const RESTORED_PATH: &str = "/run/smolvm/forkpoint/restored";
 

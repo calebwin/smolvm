@@ -526,6 +526,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_vram_limit_mib: Option<u64>,
 
+    /// Preload this fork lineage's staged CUDA modules while clone workers boot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cuda_preload_modules: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket in
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     #[serde(default)]
@@ -655,6 +659,7 @@ impl VmRecord {
             cuda: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
+            cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -716,6 +721,7 @@ impl VmRecord {
             cuda: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
+            cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -1304,11 +1310,13 @@ mod tests {
         record.cuda = true;
         record.cuda_fork_pool_size = Some(4);
         record.cuda_vram_limit_mib = Some(10240);
+        record.cuda_preload_modules = true;
 
         let encoded = serde_json::to_vec(&record).unwrap();
         let decoded: VmRecord = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.cuda_fork_pool_size, Some(4));
         assert_eq!(decoded.cuda_vram_limit_mib, Some(10240));
+        assert!(decoded.cuda_preload_modules);
 
         let mut legacy_value = serde_json::to_value(VmRecord::new(
             "legacy".to_string(),
@@ -1322,9 +1330,11 @@ mod tests {
         let legacy_object = legacy_value.as_object_mut().unwrap();
         legacy_object.remove("cuda_fork_pool_size");
         legacy_object.remove("cuda_vram_limit_mib");
+        legacy_object.remove("cuda_preload_modules");
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert_eq!(legacy.cuda_fork_pool_size, None);
         assert_eq!(legacy.cuda_vram_limit_mib, None);
+        assert!(!legacy.cuda_preload_modules);
     }
 
     #[test]

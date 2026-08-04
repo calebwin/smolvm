@@ -1798,6 +1798,9 @@ impl AgentManager {
                 // golden's loaded weights instead of copying them.
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
+            if features.cuda_preload_modules {
+                v.push(("SMOLVM_CUDA_CLONE_PRELOAD_MODULES", "1".to_string()));
+            }
             if let Some(pool_size) = features.cuda_fork_pool_size {
                 v.push((
                     smolvm_protocol::guest_env::CUDA_FORK_POOL_SIZE,

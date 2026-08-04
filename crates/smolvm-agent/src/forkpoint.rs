@@ -12,10 +12,9 @@ use std::time::Duration;
 
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
-    FORK_ENV_PATH, HELPER_PATH, READY_PATH, RELEASE_PATH, RESTORED_PATH, STATE_DIR,
-    WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+    CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, HELPER_PATH, READY_PATH, READY_VERSION, RELEASE_PATH,
+    RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
 };
-const READY_CONTENT: &[u8] = b"smolvm-forkpoint-v1\n";
 
 fn enabled() -> bool {
     std::env::var(smolvm_protocol::guest_env::FORKABLE).as_deref()
@@ -94,20 +93,22 @@ fn inject_into_container_if(
 
 /// Mark the workload ready and block until this VM is a released clone.
 pub fn run_helper() -> i32 {
-    if let Err(error) = run_helper_inner() {
+    let preload_modules = std::env::args_os().any(|argument| argument == "--cuda-preload-modules");
+    if let Err(error) = run_helper_inner(preload_modules) {
         eprintln!("smolvm-fork-ready: {error}");
         return 1;
     }
     0
 }
 
-fn run_helper_inner() -> Result<(), String> {
+fn run_helper_inner(preload_modules: bool) -> Result<(), String> {
     run_helper_at(
         Path::new(STATE_DIR),
         Path::new(READY_PATH),
         Path::new(RESTORED_PATH),
         Path::new(RELEASE_PATH),
         Duration::from_millis(20),
+        preload_modules,
     )
 }
 
@@ -117,19 +118,30 @@ fn run_helper_at(
     restored_path: &Path,
     release_path: &Path,
     poll_interval: Duration,
+    preload_modules: bool,
 ) -> Result<(), String> {
     std::fs::create_dir_all(state_dir)
         .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
     let _ = std::fs::remove_file(release_path);
 
-    let mut ready = std::fs::File::create(ready_path)
-        .map_err(|error| format!("create {}: {error}", ready_path.display()))?;
+    let ready_temp = state_dir.join(format!(".ready.{}.tmp", std::process::id()));
+    let mut ready = std::fs::File::create(&ready_temp)
+        .map_err(|error| format!("create {}: {error}", ready_temp.display()))?;
+    let ready_content = ready_content(preload_modules);
     ready
-        .write_all(READY_CONTENT)
-        .map_err(|error| format!("write {}: {error}", ready_path.display()))?;
+        .write_all(ready_content.as_bytes())
+        .map_err(|error| format!("write {}: {error}", ready_temp.display()))?;
     ready
         .sync_all()
-        .map_err(|error| format!("sync {}: {error}", ready_path.display()))?;
+        .map_err(|error| format!("sync {}: {error}", ready_temp.display()))?;
+    std::fs::rename(&ready_temp, ready_path).map_err(|error| {
+        let _ = std::fs::remove_file(&ready_temp);
+        format!(
+            "publish {} as {}: {error}",
+            ready_temp.display(),
+            ready_path.display()
+        )
+    })?;
     println!("smolvm forkpoint ready; waiting for clone release");
     let _ = std::io::stdout().flush();
 
@@ -215,6 +227,14 @@ fn write_worker_ready_at(
         let _ = std::fs::remove_file(&temporary);
         format!("publish {}: {error}", worker_ready_path.display())
     })
+}
+
+fn ready_content(preload_modules: bool) -> String {
+    if preload_modules {
+        format!("{READY_VERSION}\n{CUDA_PRELOAD_MODULES_HINT}\n")
+    } else {
+        format!("{READY_VERSION}\n")
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +324,7 @@ mod tests {
                 &state_thread.join("restored"),
                 &release_thread,
                 Duration::from_millis(1),
+                false,
             )
         });
         for _ in 0..100 {
@@ -313,6 +334,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(ready.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&ready).unwrap(),
+            ready_content(false)
+        );
         assert!(!helper.is_finished());
         std::fs::write(&restored, b"restored\n").unwrap();
         std::fs::write(&release, b"release\n").unwrap();
@@ -340,6 +365,7 @@ mod tests {
                 &restored_thread,
                 &release_thread,
                 Duration::from_secs(60),
+                false,
             )
         });
         for _ in 0..100 {
@@ -400,5 +426,14 @@ mod tests {
             assert!(write_worker_ready_at(&state, &env, &marker).is_err());
             assert!(!marker.exists());
         }
+    }
+
+    #[test]
+    fn helper_records_cuda_module_preload_hint() {
+        assert_eq!(
+            ready_content(true),
+            "smolvm-forkpoint-v1\ncuda-preload-modules\n"
+        );
+        assert_eq!(ready_content(false), "smolvm-forkpoint-v1\n");
     }
 }

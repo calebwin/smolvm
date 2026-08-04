@@ -212,6 +212,8 @@ pub struct LaunchFeatures {
     /// golden's loaded weight physicals instead of copying them (one base copy
     /// in VRAM across sibling clones; correct for frozen-base fine-tuning).
     pub cuda_share_weights: bool,
+    /// Preload the golden's staged CUDA modules while a clone worker boots.
+    pub cuda_preload_modules: bool,
     /// Number of runnable CUDA fork clones planned for this golden. The host
     /// uses it before guest CUDA initialization to expose a safe per-session
     /// VRAM share to cache-sizing frameworks such as vLLM.
