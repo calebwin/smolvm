@@ -609,12 +609,14 @@ mod tests {
         dir.set_entry_type(tar::EntryType::Directory);
         dir.set_mode(0o700);
         dir.set_size(0);
-        tar.append_data(&mut dir, "private/", std::io::empty()).unwrap();
+        tar.append_data(&mut dir, "private/", std::io::empty())
+            .unwrap();
         let mut file = tar::Header::new_gnu();
         file.set_entry_type(tar::EntryType::Regular);
         file.set_mode(0o600);
         file.set_size(3);
-        tar.append_data(&mut file, "private/secret", &b"hi\n"[..]).unwrap();
+        tar.append_data(&mut file, "private/secret", &b"hi\n"[..])
+            .unwrap();
         let archive = tar.into_inner().unwrap();
 
         extract_oci_layer(
@@ -624,8 +626,15 @@ mod tests {
         )
         .unwrap();
 
-        let got = std::fs::metadata(dest.join("private")).unwrap().permissions().mode() & 0o777;
+        let got = std::fs::metadata(dest.join("private"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(got, 0o700, "directory mode widened to {got:o}");
-        assert!(dest.join("private/secret").is_file(), "contents still extracted");
+        assert!(
+            dest.join("private/secret").is_file(),
+            "contents still extracted"
+        );
     }
 }
