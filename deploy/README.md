@@ -23,14 +23,26 @@ These are intentional isolation trade-offs, not defects.
 ## Quick start (k3s)
 
 ```sh
-# 1. install the runtime into k3s (idempotent, version-robust)
+# 1. install the runtime into k3s (re-runnable, version-robust)
 sudo deploy/k3s/install-smolvm-k3s.sh
 
 # 2. prove it end-to-end (deploy a pod as a microVM, check logs + exec)
 sudo deploy/k3s/e2e-test.sh
+
+# to unwire it again (leaves the payload in place)
+sudo deploy/k3s/uninstall-smolvm-k3s.sh
 ```
 
-`install-smolvm-k3s.sh` wires the shim into k3s's embedded containerd by reading
+**Re-run the installer after a k3s upgrade.** k3s keeps its bundled binaries in a
+content-addressed directory that `data/current` repoints to on every upgrade, so
+a shim symlinked into it is orphaned. The installer also pins the shim's
+directory on k3s's `PATH`, which is upgrade-durable, but re-running is the
+reliable fix if pods stop scheduling after an upgrade.
+
+`install-smolvm-k3s.sh` is safe to re-run: it backs up and appends to an existing
+`config.toml.tmpl` rather than overwriting it (that file is where registry
+mirrors and private-registry auth live), and leaves k3s's enable/disable state
+alone. It wires the shim into k3s's embedded containerd by reading
 k3s's *generated* config to find the exact CRI plugin path, exports the shim's
 runtime env to k3s, drops the shim onto containerd's PATH, writes a
 `config.toml.tmpl`, registers the `smolvm` RuntimeClass, and labels nodes.
