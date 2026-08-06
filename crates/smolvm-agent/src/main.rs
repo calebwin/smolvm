@@ -2773,16 +2773,19 @@ fn handle_file_write(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> AgentResponse {
-    if let Some(result) = nsfile::write_to_container(path, data, mode, uid, gid) {
-        return match result {
+    match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode, uid, gid) {
             Ok(()) => AgentResponse::Ok { data: None },
             Err(e) => AgentResponse::error(
                 format!("failed to write {} in the workload container: {}", path, e),
                 error_codes::FILE_IO_FAILED,
             ),
-        };
+        },
+        // Seeding the VM's own namespace, which `install_file_atomic` maps into
+        // the machine's overlay. Correct with no workload running, and a
+        // deliberate branch rather than a fallthrough.
+        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode, uid, gid),
     }
-    install_file_atomic(path, data, mode, uid, gid)
 }
 
 /// State for an in-progress streaming file upload on one connection.
@@ -2913,15 +2916,15 @@ impl WriteSession {
         // streaming twin). The staged bytes are piped, never re-buffered.
         match std::fs::File::open(&self.tmp_path) {
             Ok(mut staged) => {
-                if let Some(result) = nsfile::write_reader_to_container(
-                    &self.target.to_string_lossy(),
-                    &mut staged,
-                    self.mode,
-                    self.uid,
-                    self.gid,
-                ) {
+                if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
                     // Session Drop still cleans the staging file.
-                    return match result {
+                    return match ns.write_reader(
+                        &self.target.to_string_lossy(),
+                        &mut staged,
+                        self.mode,
+                        self.uid,
+                        self.gid,
+                    ) {
                         Ok(()) => {
                             info!(
                                 path = %self.target.display(),
@@ -3140,8 +3143,8 @@ fn handle_streaming_file_read(
     // layer, so a file the container itself created came back 404 (BUG-240).
     // Both directions must move together: fixing only writes would break the
     // upload-then-download round trip, which is self-consistent today.
-    if let Some(opened) = nsfile::open_in_container(path) {
-        match opened {
+    if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+        match ns.open(path) {
             Ok(mut cf) => {
                 info!(path = %path, size = cf.size, "streaming file read (container)");
                 return send_data_chunks(
