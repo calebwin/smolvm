@@ -19,8 +19,10 @@ use smolvm::network::launch::{
 
 #[test]
 fn guest_host_service_flips_the_default_to_virtio_net() {
-    let mut resources = VmResources::default();
-    resources.network = true;
+    let mut resources = VmResources {
+        network: true,
+        ..Default::default()
+    };
 
     // No ports, no egress policy, no gateway: the light outbound-only default.
     assert_eq!(
