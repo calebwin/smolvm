@@ -208,6 +208,41 @@ fn parse_mac(value: &str) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
+/// The resolv.conf line that stops the resolver asking for AAAA records.
+///
+/// `options no-aaaa` (glibc 2.36+) makes `getaddrinfo` skip the AAAA query
+/// outright. Older glibc ignores the unknown option rather than erroring, and
+/// musl ignores it too, so writing it is safe everywhere and effective where it
+/// matters. It is not a substitute for giving hosts real IPv6 egress.
+const NO_AAAA_OPTION: &str = "options no-aaaa";
+
+/// The resolv.conf suffix for this boot: the no-AAAA option where the host said
+/// it has no IPv6 egress, otherwise nothing.
+///
+/// A guest reaches the outside world through a host socket, so it can only use
+/// an IPv6 address where the *host* has an IPv6 route. Where the host is
+/// IPv4-only, a AAAA answer is a trap: the connect fails, and clients diverge
+/// sharply in how they cope. Anything doing Happy Eyeballs (node's `fetch`,
+/// curl, most browsers) races both families and never notices; anything that
+/// commits to the first answer stalls until its own timeout and reports a
+/// connectivity error for a name that resolves perfectly well over IPv4 — which
+/// is exactly how this was found, as a coding agent that hung for 30s per
+/// attempt while every hand-written probe from the same shell passed.
+///
+/// Only the host can see whether that route exists, so it decides and sets
+/// [`guest_env::NO_AAAA`]; suppressing unconditionally would take working IPv6
+/// away from guests on hosts that have it. Both resolv.conf writers use this —
+/// the virtio-net one in `linux.rs` and the overlay one in `storage.rs` that
+/// covers TSI — so the backend a guest happens to get never decides whether its
+/// resolver hands it addresses it cannot connect to.
+pub fn resolv_conf_options() -> String {
+    if std::env::var(guest_env::NO_AAAA).as_deref() == Ok("1") {
+        format!("{NO_AAAA_OPTION}\n")
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 

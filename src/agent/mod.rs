@@ -90,6 +90,9 @@ pub(crate) fn guest_network_env(
     let mut push = |key: &str, val: String| {
         env.push(std::ffi::CString::new(format!("{key}={val}")).expect("env var contains NUL"));
     };
+    if !host_has_ipv6_egress() {
+        push(guest_env::NO_AAAA, "1".to_string());
+    }
     if let Some(n) = guest_network {
         push(
             guest_env::BACKEND,
@@ -107,6 +110,32 @@ pub(crate) fn guest_network_env(
         push(guest_env::DNS, dns.to_string());
     }
     env
+}
+
+/// Does this host have a route to the IPv6 internet?
+///
+/// A guest's egress leaves through a host socket, so a AAAA answer is only
+/// usable where the host itself can reach IPv6. Where it cannot, the guest's
+/// resolver must stop returning AAAA records — glibc orders them first, so a
+/// client that takes the first result connects to an unroutable address and
+/// stalls until its own timeout, reporting a connectivity failure for a name
+/// that resolves perfectly well over IPv4.
+///
+/// `connect` on a UDP socket sends no packets; it only performs a route lookup.
+/// So this asks the kernel "is there a route?" without touching the network, and
+/// answers in microseconds. The address is a well-known public resolver used
+/// purely as a routing target — nothing is sent to it.
+///
+/// Cached: this is a property of the host, and the boot path is latency-critical.
+/// A host that gains or loses IPv6 needs the daemon restarted to be noticed,
+/// which is the right trade for keeping this off the per-boot path.
+fn host_has_ipv6_egress() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::net::UdpSocket::bind("[::]:0")
+            .and_then(|sock| sock.connect("[2001:4860:4860::8888]:53"))
+            .is_ok()
+    })
 }
 
 fn format_mac(mac: [u8; 6]) -> String {

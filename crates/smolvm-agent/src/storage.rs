@@ -2524,8 +2524,14 @@ impl OverlaySetup {
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // Whichever resolver the guest ends up with, it reaches the network through
+    // a host socket, so it must not be handed AAAA answers the host cannot
+    // route. See `network::resolv_conf_options`.
+    let with_options =
+        |nameservers: &str| format!("{nameservers}{}", crate::network::resolv_conf_options());
+
     if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
-        return "nameserver 127.0.0.1\n".to_string();
+        return with_options("nameserver 127.0.0.1\n");
     }
 
     // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
@@ -2534,11 +2540,11 @@ fn overlay_resolv_conf_contents() -> String {
     // public resolvers when the host didn't specify one.
     if let Ok(dns_server) = std::env::var(guest_env::DNS) {
         if !dns_server.is_empty() {
-            return format!("nameserver {}\n", dns_server);
+            return with_options(&format!("nameserver {}\n", dns_server));
         }
     }
 
-    "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+    with_options("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
 }
 
 /// Prepare an overlay filesystem for a workload.
@@ -4484,6 +4490,7 @@ mod tests {
     fn overlay_resolv_conf_uses_localhost_when_dns_filter_enabled() {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(guest_env::DNS_FILTER, "1");
+        std::env::remove_var(guest_env::NO_AAAA);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
 
@@ -4496,6 +4503,7 @@ mod tests {
     fn overlay_resolv_conf_uses_virtio_dns_server() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::NO_AAAA);
         std::env::set_var(guest_env::BACKEND, guest_env::BACKEND_VIRTIO_NET);
         std::env::set_var(guest_env::DNS, "100.96.0.1");
 
@@ -4511,6 +4519,7 @@ mod tests {
         // must honor the custom resolver (--dns) rather than the public default.
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::NO_AAAA);
         std::env::remove_var(guest_env::BACKEND);
         std::env::set_var(guest_env::DNS, "100.100.100.100");
 
@@ -4526,6 +4535,7 @@ mod tests {
     fn overlay_resolv_conf_defaults_to_public_resolvers() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::NO_AAAA);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
 
@@ -4533,6 +4543,44 @@ mod tests {
             overlay_resolv_conf_contents(),
             "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
         );
+    }
+
+    /// The host says it has no IPv6 route, so the guest must stop asking for
+    /// AAAA records. This is the TSI shape a cloud machine boots with, and the
+    /// one that made coding agents hang on IPv4-only workers.
+    #[test]
+    fn overlay_resolv_conf_suppresses_aaaa_when_host_lacks_ipv6() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+        std::env::set_var(guest_env::NO_AAAA, "1");
+
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\noptions no-aaaa\n"
+        );
+
+        std::env::remove_var(guest_env::NO_AAAA);
+        std::env::remove_var(guest_env::DNS);
+    }
+
+    /// A host with IPv6 egress keeps it: suppression must not be the default,
+    /// or guests lose working IPv6 everywhere to fix the hosts that lack it.
+    #[test]
+    fn overlay_resolv_conf_keeps_aaaa_when_host_has_ipv6() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::NO_AAAA);
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\n"
+        );
+
+        std::env::remove_var(guest_env::DNS);
     }
 
     #[test]

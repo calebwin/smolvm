@@ -93,6 +93,19 @@ pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
 pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
+/// Set to `1` when the host has no route to the IPv6 internet, telling the
+/// agent to write `options no-aaaa` into the guest's resolv.conf.
+///
+/// The guest reaches the network through a host socket, so whether an AAAA
+/// answer is usable is a fact about the *host*, which the guest cannot observe.
+/// The host decides and says so here. Absent → the guest resolves normally and
+/// keeps working IPv6, so this suppression appears only where it is needed.
+///
+/// It applies at overlay creation, not per boot: an image machine's resolv.conf
+/// is written into the overlay upper layer once and reused on every later start.
+/// So a host that gains IPv6 egress frees new machines, while ones created
+/// before it keep the option until their overlay is rebuilt.
+pub const NO_AAAA: &str = "SMOLVM_NETWORK_NO_AAAA";
 /// Enables the guest-side DNS filtering proxy.
 pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
 /// Enables the guest-side Docker socket bridge: the agent listens on the
