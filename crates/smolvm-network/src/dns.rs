@@ -300,6 +300,14 @@ mod tests {
     use super::*;
 
     /// A query for `name` with one question (A/IN).
+    fn query_for_type(name: &str, qtype: u16) -> Vec<u8> {
+        let mut q = query_for(name);
+        // Overwrite the trailing QTYPE (the last four bytes are QTYPE+QCLASS).
+        let qtype_at = q.len() - 4;
+        q[qtype_at..qtype_at + 2].copy_from_slice(&qtype.to_be_bytes());
+        q
+    }
+
     fn query_for(name: &str) -> Vec<u8> {
         let mut q = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -428,20 +436,23 @@ mod tests {
 
     #[test]
     fn build_ip_response_round_trips_through_parser() {
-        let query = query_for("api.internal");
         let ips = vec![
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
             IpAddr::V6("2606:4700::1".parse().unwrap()),
         ];
-        let response = build_ip_response(&query, &ips, 60);
-        assert_eq!(&response[..2], &query[..2]); // echoed id
-        let flags = read_u16(&response, DNS_FLAGS_OFFSET).unwrap();
-        assert_eq!(flags & DNS_FLAG_RESPONSE, DNS_FLAG_RESPONSE);
-        // Our own parser must extract exactly the synthesized records.
-        assert_eq!(
-            answer_ip_records(&response),
-            vec![(ips[0], 60), (ips[1], 60)]
-        );
+
+        // Answers are filtered to the question's type: an A query must not carry
+        // the AAAA record, or a resolver that asked for A sees an answer it did
+        // not request (and a guest with no v6 route follows it).
+        for (qtype, expected) in [(DNS_TYPE_A, ips[0]), (DNS_TYPE_AAAA, ips[1])] {
+            let query = query_for_type("api.internal", qtype);
+            let response = build_ip_response(&query, &ips, 60);
+            assert_eq!(&response[..2], &query[..2]); // echoed id
+            let flags = read_u16(&response, DNS_FLAGS_OFFSET).unwrap();
+            assert_eq!(flags & DNS_FLAG_RESPONSE, DNS_FLAG_RESPONSE);
+            // Our own parser must extract exactly the synthesized record.
+            assert_eq!(answer_ip_records(&response), vec![(expected, 60)]);
+        }
     }
 
     #[test]

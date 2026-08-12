@@ -852,6 +852,7 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::EgressConfig;
 
     fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
         let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -920,7 +921,7 @@ mod tests {
         let external: IpAddr = "8.8.8.8".parse().unwrap();
         let table = TcpRelayTable::new(
             None,
-            EgressPolicy::from_allowed_cidrs(Some(&[])),
+            EgressPolicy::new(EgressConfig::from_allow_lists(Some(Vec::new()), None)),
             vec![gateway],
             Some(crate::GatewayHostService {
                 guest_port: 10_081,

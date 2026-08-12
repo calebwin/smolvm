@@ -113,7 +113,11 @@ pub enum StaticTarget {
 /// Split a trailing `:port` off an allow-list entry. Uses `host:port` /
 /// `[v6]:port` convention: bare host+colon is a v6 literal or CIDR. `None` =
 /// malformed port (caller drops the entry).
-fn split_port(entry: &str) -> Option<(&str, Option<u16>)> {
+///
+/// Public so the CLI validates `--allow-host` with the exact parser that later
+/// enforces it — a second implementation could disagree about where the port
+/// ends and silently widen an allow-list.
+pub fn split_port(entry: &str) -> Option<(&str, Option<u16>)> {
     let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p != 0);
     if let Some(rest) = entry.strip_prefix('[') {
         let (addr, tail) = rest.split_once(']')?;
