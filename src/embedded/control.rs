@@ -61,9 +61,22 @@ impl MachineSpec {
 
 /// Create a DB record for a new SDK machine.
 pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
+    create_vm_with_workload(db, spec, Vec::new(), None)
+}
+
+/// Create a DB record with the image workload configuration supplied by an
+/// SDK, without expanding the stable `MachineSpec` struct.
+pub(crate) fn create_vm_with_workload(
+    db: &SmolvmDb,
+    spec: &MachineSpec,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
-    let record = spec.to_record();
+    let mut record = spec.to_record();
+    record.env = env;
+    record.workdir = workdir;
     if db.insert_vm_if_not_exists(&spec.name, &record)? {
         Ok(())
     } else {
@@ -79,21 +92,29 @@ pub fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
     db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
 }
 
-/// Start a persisted VM and update its DB state.
-pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
+/// Start or reconnect to a persisted VM and report whether this call actually
+/// booted/restarted it. Callers use the status to launch image workloads exactly
+/// once: a reused VM already has its workload, while a restarted VM does not.
+pub(crate) fn start_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
     let record = get_record(db, name)?;
-    let handle = start_vm_from_record(&record)?;
-    mark_running(db, name, handle.child_pid())?;
-    Ok(handle)
+    let started = start_vm_from_record(&record)?;
+    mark_running(db, name, started.handle.child_pid())?;
+    Ok(started)
 }
 
-fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
+fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
     launch_from_record(record, LaunchFeatures::default())
+}
+
+/// Result of an embedded launch attempt.
+pub(crate) struct StartedVm {
+    pub(crate) handle: VmHandle,
+    pub(crate) freshly_started: bool,
 }
 
 /// Boot `record` with the given launch features and return a handle. Shared by
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
-fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmHandle> {
+fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<StartedVm> {
     let mut features = features;
     if record.forkable_on_start() {
         features.forkable = true;
@@ -116,7 +137,7 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmH
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-    manager
+    let freshly_started = manager
         .ensure_running_with_full_config(
             record.host_mounts(),
             record.port_mappings(),
@@ -125,22 +146,26 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmH
         )
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
-    Ok(VmHandle::new(manager, None))
+    Ok(StartedVm {
+        handle: VmHandle::new(manager, None),
+        freshly_started,
+    })
 }
 
 /// Start a persisted VM as a FORKABLE fork base: its guest RAM is backed by a
 /// memfd (copy-on-write cloneable) and a control socket is exposed so the machine
 /// can later be forked with [`fork_vm`]. Same mechanics as the CLI's
 /// `machine start --forkable`, surfaced for the embedded SDK.
-pub fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
+/// Start or reconnect to a forkable VM and retain the actual launch status.
+pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         forkable: true,
         ..LaunchFeatures::default()
     };
-    let handle = launch_from_record(&record, features)?;
-    mark_running(db, name, handle.child_pid())?;
-    Ok(handle)
+    let started = launch_from_record(&record, features)?;
+    mark_running(db, name, started.handle.child_pid())?;
+    Ok(started)
 }
 
 /// Start a persisted VM attached to a Kubernetes pod network namespace: the
@@ -158,9 +183,9 @@ pub fn start_vm_with_netns(
         pod_netns: Some(netns),
         ..LaunchFeatures::default()
     };
-    let handle = launch_from_record(&record, features)?;
-    mark_running(db, name, handle.child_pid())?;
-    Ok(handle)
+    let started = launch_from_record(&record, features)?;
+    mark_running(db, name, started.handle.child_pid())?;
+    Ok(started.handle)
 }
 
 /// Fork a running, forkable `golden` into a new `clone` via copy-on-write guest
@@ -175,6 +200,18 @@ pub fn fork_vm(
     golden: &str,
     clone: &str,
     pinned_ports: &[(u16, u16)],
+) -> Result<VmHandle> {
+    fork_vm_with_options(db, golden, clone, pinned_ports, false, None)
+}
+
+/// Fork a machine with launch options needed by non-embedded front-ends.
+pub(crate) fn fork_vm_with_options(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    pinned_ports: &[(u16, u16)],
+    share_weights: bool,
+    watch_parent: Option<bool>,
 ) -> Result<VmHandle> {
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // `clone_forkable = false`: a clone can't itself be re-forked (nested fork).
@@ -191,11 +228,14 @@ pub fn fork_vm(
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
         snapshot_dir: Some(prep.snapshot_dir.clone()),
+        cuda_share_weights: share_weights,
         cuda_preload_modules: prep.clone_record.cuda_preload_modules,
+        watch_parent,
         ..LaunchFeatures::default()
     };
     match launch_from_record(&prep.clone_record, features) {
-        Ok(mut handle) => {
+        Ok(started) => {
+            let mut handle = started.handle;
             // Fresh on-disk identity (hostname, machine-id, SSH host keys, RNG).
             // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone
             // and roll it back rather than leave it live with the golden's
@@ -433,6 +473,24 @@ mod tests {
         assert!(!plain.vm_resources().gpu);
         assert!(!plain.cuda);
         assert!(!plain.vm_resources().cuda);
+    }
+
+    #[test]
+    fn record_carries_image_workload_configuration() {
+        let mut spec = test_spec("workload", true);
+        spec.image = Some("example/service:latest".into());
+        let db = test_db();
+        create_vm_with_workload(
+            &db,
+            &spec,
+            vec![("SESSION".into(), "golden".into())],
+            Some("/workspace".into()),
+        )
+        .unwrap();
+        let record = get_record(&db, "workload").unwrap();
+        assert_eq!(record.image.as_deref(), Some("example/service:latest"));
+        assert_eq!(record.env, vec![("SESSION".into(), "golden".into())]);
+        assert_eq!(record.workdir.as_deref(), Some("/workspace"));
     }
 
     #[test]

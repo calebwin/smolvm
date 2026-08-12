@@ -912,10 +912,13 @@ fn build_rejuvenation_script(clone: &str, seed: &str) -> String {
          fi; \
          rm -rf /var/lib/cloud/instance /var/lib/cloud/instances/* /var/lib/cloud/data/instance-id 2>/dev/null || true; \
          printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
+         umask 077; \
+         mkdir -p '{state_dir}'; \
          printf '%s\n' smolvm-forkpoint-restored-v1 > '{restored}'; \
          true",
         c = clone,
         s = seed,
+        state_dir = smolvm_protocol::forkpoint::STATE_DIR,
         restored = smolvm_protocol::forkpoint::RESTORED_PATH,
     )
 }
@@ -1818,6 +1821,10 @@ mod tests {
         // The clone name and RNG seed are threaded through.
         assert!(script.contains("clone-a"));
         assert!(script.contains("deadbeef"));
+        assert!(script.contains(&format!(
+            "mkdir -p '{}'",
+            smolvm_protocol::forkpoint::STATE_DIR
+        )));
         assert!(script.contains(smolvm_protocol::forkpoint::RESTORED_PATH));
         // Guarded so it fails hard on core identity but no-ops when sshd/dbus
         // are absent (minimal library images).
