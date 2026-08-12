@@ -3545,14 +3545,20 @@ fn mount_overlay_fsconfig(
     ))
 }
 
-/// Merge `lowerdirs` (bottom -> top) into `output` as a single tar archive.
+/// Merge `lowerdirs` into `output` as a single tar archive.
 ///
 /// Backs [`AgentRequest::FlattenLayers`](smolvm_protocol::AgentRequest::FlattenLayers).
 /// The merge is a read-only overlay mount so that whiteouts and opaque markers
 /// resolve exactly as they do for a running container — a file copy would ship
 /// deleted paths back into the flattened layer.
 ///
-/// Entries that are missing or empty are dropped: callers append a container
+/// `lowerdirs` is **topmost first**, the same order the runtime container mount
+/// uses, because that is the order `lowerdir+` stacks them in. Passing an image's
+/// layers bottom-up instead silently inverts precedence: the base layer wins
+/// every conflicting path, so a merged `/etc/passwd` loses the users later layers
+/// added and the machine's own writes rank lowest of all.
+///
+/// Entries that are missing or empty are dropped: callers pass a container
 /// overlay's upper dir without knowing whether the machine ever wrote to it, and
 /// overlayfs rejects a lowerdir that does not exist. A single surviving directory
 /// is tarred directly, since overlayfs requires two lower layers when there is no
@@ -3626,7 +3632,7 @@ fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Mount a read-only overlay of `lowerdirs` (bottom -> top) at `merged_path`.
+/// Mount a read-only overlay of `lowerdirs` (topmost first) at `merged_path`.
 ///
 /// Same `fsconfig` path as [`mount_overlay_fsconfig`] but with no upperdir or
 /// workdir, which is what makes the mount read-only. Appending each layer with
@@ -3649,7 +3655,8 @@ fn mount_overlay_lowers_only(lowerdirs: &[String], merged_path: &Path) -> Result
     let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)
         .map_err(|e| StorageError::new(format!("fsopen(overlay) failed: {e}")))?;
 
-    // overlayfs stacks lowerdir+ bottom-up, matching our bottom -> top order.
+    // Each `lowerdir+` ranks below the one before it, so the caller's
+    // topmost-first order is passed straight through.
     for lower in lowerdirs {
         fsconfig_set_string(fs.as_fd(), "lowerdir+", lower.as_str()).map_err(|e| {
             StorageError::new(format!(
@@ -4189,13 +4196,15 @@ mod tests {
         );
     }
 
-    /// Order is the whole contract: overlayfs stacks `lowerdir+` bottom-up, and
-    /// a reversed stack would resolve whiteouts against the wrong layer and
-    /// resurrect files the image deleted.
+    /// Order is the whole contract — `lowerdir+` ranks each layer below the one
+    /// before it, so the caller's topmost-first list must survive filtering
+    /// unreordered. Passing it bottom-up instead inverts precedence silently:
+    /// the base layer wins every conflicting path and the machine's own writes
+    /// rank lowest, which reads as an image that lost its later layers.
     #[test]
-    fn flatten_preserves_bottom_to_top_order() {
+    fn flatten_preserves_topmost_first_order() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dirs: Vec<String> = ["base", "middle", "top"]
+        let dirs: Vec<String> = ["upper", "top-layer", "base"]
             .iter()
             .map(|name| {
                 let dir = tmp.path().join(name);
@@ -4206,6 +4215,30 @@ mod tests {
             .collect();
 
         assert_eq!(mountable_lowerdirs(&dirs), dirs);
+    }
+
+    /// Dropping an empty entry must not disturb the rank of the ones that stay:
+    /// a machine that never wrote anything still has its (empty) overlay passed
+    /// first, and removing it has to leave the image layers in their own order.
+    #[test]
+    fn flatten_keeps_rank_when_an_entry_is_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut make = |name: &str, populated: bool| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create dir");
+            if populated {
+                std::fs::write(dir.join("f"), name.as_bytes()).expect("write");
+            }
+            dir.to_string_lossy().into_owned()
+        };
+        let empty_upper = make("empty-upper", false);
+        let top = make("top-layer", true);
+        let base = make("base", true);
+
+        assert_eq!(
+            mountable_lowerdirs(&[empty_upper, top.clone(), base.clone()]),
+            vec![top, base]
+        );
     }
 
     #[test]

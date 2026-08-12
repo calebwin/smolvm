@@ -475,11 +475,15 @@ fn flatten_and_export(
     if lowers.is_empty() {
         return Err(Error::agent("flatten layers", "no layers to flatten"));
     }
-    // The machine's container overlay goes on top of the image layers. The agent
-    // drops it if the machine never wrote to it, so it needs no probe from here.
+    // Topmost first, which is the order the agent stacks them in: the machine's
+    // own writes outrank every image layer, then the image layers from top down.
+    // `lowers` arrives bottom-up as the image lists them, so it has to be
+    // reversed — leaving it as-is makes the base layer win every conflict.
+    // The agent drops the overlay if the machine never wrote to it, so it needs
+    // no probe from here.
     let upper = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
-    let mut stack: Vec<String> = lowers.to_vec();
-    stack.push(upper);
+    let mut stack: Vec<String> = vec![upper];
+    stack.extend(lowers.iter().rev().cloned());
 
     println!(
         "Flattening {} layer(s) + container overlay...",
