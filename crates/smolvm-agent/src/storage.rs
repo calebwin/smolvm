@@ -4223,7 +4223,7 @@ mod tests {
     #[test]
     fn flatten_keeps_rank_when_an_entry_is_dropped() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut make = |name: &str, populated: bool| {
+        let make = |name: &str, populated: bool| {
             let dir = tmp.path().join(name);
             std::fs::create_dir_all(&dir).expect("create dir");
             if populated {
