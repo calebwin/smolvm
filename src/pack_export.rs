@@ -435,51 +435,20 @@ fn flatten_and_export(
     if lowers.is_empty() {
         return Err(Error::agent("flatten layers", "no layers to flatten"));
     }
+    // The machine's container overlay goes on top of the image layers. The agent
+    // drops it if the machine never wrote to it, so it needs no probe from here.
     let upper = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
-    // overlayfs wants topmost-first in `lowerdir=`.
-    let base_chain: Vec<&str> = lowers.iter().rev().map(String::as_str).collect();
-    let base_chain = base_chain.join(":");
+    let mut stack: Vec<String> = lowers.to_vec();
+    stack.push(upper);
 
     println!(
         "Flattening {} layer(s) + container overlay...",
         lowers.len()
     );
-    let script = format!(
-        "set -e\n\
-         low='{base_chain}'\n\
-         n={n}\n\
-         if [ -d '{upper}' ] && [ -n \"$(ls -A '{upper}' 2>/dev/null)\" ]; then\n\
-           low=\"{upper}:$low\"; n=$((n+1))\n\
-         fi\n\
-         if [ \"$n\" -eq 1 ]; then\n\
-           tar cf /storage/flat-export.tar -C \"${{low%%:*}}\" .\n\
-         else\n\
-           mkdir -p /tmp/flatview\n\
-           mount -t overlay overlay -o lowerdir=\"$low\" /tmp/flatview\n\
-           tar cf /storage/flat-export.tar -C /tmp/flatview .\n\
-           umount /tmp/flatview\n\
-         fi\n\
-         echo FLAT_OK\n",
-        n = lowers.len(),
-    );
-    let (exit_code, stdout, stderr) = client.vm_exec(
-        vec!["sh".to_string(), "-c".to_string(), script],
-        vec![],
-        None,
-        None,
-        None,
-    )?;
-    let stdout_str = String::from_utf8_lossy(&stdout);
-    if exit_code != 0 || !stdout_str.contains("FLAT_OK") {
-        return Err(Error::agent(
-            "flatten layers",
-            format!(
-                "flatten failed (exit {}): {}",
-                exit_code,
-                String::from_utf8_lossy(&stderr)
-            ),
-        ));
-    }
+    // Driven agent-side rather than through `mount(8)` over VmExec: `mount(8)`
+    // rejects a `lowerdir=` value past ~255 bytes, which any image with four or
+    // more layers exceeds.
+    client.flatten_layers(&stack, "/storage/flat-export.tar")?;
 
     // Stream the flattened tar to disk (never buffered whole in memory), then
     // content-address it. Stage in the layers dir so the final rename is

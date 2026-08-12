@@ -3545,6 +3545,154 @@ fn mount_overlay_fsconfig(
     ))
 }
 
+/// Merge `lowerdirs` (bottom -> top) into `output` as a single tar archive.
+///
+/// Backs [`AgentRequest::FlattenLayers`](smolvm_protocol::AgentRequest::FlattenLayers).
+/// The merge is a read-only overlay mount so that whiteouts and opaque markers
+/// resolve exactly as they do for a running container — a file copy would ship
+/// deleted paths back into the flattened layer.
+///
+/// Entries that are missing or empty are dropped: callers append a container
+/// overlay's upper dir without knowing whether the machine ever wrote to it, and
+/// overlayfs rejects a lowerdir that does not exist. A single surviving directory
+/// is tarred directly, since overlayfs requires two lower layers when there is no
+/// upperdir.
+pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+    let present = mountable_lowerdirs(lowerdirs);
+
+    let source = match present.len() {
+        0 => {
+            return Err(StorageError::new(
+                "no layers to flatten: every directory was missing or empty".to_string(),
+            ))
+        }
+        // One layer needs no merge, and overlayfs would refuse it anyway.
+        1 => PathBuf::from(&present[0]),
+        _ => {
+            let merged = Path::new(STORAGE_ROOT).join("flatten-merged");
+            let _ = std::fs::remove_dir_all(&merged);
+            std::fs::create_dir_all(&merged)?;
+            mount_overlay_lowers_only(&present, &merged)?;
+            merged
+        }
+    };
+
+    let tar_result = tar_directory(&source, output);
+
+    if source != Path::new(&present[0]) {
+        // Best-effort: a failed unmount must not mask a tar error.
+        let _ = std::process::Command::new("umount").arg(&source).status();
+        let _ = std::fs::remove_dir_all(&source);
+    }
+
+    tar_result
+}
+
+/// Keep the entries of `lowerdirs` that overlayfs can actually stack.
+///
+/// overlayfs fails the whole mount on a lowerdir that does not exist, and an
+/// empty directory contributes nothing to the merge, so dropping both lets a
+/// caller pass a container overlay's upper dir unconditionally.
+fn mountable_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
+    lowerdirs
+        .iter()
+        .filter(|dir| {
+            let path = Path::new(dir);
+            path.is_dir()
+                && std::fs::read_dir(path)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Tar `dir`'s contents (not the directory itself) into `output`.
+fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
+    let status = std::process::Command::new("tar")
+        .arg("cf")
+        .arg(output)
+        .arg("-C")
+        .arg(dir)
+        .arg(".")
+        .status()
+        .map_err(|e| StorageError::new(format!("spawning tar failed: {e}")))?;
+    if !status.success() {
+        return Err(StorageError::new(format!(
+            "tar of {} failed: {status}",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Mount a read-only overlay of `lowerdirs` (bottom -> top) at `merged_path`.
+///
+/// Same `fsconfig` path as [`mount_overlay_fsconfig`] but with no upperdir or
+/// workdir, which is what makes the mount read-only. Appending each layer with
+/// its own `lowerdir+` is the whole point: a single `lowerdir=` string caps out
+/// at ~255 bytes through `mount(8)`, which is only about three layer paths.
+#[cfg(target_os = "linux")]
+fn mount_overlay_lowers_only(lowerdirs: &[String], merged_path: &Path) -> Result<()> {
+    use rustix::fd::AsFd;
+    use rustix::mount::{
+        fsconfig_create, fsconfig_set_string, fsmount, fsopen, move_mount, FsMountFlags,
+        FsOpenFlags, MountAttrFlags, MoveMountFlags,
+    };
+
+    info!(
+        layer_count = lowerdirs.len(),
+        merged_path = %merged_path.display(),
+        "mounting read-only overlay for flatten"
+    );
+
+    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)
+        .map_err(|e| StorageError::new(format!("fsopen(overlay) failed: {e}")))?;
+
+    // overlayfs stacks lowerdir+ bottom-up, matching our bottom -> top order.
+    for lower in lowerdirs {
+        fsconfig_set_string(fs.as_fd(), "lowerdir+", lower.as_str()).map_err(|e| {
+            StorageError::new(format!(
+                "fsconfig lowerdir+={lower} failed (kernel may lack lowerdir+ (<6.7)): {e}"
+            ))
+        })?;
+    }
+
+    fsconfig_create(fs.as_fd())
+        .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;
+
+    let mnt = fsmount(
+        fs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::empty(),
+    )
+    .map_err(|e| StorageError::new(format!("fsmount(overlay) failed: {e}")))?;
+
+    move_mount(
+        mnt.as_fd(),
+        "",
+        rustix::fs::CWD,
+        merged_path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .map_err(|e| {
+        StorageError::new(format!(
+            "move_mount to {} failed: {e}",
+            merged_path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// Non-Linux stub: overlayfs is Linux-only.
+#[cfg(not(target_os = "linux"))]
+fn mount_overlay_lowers_only(_lowerdirs: &[String], _merged_path: &Path) -> Result<()> {
+    Err(StorageError::new(
+        "overlay mount is only supported on Linux".to_string(),
+    ))
+}
+
 /// Mount overlay by merging layers into a single directory (most compatible).
 ///
 /// This approach physically copies all layers into a single merged directory,
@@ -4013,6 +4161,51 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// A machine that has never written to its container overlay still has the
+    /// caller append that upper dir, and overlayfs fails the whole mount on a
+    /// lowerdir that is not there — so it has to be dropped, not passed through.
+    #[test]
+    fn flatten_drops_lowerdirs_that_are_missing_or_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let populated = tmp.path().join("layer");
+        std::fs::create_dir_all(&populated).expect("create layer");
+        std::fs::write(populated.join("file"), b"x").expect("write file");
+        let empty = tmp.path().join("empty-upper");
+        std::fs::create_dir_all(&empty).expect("create empty");
+        let missing = tmp.path().join("never-created");
+
+        let kept = mountable_lowerdirs(&[
+            populated.to_string_lossy().into_owned(),
+            empty.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ]);
+
+        assert_eq!(
+            kept,
+            vec![populated.to_string_lossy().into_owned()],
+            "only the populated directory is mountable"
+        );
+    }
+
+    /// Order is the whole contract: overlayfs stacks `lowerdir+` bottom-up, and
+    /// a reversed stack would resolve whiteouts against the wrong layer and
+    /// resurrect files the image deleted.
+    #[test]
+    fn flatten_preserves_bottom_to_top_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs: Vec<String> = ["base", "middle", "top"]
+            .iter()
+            .map(|name| {
+                let dir = tmp.path().join(name);
+                std::fs::create_dir_all(&dir).expect("create dir");
+                std::fs::write(dir.join("f"), name.as_bytes()).expect("write");
+                dir.to_string_lossy().into_owned()
+            })
+            .collect();
+
+        assert_eq!(mountable_lowerdirs(&dirs), dirs);
     }
 
     #[test]

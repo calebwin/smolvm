@@ -915,6 +915,18 @@ impl AgentClient {
         expect_ok(resp, "format storage")
     }
 
+    /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.
+    ///
+    /// Missing or empty entries are dropped guest-side, so callers can append a
+    /// container overlay's upper dir without probing it first.
+    pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+        let resp = self.request(&AgentRequest::FlattenLayers {
+            lowerdirs: lowerdirs.to_vec(),
+            output: output.to_string(),
+        })?;
+        expect_ok(resp, "flatten layers")
+    }
+
     /// Get storage status.
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
