@@ -90,6 +90,9 @@ pub mod registry;
 pub mod secrets;
 pub mod settings;
 pub mod smolfile;
+/// Opt-in client for a resident SmolGPU process pool.
+#[cfg(target_os = "linux")]
+pub mod smolgpu;
 pub mod storage;
 pub mod systemd_scope;
 pub mod util;

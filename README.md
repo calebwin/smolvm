@@ -282,6 +282,17 @@ The VM boundary still isolates the workload's CPU, memory, and filesystem. GPU a
 
 See [GPU access by API remoting: how a driverless microVM runs CUDA](https://smolmachines.com/engineering/gpu-over-vsock) for the design, trade-offs, and comparison with passthrough.
 
+Experimental SmolGPU Process Pools
+----------------------------------
+
+On Linux, the library exposes an explicit `smolvm::smolgpu::SmolGpuPool` adapter for a
+separately installed `smolgpu-host` runtime. It runs a packed RV64 process artifact as a
+fixed population of GPU-resident COW contexts and returns independently ordered outputs
+plus execution and density telemetry. It does not change `machine run`, interpret an OCI
+rootfs as a GPU program, or replace CUDA API remoting. See
+[`docs/smolgpu-backend.md`](docs/smolgpu-backend.md) for the lifecycle, current ABI
+boundary, and cross-card validation.
+
 Development
 -----------
 
