@@ -2,12 +2,12 @@
 
 use crate::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
 use crate::config::{RecordState, VmRecord};
-use std::collections::BTreeMap;
 use crate::data::network::PortMapping;
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
 use crate::embedded::handle::VmHandle;
 use crate::{Error, Result};
+use std::collections::BTreeMap;
 
 /// Runtime configuration supplied by an embedded SDK constructor.
 /// `Default` is derived so a new field does not break every construction site —
@@ -413,7 +413,8 @@ mod tests {
             resources: VmResources::default(),
             image: None,
             persistent,
-            runtime_managed: false,
+            // Spread the rest so a new spec field does not break the fixtures.
+            ..MachineSpec::default()
         }
     }
 

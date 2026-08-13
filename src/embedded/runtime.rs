@@ -587,7 +587,8 @@ mod tests {
             resources: crate::agent::VmResources::default(),
             image: None,
             persistent,
-            runtime_managed: false,
+            // Spread the rest so a new spec field does not break the fixtures.
+            ..MachineSpec::default()
         }
     }
 
