@@ -3,4 +3,4 @@
 # built from. Verified against the pinned submodules by
 # scripts/check-libkrun-provenance.sh (run in CI).
 libkrun=c283ed7556d0af534903f4b7972f190239858f15
-libkrunfw=502d3258211b0fbadcd95d6ade08a4fc799c4db0
+libkrunfw=7c1151f9c2ae1d278e243b6583850d5d848284d5
