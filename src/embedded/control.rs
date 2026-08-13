@@ -2,6 +2,7 @@
 
 use crate::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
 use crate::config::{RecordState, VmRecord};
+use std::collections::BTreeMap;
 use crate::data::network::PortMapping;
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
@@ -9,7 +10,11 @@ use crate::embedded::handle::VmHandle;
 use crate::{Error, Result};
 
 /// Runtime configuration supplied by an embedded SDK constructor.
-#[derive(Debug, Clone)]
+/// `Default` is derived so a new field does not break every construction site —
+/// callers can spread `..MachineSpec::default()`. The shim and the examples
+/// previously listed every field, which made each addition a breaking change to
+/// code that only compiles on Linux (and so failed after review, not during it).
+#[derive(Debug, Clone, Default)]
 pub struct MachineSpec {
     /// Unique machine name.
     pub name: String,
@@ -25,6 +30,15 @@ pub struct MachineSpec {
     pub image: Option<String>,
     /// Whether the machine should persist across stop/start.
     pub persistent: bool,
+    /// Caller metadata, mirroring the CLI's `--label` and surfaced by
+    /// `machine ls --json`. smolvm never interprets these.
+    ///
+    /// An embedder managing many machines has only the name to go on otherwise,
+    /// and a name cannot be read back reliably (the table view truncates it), so
+    /// without labels a process that dies cannot recognise its own machines
+    /// afterwards. That is the difference between reclaiming a leaked VM and
+    /// leaving it running.
+    pub labels: BTreeMap<String, String>,
     /// Set by the Kubernetes containerd shim for pod-sandbox VMs. Marks the
     /// record so node-reboot reconciliation can reclaim it (and only it) when
     /// its process is gone. Defaults to false for CLI/SDK machines.
@@ -53,6 +67,7 @@ impl MachineSpec {
         record.gpu_vram_mib = self.resources.gpu_vram_mib;
         record.cuda = self.resources.cuda;
         record.image = self.image.clone();
+        record.labels = self.labels.clone();
         record.ephemeral = !self.persistent;
         record.runtime_managed = self.runtime_managed;
         record
