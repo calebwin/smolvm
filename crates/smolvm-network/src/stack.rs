@@ -299,10 +299,14 @@ fn run_network_stack(
                 }
                 FrameAction::UdpFlow { destination } => {
                     // Same egress policy as TCP; a denied destination's datagram
-                    // is silently dropped (a guest sees a normal UDP black hole).
-                    if udp_relay::should_relay_udp(destination, &egress)
-                        && udp_sockets.ensure_socket(destination, &mut sockets)
-                    {
+                    // is silently dropped (a guest sees a normal UDP black hole),
+                    // but the denial is recorded in the boot log — these lines are
+                    // the machine's egress audit trail (`read_egress_denials`).
+                    let relay_allowed = udp_relay::should_relay_udp(destination, &egress);
+                    if !relay_allowed && destination.port() != 53 {
+                        virtio_net_log!("egress policy denied sendto {}", destination);
+                    }
+                    if relay_allowed && udp_sockets.ensure_socket(destination, &mut sockets) {
                         if matches!(
                             interface.poll_ingress_single(now, &mut device, &mut sockets),
                             PollIngressSingleResult::None
@@ -778,6 +782,8 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
                 "virtio-net: blocking DNS query by allow-host policy name={}",
                 name
             );
+            // Standardized marker for the egress audit trail (`read_egress_denials`).
+            virtio_net_log!("egress policy denied resolve {}", name);
             DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
         }
         None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),

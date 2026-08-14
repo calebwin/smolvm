@@ -360,6 +360,98 @@ pub fn egress_telemetry_file(name: &str) -> PathBuf {
     vm_data_dir(name).join("egress")
 }
 
+/// Per-VM boot-subprocess stderr log: `<vm_data_dir>/agent-startup-error.log`.
+/// The subprocess re-points its own stderr here at startup (append mode, so
+/// prior boots survive), and the virtio-net runtime's unconditional log lines
+/// land in it — including the `egress policy denied` lines that are a confined
+/// machine's only record of blocked traffic. Resolved from the name on both
+/// sides of the process boundary, like [`egress_telemetry_file`].
+pub fn boot_stderr_log_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join("agent-startup-error.log")
+}
+
+/// One egress denial observed by the VMM: the policy refused a guest's
+/// connect or sendto toward `dest`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EgressDenial {
+    /// Denial time as logged by the VMM (RFC 3339, microsecond precision), or
+    /// empty when the line carried no parseable timestamp.
+    pub timestamp: String,
+    /// The refused operation: `connect` (TCP) or `sendto` (UDP).
+    pub operation: String,
+    /// The destination the guest tried to reach, as `ip:port`.
+    pub dest: String,
+}
+
+/// How much of the VMM log tail to scan for denial lines. A denial line is
+/// ~100 bytes, so this window holds a few thousand events — far more than a
+/// caller pages through — while bounding the read on a long-lived machine
+/// whose log has grown.
+const EGRESS_DENIAL_SCAN_BYTES: u64 = 256 * 1024;
+
+/// Read the egress denials recorded for `name`, oldest first, capped at
+/// `limit`. Returns an empty list when the machine has no VMM log (never
+/// booted, or built before the log existed) — absence of the file is
+/// "no denials observed", not an error.
+pub fn read_egress_denials(name: &str, limit: usize) -> Vec<EgressDenial> {
+    let path = boot_stderr_log_file(name);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > EGRESS_DENIAL_SCAN_BYTES {
+        let _ = file.seek(SeekFrom::End(-(EGRESS_DENIAL_SCAN_BYTES as i64)));
+    }
+    let mut tail = String::new();
+    if file.read_to_string(&mut tail).is_err() {
+        return Vec::new();
+    }
+    let mut events: Vec<EgressDenial> = tail.lines().filter_map(parse_egress_denial_line).collect();
+    if events.len() > limit {
+        events.drain(..events.len() - limit);
+    }
+    events
+}
+
+/// Parse one boot-log line into a denial event, or `None` for any other line.
+///
+/// The virtio-net runtime emits three shapes (see `smolvm-network`'s tcp/udp
+/// relays and DNS filter), prefixed `[<ts>]: `:
+///   `egress policy denied connect to <ip:port>`
+///   `egress policy denied sendto <ip:port>`
+///   `egress policy denied resolve <hostname>`
+/// Matching is anchored on the `egress policy denied ` marker rather than the
+/// prefix, so surrounding format drift can't silently discard events; libkrun's
+/// TSI muxer logs the same marker, so those parse too if they ever appear.
+fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
+    const MARKER: &str = "egress policy denied ";
+    let after = &line[line.find(MARKER)? + MARKER.len()..];
+    let (operation, rest) = after.split_once(' ')?;
+    if operation != "connect" && operation != "sendto" && operation != "resolve" {
+        return None;
+    }
+    let dest = rest.strip_prefix("to ").unwrap_or(rest).trim();
+    if dest.is_empty() {
+        return None;
+    }
+    // virtio-net lines look like `[2026-08-13T02:31:05Z]: ...`; env_logger's
+    // (libkrun) like `[2026-08-13T02:31:05.123456Z WARN ...] ...`. Both start
+    // with a bracketed timestamp token.
+    let timestamp = line
+        .strip_prefix('[')
+        .and_then(|r| r.split_whitespace().next())
+        .unwrap_or("")
+        .trim_end_matches(':')
+        .trim_end_matches(']')
+        .to_string();
+    Some(EgressDenial {
+        timestamp,
+        operation: operation.to_string(),
+        dest: dest.to_string(),
+    })
+}
+
 /// How often the VM subprocess flushes its egress counter to disk. The control
 /// plane's egress rollup runs on a multi-minute cadence, so a value this small
 /// keeps the file comfortably fresh while writing only a few bytes.
@@ -3025,6 +3117,79 @@ mod tests {
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
+    /// The three denial shapes the virtio-net runtime emits parse into
+    /// structured events — and libkrun's muxer format parses too — while
+    /// everything else in a boot log is ignored.
+    #[test]
+    fn egress_denial_lines_parse_and_noise_is_ignored() {
+        let connect = parse_egress_denial_line(
+            "[2026-08-14T03:13:08Z]: egress policy denied connect to 8.8.8.8:443",
+        )
+        .expect("connect line parses");
+        assert_eq!(connect.timestamp, "2026-08-14T03:13:08Z");
+        assert_eq!(connect.operation, "connect");
+        assert_eq!(connect.dest, "8.8.8.8:443");
+
+        let sendto = parse_egress_denial_line(
+            "[2026-08-14T03:13:09Z]: egress policy denied sendto 9.9.9.9:123",
+        )
+        .expect("sendto line parses");
+        assert_eq!(sendto.operation, "sendto");
+        assert_eq!(sendto.dest, "9.9.9.9:123");
+
+        let resolve = parse_egress_denial_line(
+            "[2026-08-14T03:13:10Z]: egress policy denied resolve evil.example.com",
+        )
+        .expect("resolve line parses");
+        assert_eq!(resolve.operation, "resolve");
+        assert_eq!(resolve.dest, "evil.example.com");
+
+        // libkrun's TSI muxer format (env_logger) parses as well.
+        let muxer = parse_egress_denial_line(
+            "[2026-08-13T02:31:05.123456Z WARN  devices::virtio::vsock::muxer] \
+             egress policy denied connect to 93.184.215.14:443",
+        )
+        .expect("muxer line parses");
+        assert_eq!(muxer.timestamp, "2026-08-13T02:31:05.123456Z");
+        assert_eq!(muxer.dest, "93.184.215.14:443");
+
+        for noise in [
+            "[2026-08-14T03:13:08Z]: virtio-net: guest TCP SYN source=x destination=y",
+            "[2026-08-13T02:31:07Z INFO  libkrun] egress policy configured with 2 CIDR rule(s)",
+            "plain unrelated stderr line",
+            "[ts WARN x] egress policy denied", // no operation/dest
+        ] {
+            assert!(
+                parse_egress_denial_line(noise).is_none(),
+                "must ignore: {noise}"
+            );
+        }
+    }
+
+    /// `read_egress_denials` reads the newest events from the log tail and
+    /// honors the caller's cap, keeping the most recent entries.
+    #[test]
+    fn read_egress_denials_caps_to_newest() {
+        // Write the log exactly where vmm_log_file() resolves for a
+        // pid-namespaced throwaway name, and remove that dir afterwards.
+        let name = format!("egress-test-{}", std::process::id());
+        let log = boot_stderr_log_file(&name);
+        std::fs::create_dir_all(log.parent().expect("parent")).expect("mkdir");
+        let mut contents = String::new();
+        for i in 0..10 {
+            contents.push_str(&format!(
+                "[2026-08-13T02:31:{i:02}Z]: egress policy denied connect to 10.0.0.{i}:443\n"
+            ));
+        }
+        std::fs::write(&log, contents).expect("write log");
+
+        let events = read_egress_denials(&name, 3);
+        std::fs::remove_dir_all(vm_data_dir(&name)).ok();
+        assert_eq!(events.len(), 3, "capped to limit");
+        assert_eq!(events[0].dest, "10.0.0.7:443", "oldest of the kept tail");
+        assert_eq!(events[2].dest, "10.0.0.9:443", "newest kept last");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

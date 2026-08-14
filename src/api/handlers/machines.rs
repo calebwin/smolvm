@@ -39,9 +39,10 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
-    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo,
-    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, EgressEventsResponse,
+    ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse,
+    MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec,
+    StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -874,6 +875,47 @@ pub async fn get_machine(
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Query string for `GET /machines/{name}/egress-events`.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct EgressEventsQuery {
+    /// Maximum number of events to return (newest kept). Default 200.
+    pub limit: Option<usize>,
+}
+
+/// List the machine's egress denials — outbound connects and sendtos its
+/// egress policy refused. Empty for a machine with no policy, no denials, or
+/// one that has never booted.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/egress-events",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name"),
+        EgressEventsQuery
+    ),
+    responses(
+        (status = 200, description = "Egress denial events", body = EgressEventsResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn get_machine_egress_events(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<EgressEventsQuery>,
+) -> Result<Json<EgressEventsResponse>, ApiError> {
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    let limit = query.limit.unwrap_or(200);
+    let events = crate::agent::read_egress_denials(&name, limit)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    Ok(Json(EgressEventsResponse { events }))
 }
 
 /// Classify a VM launch/boot failure. A published host-port bind conflict — the

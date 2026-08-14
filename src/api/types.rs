@@ -696,6 +696,41 @@ pub struct MachineInfo {
     pub created_at: u64,
 }
 
+/// One egress denial: the machine's egress policy refused an outbound
+/// connect or sendto. These are the machine's only record of blocked
+/// traffic, read from the VMM's log.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressDenialInfo {
+    /// Denial time (RFC 3339, microsecond precision), or empty when the
+    /// log line carried no parseable timestamp.
+    #[schema(example = "2026-08-13T02:31:05.123456Z")]
+    pub timestamp: String,
+    /// The refused operation: `connect` (TCP) or `sendto` (UDP).
+    #[schema(example = "connect")]
+    pub operation: String,
+    /// The destination the guest tried to reach.
+    #[schema(example = "93.184.215.14:443")]
+    pub dest: String,
+}
+
+impl From<crate::agent::EgressDenial> for EgressDenialInfo {
+    fn from(d: crate::agent::EgressDenial) -> Self {
+        Self {
+            timestamp: d.timestamp,
+            operation: d.operation,
+            dest: d.dest,
+        }
+    }
+}
+
+/// Egress denial events response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EgressEventsResponse {
+    /// Denials oldest-first, capped by the `limit` query parameter.
+    pub events: Vec<EgressDenialInfo>,
+}
+
 /// List machines response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListMachinesResponse {

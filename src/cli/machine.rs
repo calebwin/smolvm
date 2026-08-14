@@ -323,6 +323,9 @@ pub enum MachineCmd {
     /// Show machine status
     Status(StatusCmd),
 
+    /// Show egress denials — outbound connections the machine's egress policy refused
+    EgressEvents(EgressEventsCmd),
+
     /// List all machines
     #[command(visible_alias = "list")]
     Ls(LsCmd),
@@ -387,6 +390,7 @@ impl MachineCmd {
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
+            MachineCmd::EgressEvents(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
             MachineCmd::Update(cmd) => cmd.run(),
@@ -3785,6 +3789,53 @@ impl StatusCmd {
             return vm_common::status_vm_json(&self.name);
         }
         vm_common::status_vm(&self.name, |_| {})
+    }
+}
+
+// ============================================================================
+// EgressEvents Command
+// ============================================================================
+
+/// Show the machine's egress denials.
+///
+/// Lists outbound connects and sendtos the egress policy refused — the record
+/// of what a confined workload tried and failed to reach. Empty for machines
+/// without an egress policy, or with no denials.
+#[derive(Args, Debug)]
+pub struct EgressEventsCmd {
+    /// Machine to inspect (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Maximum number of events to show (newest kept)
+    #[arg(long, default_value_t = 200)]
+    pub limit: usize,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl EgressEventsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = self.name.as_deref().unwrap_or("default");
+        let events = smolvm::agent::read_egress_denials(name, self.limit);
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&events).unwrap_or_default()
+            );
+            return Ok(());
+        }
+        if events.is_empty() {
+            println!("No egress denials recorded for '{name}'.");
+            return Ok(());
+        }
+        println!("{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP");
+        for e in &events {
+            println!("{:<30} {:<9} {}", e.timestamp, e.operation, e.dest);
+        }
+        Ok(())
     }
 }
 
