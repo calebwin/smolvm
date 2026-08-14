@@ -287,10 +287,10 @@ impl TcpRelayTable {
                 %destination,
                 "virtio-net: blocking outbound connection by egress policy"
             );
-            // Recorded unconditionally in the boot log: these lines are the
-            // machine's egress audit trail, parsed by the host's
-            // `read_egress_denials` (keep the marker text stable).
-            virtio_net_log!("egress policy denied connect to {}", destination);
+            // Recorded in the machine's egress audit trail (dedicated file +
+            // stderr) — parsed by the host's `read_egress_denials`.
+            self.egress
+                .record_denial("connect", &format_args!("to {destination}"));
             return false;
         }
 

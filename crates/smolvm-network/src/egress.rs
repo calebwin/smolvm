@@ -205,6 +205,10 @@ pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
+    /// Audit sink for denials. When set, every denied connect/sendto/resolve is
+    /// appended here in addition to the runtime's stderr line, so the record
+    /// can't be evicted by ordinary connection chatter in the boot log.
+    denial_log: Option<Arc<std::path::PathBuf>>,
 }
 
 impl EgressPolicy {
@@ -213,6 +217,7 @@ impl EgressPolicy {
         Self {
             inner: None,
             floor: floor_mode(),
+            denial_log: None,
         }
     }
 
@@ -248,10 +253,51 @@ impl EgressPolicy {
                 learned: Mutex::new(HashMap::new()),
             })),
             floor: floor_mode(),
+            denial_log: None,
         }
     }
 
     /// Convenience for the CIDR-only case.
+    /// Attach the audit sink denials are appended to. The launcher points this
+    /// at the machine's data dir so the host can read denials back.
+    pub fn with_denial_log(mut self, path: std::path::PathBuf) -> Self {
+        self.denial_log = Some(Arc::new(path));
+        self
+    }
+
+    /// Record one denial: a stderr line for anyone tailing the boot log, and —
+    /// when a sink is attached — an appended line in the dedicated audit file,
+    /// which connection chatter can never evict. Keep the marker text stable:
+    /// the host's `read_egress_denials` parses `egress policy denied <op> <dest>`.
+    ///
+    /// The sink rotates once past 8 MiB (`.1` suffix) so a workload hammering a
+    /// denied destination at packet rate can't fill the host disk.
+    pub fn record_denial(&self, operation: &str, dest: &dyn std::fmt::Display) {
+        crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
+        let Some(path) = self.denial_log.as_deref() else {
+            return;
+        };
+        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
+            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "{}",
+                crate::format_network_log_line(
+                    std::time::SystemTime::now(),
+                    &format!("egress policy denied {operation} {dest}"),
+                )
+            );
+        }
+    }
+
     pub fn from_allowed_cidrs(allowed: Option<&[String]>) -> Self {
         Self::new(allowed, None)
     }

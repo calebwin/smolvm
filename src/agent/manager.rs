@@ -360,14 +360,14 @@ pub fn egress_telemetry_file(name: &str) -> PathBuf {
     vm_data_dir(name).join("egress")
 }
 
-/// Per-VM boot-subprocess stderr log: `<vm_data_dir>/agent-startup-error.log`.
-/// The subprocess re-points its own stderr here at startup (append mode, so
-/// prior boots survive), and the virtio-net runtime's unconditional log lines
-/// land in it — including the `egress policy denied` lines that are a confined
-/// machine's only record of blocked traffic. Resolved from the name on both
-/// sides of the process boundary, like [`egress_telemetry_file`].
-pub fn boot_stderr_log_file(name: &str) -> PathBuf {
-    vm_data_dir(name).join("agent-startup-error.log")
+/// Per-VM egress denial audit log: `<vm_data_dir>/egress-denials.log`. The
+/// virtio-net runtime appends one line per denied connect/sendto/resolve
+/// (append mode, so prior boots survive; rotated once past 8 MiB). Dedicated
+/// so ordinary connection chatter in the boot log can never evict an audit
+/// event. Resolved from the name on both sides of the process boundary, like
+/// [`egress_telemetry_file`].
+pub fn egress_denials_log_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(smolvm_network::EGRESS_DENIALS_LOG)
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
@@ -383,10 +383,9 @@ pub struct EgressDenial {
     pub dest: String,
 }
 
-/// How much of the VMM log tail to scan for denial lines. A denial line is
-/// ~100 bytes, so this window holds a few thousand events — far more than a
-/// caller pages through — while bounding the read on a long-lived machine
-/// whose log has grown.
+/// How much of the denial log tail to scan. The file holds only denial lines
+/// (~100 bytes each), so this window is a few thousand events — far more than
+/// a caller pages through — while bounding the read.
 const EGRESS_DENIAL_SCAN_BYTES: u64 = 256 * 1024;
 
 /// Read the egress denials recorded for `name`, oldest first, capped at
@@ -394,7 +393,7 @@ const EGRESS_DENIAL_SCAN_BYTES: u64 = 256 * 1024;
 /// booted, or built before the log existed) — absence of the file is
 /// "no denials observed", not an error.
 pub fn read_egress_denials(name: &str, limit: usize) -> Vec<EgressDenial> {
-    let path = boot_stderr_log_file(name);
+    let path = egress_denials_log_file(name);
     let Ok(mut file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
@@ -3175,7 +3174,7 @@ mod tests {
         // Write the log exactly where vmm_log_file() resolves for a
         // pid-namespaced throwaway name, and remove that dir afterwards.
         let name = format!("egress-test-{}", std::process::id());
-        let log = boot_stderr_log_file(&name);
+        let log = egress_denials_log_file(&name);
         std::fs::create_dir_all(log.parent().expect("parent")).expect("mkdir");
         let mut contents = String::new();
         for i in 0..10 {

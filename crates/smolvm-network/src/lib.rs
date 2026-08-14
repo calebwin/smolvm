@@ -187,7 +187,11 @@ impl GuestNetworkConfig {
     }
 }
 
-fn format_network_log_line(timestamp: SystemTime, message: &str) -> String {
+/// Filename of the per-VM egress denial audit log, created beside the vsock
+/// socket by the launcher and read back by the host's `read_egress_denials`.
+pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
+
+pub(crate) fn format_network_log_line(timestamp: SystemTime, message: &str) -> String {
     format!(
         "[{}]: {}",
         humantime::format_rfc3339_seconds(timestamp),

@@ -304,7 +304,7 @@ fn run_network_stack(
                     // the machine's egress audit trail (`read_egress_denials`).
                     let relay_allowed = udp_relay::should_relay_udp(destination, &egress);
                     if !relay_allowed && destination.port() != 53 {
-                        virtio_net_log!("egress policy denied sendto {}", destination);
+                        egress.record_denial("sendto", &destination);
                     }
                     if relay_allowed && udp_sockets.ensure_socket(destination, &mut sockets) {
                         if matches!(
@@ -783,7 +783,7 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
                 name
             );
             // Standardized marker for the egress audit trail (`read_egress_denials`).
-            virtio_net_log!("egress policy denied resolve {}", name);
+            egress.record_denial("resolve", &name);
             DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
         }
         None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),

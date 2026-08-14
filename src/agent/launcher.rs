@@ -1056,10 +1056,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     .iter()
                     .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
                     .collect();
-                let egress = smolvm_network::EgressPolicy::new(
+                // The denial sink lives beside the vsock socket — the same
+                // per-VM dir the host resolves via `vm_data_dir`, where
+                // `read_egress_denials` looks for it.
+                let denial_log = vsock_socket
+                    .parent()
+                    .map(|dir| dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+                let mut egress = smolvm_network::EgressPolicy::new(
                     resources.allowed_cidrs.as_deref(),
                     egress_refresh_hosts.as_deref(),
                 );
+                if let Some(path) = denial_log {
+                    egress = egress.with_denial_log(path);
+                }
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
 
                 // The host and guest ends of the virtio-net channel are an AF_UNIX
