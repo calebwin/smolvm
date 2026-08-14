@@ -588,6 +588,164 @@ fn should_expose_storage(mounts: &[(String, String, bool)], unprivileged: bool) 
 /// back to a name sort.
 const LAYER_ORDER_FILE: &str = "layer-order";
 
+/// Subdir on the storage disk holding layers this VM unpacked for itself.
+const GUEST_LAYERS_DIR: &str = "packed-layers";
+/// Marker written once every staged tar has been unpacked, holding the staged
+/// set's signature so a restart reuses the work and a changed pack redoes it.
+const GUEST_LAYERS_MARKER: &str = ".extracted";
+
+/// The layer tars a host staged for us rather than unpacking itself, if any.
+///
+/// A `.tar` whose sibling directory already exists was unpacked by the host, so
+/// it is not ours to redo.
+fn staged_layer_tars(packed_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut tars = Vec::new();
+    let entries = std::fs::read_dir(packed_dir)
+        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "tar") && !path.with_extension("").is_dir() {
+            tars.push(path);
+        }
+    }
+    tars.sort();
+    Ok(tars)
+}
+
+/// Unpack host-staged layer tars onto the storage disk and return that
+/// directory, or `None` when the host already unpacked them.
+///
+/// A host only unpacks a pack's layers itself when it can reproduce the
+/// archived uid/gid, which in practice means running as root on Unix.
+/// Everywhere else — macOS, Windows, a rootless Linux daemon — `chown` is
+/// simply unavailable, and unpacking there silently re-owns every file to
+/// whoever ran the command: an image's postgres files (uid 999) arrive owned by
+/// the host user, and the service cannot read the data directory it owns.
+///
+/// Those hosts stage the raw tars instead and we unpack them here, where the
+/// agent is root no matter what the host OS is. That is the same reason the
+/// ordinary registry-pull path (`crane` + `tar`, in-guest) has always got
+/// ownership right on every platform; this brings packs onto it.
+///
+/// Returning `None` for an already-unpacked dir leaves that path untouched, so
+/// artifacts made by earlier versions keep working and a root Linux host keeps
+/// sharing one extracted copy across every VM built on the pack.
+fn ensure_packed_layers_extracted_with_progress<F>(
+    packed_dir: &Path,
+    mut progress: F,
+) -> Result<Option<PathBuf>>
+where
+    F: FnMut(&str, u64),
+{
+    let tars = staged_layer_tars(packed_dir)?;
+    if tars.is_empty() {
+        return Ok(None);
+    }
+
+    let key = packed_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("packed");
+    let out = Path::new(STORAGE_ROOT).join(GUEST_LAYERS_DIR).join(key);
+    let marker = out.join(GUEST_LAYERS_MARKER);
+    let signature = staged_tars_signature(&tars)?;
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
+        return Ok(Some(out));
+    }
+
+    // First boot on this disk, or the pack changed under a reused one.
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out)?;
+    for tar in &tars {
+        let stem = tar.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+            StorageError::new(format!("unreadable layer name: {}", tar.display()))
+        })?;
+        let dir = out.join(stem);
+        std::fs::create_dir_all(&dir)?;
+        info!(layer = %stem, "unpacking staged layer");
+        progress("unpacking image layers", 0);
+        extract_layer_tar(tar, &dir)?;
+    }
+
+    // Carry the stacking order across; without it the guest would fall back to
+    // sorting layer dirs by digest, which is not OCI order.
+    let order = packed_dir.join(LAYER_ORDER_FILE);
+    if order.is_file() {
+        let _ = std::fs::copy(&order, out.join(LAYER_ORDER_FILE));
+    }
+
+    // Marker last, so an interrupted unpack is redone rather than trusted.
+    std::fs::write(&marker, signature)?;
+    Ok(Some(out))
+}
+
+/// Identify the staged set by each tar's name, size and mtime — enough to catch
+/// a machine re-created from a different pack on a reused storage disk, without
+/// reading hundreds of megabytes to hash them.
+fn staged_tars_signature(tars: &[PathBuf]) -> Result<String> {
+    let mut parts = Vec::with_capacity(tars.len());
+    for tar in tars {
+        let meta = std::fs::metadata(tar)
+            .map_err(|e| StorageError::read_error(tar.display().to_string(), e))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = tar.file_name().unwrap_or_default().to_string_lossy();
+        parts.push(format!("{name}:{}:{mtime}", meta.len()));
+    }
+    Ok(parts.join(","))
+}
+
+/// Unpack one layer tar into `dir`, preserving ownership.
+///
+/// `tar` restores the archived uid/gid when it runs as root, which the agent
+/// always does — that is the whole point of unpacking here rather than on the
+/// host.
+fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
+    let out = Command::new("tar")
+        .arg("-x")
+        .arg("-f")
+        .arg(tar)
+        .arg("-C")
+        .arg(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
+    if !out.status.success() {
+        return Err(StorageError::new(format!(
+            "failed to unpack layer {}: {}",
+            tar.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// The directory whose subdirs are this pack's layers, materialising them first
+/// if the host staged tars for us or handed us a saved-image archive.
+fn effective_packed_dir(packed_dir: &Path) -> Result<PathBuf> {
+    effective_packed_dir_with_progress(packed_dir, |_, _| {})
+}
+
+fn effective_packed_dir_with_progress<F>(packed_dir: &Path, mut progress: F) -> Result<PathBuf>
+where
+    F: FnMut(&str, u64),
+{
+    if let Some(flattened) = ensure_archive_flattened_with_progress(packed_dir, &mut progress)? {
+        return Ok(flattened);
+    }
+    if let Some(extracted) =
+        ensure_packed_layers_extracted_with_progress(packed_dir, &mut progress)?
+    {
+        return Ok(extracted);
+    }
+    Ok(packed_dir.to_path_buf())
+}
+
 /// Packed layer directory names in OCI order, **bottom-most layer first**.
 ///
 /// Honors [`LAYER_ORDER_FILE`] when present and self-consistent; otherwise falls
@@ -704,10 +862,6 @@ const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
 /// still matches, so a machine re-created from a different image on a reused
 /// disk re-flattens instead of booting the old rootfs. The marker is written
 /// last, so the image-info and overlay paths share one flatten within a start.
-fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
-    ensure_archive_flattened_with_progress(packed_dir, |_, _| {})
-}
-
 fn ensure_archive_flattened_with_progress<F>(
     packed_dir: &Path,
     mut progress: F,
@@ -1692,12 +1846,9 @@ where
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
         info!(image = %image, "using packed layers, skipping network pull");
-        // A local image archive is flattened into a rootfs first; an ordinary
-        // packed-layers dir is used as-is.
-        if let Some(flattened) = ensure_archive_flattened(packed_dir)? {
-            return create_packed_image_info(image, &flattened);
-        }
-        return create_packed_image_info(image, packed_dir);
+        // A saved-image archive is flattened, host-staged tars are unpacked
+        // here, and an already-unpacked dir is used as-is.
+        return create_packed_image_info(image, &effective_packed_dir(packed_dir)?);
     }
 
     // Determine OCI platform - default to current architecture
@@ -2002,9 +2153,8 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     // synthesize image info without a registry manifest, mirroring the pull
     // path. A local image archive is flattened into a rootfs first.
     if let Some(packed_dir) = get_packed_layers_dir() {
-        let flattened = ensure_archive_flattened(packed_dir)?;
-        let effective = flattened.as_deref().unwrap_or(packed_dir);
-        return Ok(Some(create_packed_image_info(image, effective)?));
+        let effective = effective_packed_dir(packed_dir)?;
+        return Ok(Some(create_packed_image_info(image, &effective)?));
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -2551,11 +2701,11 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     // Check if we have packed layers available
     if let Some(packed_dir) = get_packed_layers_dir() {
         info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
-        // A local image archive is flattened into a rootfs (a single packed
-        // layer) first; an ordinary packed-layers dir is used as-is.
-        let flattened = ensure_archive_flattened(packed_dir)?;
-        let effective = flattened.as_deref().unwrap_or(packed_dir);
-        return prepare_overlay_from_packed(image, workload_id, effective);
+        // A saved-image archive is flattened into a rootfs (a single packed
+        // layer), host-staged tars are unpacked here, and an already-unpacked
+        // dir is used as-is.
+        let effective = effective_packed_dir(packed_dir)?;
+        return prepare_overlay_from_packed(image, workload_id, &effective);
     }
 
     // Ensure image exists
@@ -3007,9 +3157,8 @@ where
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is.
     let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
-        let flattened = ensure_archive_flattened_with_progress(packed_dir, &mut progress)?;
-        let effective = flattened.as_deref().unwrap_or(packed_dir);
-        get_packed_lowerdirs(effective)?
+        let effective = effective_packed_dir_with_progress(packed_dir, &mut progress)?;
+        get_packed_lowerdirs(&effective)?
     } else {
         get_image_lowerdirs(image)?
     };

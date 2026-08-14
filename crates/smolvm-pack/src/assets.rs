@@ -415,6 +415,15 @@ impl AssetCollector {
         Ok(())
     }
 
+    /// Total bytes of the layer tars registered so far.
+    ///
+    /// From-vm packs record this as the manifest's `image_size` so the run-time
+    /// storage auto-sizer accounts for the layers — essential when the guest
+    /// unpacks staged tars onto the storage disk itself.
+    pub fn staged_layer_bytes(&self) -> u64 {
+        self.inventory.layers.iter().map(|l| l.size).sum()
+    }
+
     /// Get the staging path where a layer file should be written.
     ///
     /// Call this before streaming the layer to get the destination path,

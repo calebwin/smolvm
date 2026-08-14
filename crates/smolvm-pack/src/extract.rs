@@ -102,6 +102,68 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
+/// Restore a tar entry's numeric owner on `path`, ignoring errors. No-op on
+/// non-Unix targets and whenever the process cannot change ownership.
+///
+/// Container images address their service accounts by numeric id — postgres is
+/// uid 999, nginx 101, mysql 999 — and the guest sees the unpacked tree through
+/// virtiofs with those host ids intact. Dropping them makes every file root's,
+/// so the service cannot read the data directory it owns: PostgreSQL refuses to
+/// start on a root-owned PGDATA, which is how this surfaced. The tar headers
+/// carry the right ids; only the extraction discarded them.
+///
+/// `lchown`, not `chown`, so a symlink entry is not dereferenced and its target
+/// re-owned instead.
+///
+/// Only attempted as root. An unprivileged extraction — the normal case on
+/// macOS, where the VM's uid mapping makes the host owner irrelevant anyway —
+/// can only ever chown to itself, so EPERM there is expected rather than a
+/// failure worth reporting. Callers still mask setuid/setgid out of the mode,
+/// so a hostile header cannot pair a chosen owner with an escalating bit.
+#[inline]
+fn set_owner(path: &Path, uid: u64, gid: u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            unsafe {
+                libc::lchown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
+    }
+}
+
+/// Whether unpacking a pack's layers on this host reproduces the uid/gid the
+/// archive recorded.
+///
+/// Only root on a Unix host can: `chown` to another id requires the privilege,
+/// and Windows has no POSIX owner to restore at all. Unpacking anywhere else
+/// silently re-owns every file to whoever ran the command — a container image's
+/// postgres files (uid 999) land owned by the host user, and the service then
+/// cannot read the data directory it owns.
+///
+/// When this is false the layers are staged as tars instead and unpacked inside
+/// the guest, where the agent is always root. Host-side unpacking stays the
+/// default where it is faithful, because one extracted copy is shared by every
+/// VM built on the pack; the in-guest copy lives on a single machine's disk.
+fn host_unpack_preserves_ownership() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Files larger than this threshold are extracted with a sparse write
 /// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
 /// dense sequential write.  Chosen to match typical overlay disk sizes while
@@ -523,6 +585,12 @@ fn safe_unpack_with_limits<R: Read>(
         let is_regular =
             entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse;
 
+        // Read the owner off the header before the entry is consumed: the
+        // sparse path streams `entry` to exhaustion, after which the header is
+        // still available but reading it here keeps both branches symmetric.
+        let uid = entry.header().uid().unwrap_or(0);
+        let gid = entry.header().gid().unwrap_or(0);
+
         // For large regular files use a sparse write: ftruncate creates the
         // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
         // prevents 10 GiB overlay disks from materialising as dense files on
@@ -536,6 +604,7 @@ fn safe_unpack_with_limits<R: Read>(
                     format!("failed to unpack '{}': {}", entry_path.display(), e),
                 ));
             }
+            set_owner(&full_path, uid, gid);
         } else {
             if let Err(e) = entry.unpack_in(dest) {
                 // On macOS, certain entries fail to unpack due to platform
@@ -557,6 +626,11 @@ fn safe_unpack_with_limits<R: Read>(
             if entry_type == tar::EntryType::Directory && full_path.is_dir() {
                 set_mode(&full_path, 0o755);
             }
+
+            // Ownership after the mode is in place: chown clears setuid/setgid,
+            // and the deferred directory pass below only restores modes, never
+            // owners, so doing it here is the single point that applies.
+            set_owner(&full_path, uid, gid);
         }
     }
 
@@ -1227,7 +1301,25 @@ fn post_process_extraction(
     // APFS sparse disk image on macOS. The image is persisted in the cache and
     // re-mounted on subsequent runs.
     let layers_dir = cache_dir.join("layers");
-    if layers_dir.exists() {
+    if layers_dir.exists() && !host_unpack_preserves_ownership() {
+        // This host cannot reproduce the archived uid/gid (see
+        // `host_unpack_preserves_ownership`), so leave the tars staged and let
+        // the guest agent unpack them, where it is root on every host OS.
+        // Only the stacking order has to be recorded here, against the tars.
+        if debug {
+            eprintln!("debug: staging OCI layers for in-guest extraction...");
+        }
+        if !layer_order.is_empty() {
+            let lines: Vec<&str> = layer_order
+                .iter()
+                .filter(|id| layers_dir.join(format!("{id}.tar")).is_file())
+                .map(String::as_str)
+                .collect();
+            if !lines.is_empty() {
+                fs::write(layers_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+            }
+        }
+    } else if layers_dir.exists() {
         if debug {
             eprintln!("debug: extracting OCI layers...");
         }
@@ -1368,8 +1460,15 @@ impl Drop for LayersVolumeLease {
 pub fn acquire_layers_lease(cache_dir: &Path, debug: bool) -> std::io::Result<LayersVolumeLease> {
     #[cfg(target_os = "macos")]
     {
+        // The case-sensitive volume only ever holds HOST-extracted layers.
+        // When the host stages tars for in-guest extraction instead (see
+        // `host_unpack_preserves_ownership`), the tars live in
+        // `cache_dir/layers` and the volume was never created — returning it
+        // here would hand the guest an empty directory. An existing sparse
+        // image still wins, so packs extracted by an earlier version (or by a
+        // root run) keep mounting the volume they were extracted into.
         let image_path = cache_dir.join(CS_IMAGE_NAME);
-        if image_path.exists() || has_layer_tars(cache_dir) {
+        if image_path.exists() || (host_unpack_preserves_ownership() && has_layer_tars(cache_dir)) {
             // Case-sensitive volume is required on macOS to preserve Linux
             // paths faithfully. Fail if it can't be acquired rather than
             // silently falling back to case-insensitive extraction.
@@ -1404,8 +1503,11 @@ pub fn acquire_daemon_lease(
 ) -> std::io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
+        // Same gate as `acquire_layers_lease`: staged tars are shared to the
+        // guest from `cache_dir/layers` directly, so the case-sensitive volume
+        // is only in play when the host extracted into it.
         let image_path = cache_dir.join(CS_IMAGE_NAME);
-        if image_path.exists() || has_layer_tars(cache_dir) {
+        if image_path.exists() || (host_unpack_preserves_ownership() && has_layer_tars(cache_dir)) {
             let leases_dir = cache_dir.join(LEASES_DIR);
             fs::create_dir_all(&leases_dir)?;
             let lock = lock_leases(cache_dir)?;
@@ -2264,6 +2366,80 @@ mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"untouched");
     }
 
+    /// Container images address their service accounts numerically — postgres
+    /// is uid 999 — so an extraction that drops the ids hands the service a
+    /// data directory it cannot read, and PostgreSQL refuses to start on it.
+    /// As root the ids must survive; unprivileged, extraction must still
+    /// succeed rather than failing on the EPERM it cannot avoid.
+    #[cfg(unix)]
+    #[test]
+    fn unpacking_preserves_the_headers_numeric_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("out");
+        fs::create_dir_all(&dest).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o600);
+        header.set_uid(999);
+        header.set_gid(999);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "pgdata", &b"data"[..])
+            .unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack(&mut archive, &dest).expect("extraction succeeds at either privilege level");
+
+        let meta = fs::metadata(dest.join("pgdata")).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            assert_eq!(meta.uid(), 999, "the header's uid must survive extraction");
+            assert_eq!(meta.gid(), 999, "the header's gid must survive extraction");
+        } else {
+            assert_eq!(
+                meta.uid(),
+                euid,
+                "unprivileged extraction leaves the caller as owner, without erroring"
+            );
+        }
+    }
+
+    /// `lchown`, not `chown`: re-owning a symlink entry must not reach through
+    /// the link and re-own whatever it points at.
+    #[cfg(unix)]
+    #[test]
+    fn re_owning_a_symlink_leaves_its_target_untouched() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        if unsafe { libc::geteuid() } != 0 {
+            return; // chown is a no-op unprivileged, so there is nothing to assert
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("target");
+        let link = temp_dir.path().join("link");
+        fs::write(&target, b"x").unwrap();
+        symlink(&target, &link).unwrap();
+
+        set_owner(&link, 999, 999);
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().uid(),
+            0,
+            "the link's target must keep its own owner"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&link).unwrap().uid(),
+            999,
+            "the link itself is re-owned"
+        );
+    }
+
     /// Build a tar archive carrying a single symlink entry whose link target
     /// is `link_target`, plus (optionally) a trailing regular-file entry.
     fn make_symlink_tar(name: &str, link_target: &str) -> Vec<u8> {
@@ -2993,33 +3169,60 @@ mod tests {
         );
     }
 
+    /// Staged tars (in-guest extraction mode) must be shared from the plain
+    /// `layers` dir — a case-sensitive volume was never created for them, so
+    /// mounting one would hand the guest an empty directory.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn staged_tars_do_not_mount_a_volume() {
+        if host_unpack_preserves_ownership() {
+            return; // as root the host extracts into the volume; covered below
+        }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        fs::create_dir_all(cache_dir.join("layers")).unwrap();
+        fs::write(cache_dir.join("layers/dummy.tar"), b"").unwrap();
+
+        let lease = acquire_layers_lease(&cache_dir, false).unwrap();
+        assert_eq!(
+            lease.path,
+            cache_dir.join("layers"),
+            "staged tars are shared to the guest as-is"
+        );
+        assert!(!is_mount_point(&lease.path));
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn test_layers_lease_creates_and_cleans_volume() {
-        // Verify that acquire_layers_lease creates a case-sensitive sparse
-        // image, mounts it, and detaches on lease drop.
-        // Skips gracefully if hdiutil is unavailable (CI, sandboxed envs).
+        // Verify the case-sensitive volume lifecycle: created and mounted on
+        // acquire, detached on lease drop, and — once the sparse image exists
+        // (a pack extracted by root or an earlier version) — chosen again by
+        // the public accessor. Skips gracefully if hdiutil is unavailable
+        // (CI, sandboxed envs).
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_dir = temp_dir.path().join("cache");
         // Create a dummy tar so has_layer_tars() returns true.
         fs::create_dir_all(cache_dir.join("layers")).unwrap();
         fs::write(cache_dir.join("layers/dummy.tar"), b"").unwrap();
 
-        let lease = match acquire_layers_lease(&cache_dir, false) {
+        // Drive the volume machinery directly (the public accessor only takes
+        // this path for root extraction or a pre-existing image).
+        let lease = match acquire_lease(&cache_dir, false) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("SKIP: hdiutil unavailable: {}", e);
                 return;
             }
         };
-        assert!(lease.path.exists());
-        assert!(is_mount_point(&lease.path));
+        assert!(lease.exists());
+        assert!(is_mount_point(&lease));
 
         // Both "lower" and "Lower" should coexist on the case-sensitive volume.
-        fs::write(lease.path.join("lower"), "file").unwrap();
-        fs::create_dir_all(lease.path.join("Lower")).unwrap();
-        assert!(lease.path.join("lower").exists());
-        assert!(lease.path.join("Lower").is_dir());
+        fs::write(lease.join("lower"), "file").unwrap();
+        fs::create_dir_all(lease.join("Lower")).unwrap();
+        assert!(lease.join("lower").exists());
+        assert!(lease.join("Lower").is_dir());
 
         // Lease file should exist while lease is held.
         let lease_file = cache_dir
@@ -3027,13 +3230,19 @@ mod tests {
             .join(format!("{}", std::process::id()));
         assert!(lease_file.exists());
 
-        // Drop lease — should detach volume (last lease).
-        let mount_point = lease.path.clone();
-        drop(lease);
+        // Release — should detach volume (last lease).
+        release_lease(&cache_dir);
         assert!(
-            !is_mount_point(&mount_point),
+            !is_mount_point(&lease),
             "volume should be detached after last lease drop"
         );
+
+        // The sparse image persists; the public accessor must now pick the
+        // volume back up even though extraction mode would stage tars.
+        let compat = acquire_layers_lease(&cache_dir, false).unwrap();
+        assert!(is_mount_point(&compat.path), "existing image is honored");
+        assert!(compat.path.join("lower").exists());
+        drop(compat);
     }
 
     #[test]

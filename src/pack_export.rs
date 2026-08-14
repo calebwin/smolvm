@@ -59,6 +59,13 @@ pub struct FromVmAssets {
     /// that path already copied the source manifest's env into the record, so the
     /// machine's own env is the complete set.
     pub image_env: Vec<String>,
+    /// Total bytes of the layer tars collected for this pack.
+    ///
+    /// Recorded as the manifest's `image_size` so the run-time storage
+    /// auto-sizer reserves room for them; without it a from-vm pack falls back
+    /// to the minimal default disk, which cannot hold the layers when the
+    /// guest has to unpack staged tars onto it.
+    pub layer_bytes: u64,
 }
 
 /// Collect a stopped machine's pack assets into `collector` and report the
@@ -158,6 +165,7 @@ pub fn collect_from_vm_assets(
         },
         image: vm.image.clone(),
         image_env,
+        layer_bytes: collector.staged_layer_bytes(),
     })
 }
 
@@ -165,6 +173,10 @@ pub fn collect_from_vm_assets(
 /// Smolfile overrides layer on top of this baseline at the call site.
 pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets: &FromVmAssets) {
     manifest.mode = assets.mode.clone();
+    // Without this the run-time storage auto-sizer sees a legacy manifest and
+    // creates the minimal default disk — too small to hold the layers when the
+    // guest unpacks staged tars onto it.
+    manifest.image_size = assets.layer_bytes;
     if let Some(ref image) = assets.image {
         manifest.image = image.clone();
     }
