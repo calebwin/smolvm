@@ -1691,7 +1691,7 @@ async fn boot_prepared_fork_inner(
             let _ = db.remove_vm(&clone_b);
         };
         crate::agent::fork::fail_closed_on_rejuvenation(
-            crate::agent::fork::rejuvenate_clone(&clone_b),
+            crate::agent::fork::rejuvenate_clone(&clone_b, &record),
             teardown,
         )
         .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;

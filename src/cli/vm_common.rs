@@ -1102,7 +1102,7 @@ fn boot_prepared_fork(
     }
 
     smolvm::agent::fork::fail_closed_on_rejuvenation(
-        smolvm::agent::fork::rejuvenate_clone(clone),
+        smolvm::agent::fork::rejuvenate_clone(clone, &prep.clone_record),
         || teardown_fork_clone(db, clone),
     )?;
     smolvm::agent::fork::fail_closed_on_rejuvenation(

@@ -897,20 +897,94 @@ const REJUVENATE_ATTEMPTS: usize = 3;
 /// fork must fail rather than vend a clone that impersonates the golden. Steps
 /// that are legitimately absent on minimal/library images (no sshd, no dbus,
 /// no cloud-init) are guarded so they no-op instead of failing.
-fn build_rejuvenation_script(clone: &str, seed: &str) -> String {
+fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> String {
+    // An image machine's identity files live in the workload container's
+    // rootfs, NOT the VM rootfs the agent execs in — writing them unprefixed
+    // strands them where no workload will ever read them, leaving the clone on
+    // the golden's SSH host keys. Reach the container through its overlayfs
+    // `merged` mount, exactly as [`write_fork_env`] does and for the same
+    // reason: a container exec would recycle the workload the fork just
+    // restored. A bare VM (no image) keeps the plain VM-rootfs paths.
+    let (root, require_root) = match record.image {
+        Some(_) => {
+            let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+            let merged = format!("/storage/overlays/persistent-{owner}/merged");
+            let require = format!(
+                "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
+                 ls /storage/overlays >&2; exit 41; fi; "
+            );
+            (merged, require)
+        }
+        None => (String::new(), String::new()),
+    };
+    // `ssh-keygen -A` writes to a hardcoded /etc/ssh, so regenerating the
+    // container's keys means running the container's own binary under chroot.
+    // Both tools are probed by absolute path: the agent's exec PATH does not
+    // necessarily carry /usr/sbin, and a bare `command -v chroot` that misses
+    // aborts the script under `set -e` — after the old keys are already gone.
+    //
+    // The chroot also needs device nodes: the workload's /dev is a tmpfs mounted
+    // inside the container's mount namespace, so from the agent's namespace the
+    // merged rootfs has an empty /dev and `ssh-keygen` finds no entropy source.
+    // Nodes this creates are removed again; the container's own /dev tmpfs hides
+    // them from the workload either way.
+    //
+    // Availability is checked BEFORE anything is deleted so that an
+    // unsatisfiable clone fails the same way on every retry. Otherwise attempt
+    // one removes the keys, fails, and attempt two finds no keys to rotate and
+    // reports success — laundering the failure the retry loop exists to catch.
+    let ssh_block = if root.is_empty() {
+        "if ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then \
+             KG=''; for k in /usr/bin/ssh-keygen /bin/ssh-keygen /usr/local/bin/ssh-keygen; do \
+                 if [ -x \"$k\" ]; then KG=\"$k\"; break; fi; \
+             done; \
+             if [ -z \"$KG\" ]; then echo 'no ssh-keygen to rotate the host keys' >&2; exit 42; fi; \
+             rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; \
+             \"$KG\" -A >/dev/null 2>&1 || true; \
+             if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then \
+                 echo 'host key rotation produced no keys' >&2; exit 42; \
+             fi; \
+         fi"
+            .to_string()
+    } else {
+        format!(
+            "if ls {root}/etc/ssh/ssh_host_*_key >/dev/null 2>&1; then \
+                 CH=''; for c in /usr/sbin/chroot /sbin/chroot /usr/bin/chroot; do \
+                     if [ -x \"$c\" ]; then CH=\"$c\"; break; fi; \
+                 done; \
+                 KG=''; for k in /usr/bin/ssh-keygen /bin/ssh-keygen /usr/local/bin/ssh-keygen; do \
+                     if [ -x {root}\"$k\" ]; then KG=\"$k\"; break; fi; \
+                 done; \
+                 if [ -z \"$CH\" ] || [ -z \"$KG\" ]; then \
+                     echo 'no chroot/ssh-keygen to rotate the workload host keys' >&2; exit 42; \
+                 fi; \
+                 rm -f {root}/etc/ssh/ssh_host_*_key {root}/etc/ssh/ssh_host_*_key.pub; \
+                 MADE=''; mkdir -p {root}/dev; \
+                 for d in 'urandom c 1 9' 'random c 1 8' 'null c 1 3'; do \
+                     set -- $d; \
+                     if [ ! -e {root}/dev/$1 ] && mknod -m 666 {root}/dev/$1 $2 $3 $4 2>/dev/null; then \
+                         MADE=\"$MADE {root}/dev/$1\"; \
+                     fi; \
+                 done; \
+                 \"$CH\" {root} \"$KG\" -A >/dev/null 2>&1 || true; \
+                 if [ -n \"$MADE\" ]; then rm -f $MADE; fi; \
+                 if ! ls {root}/etc/ssh/ssh_host_*_key >/dev/null 2>&1; then \
+                     echo 'host key rotation produced no keys' >&2; exit 42; \
+                 fi; \
+             fi"
+        )
+    };
     format!(
         "set -e; \
+         {require_root}\
          hostname '{c}' 2>/dev/null || true; \
-         printf '%s\\n' '{c}' > /etc/hostname; \
-         tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id; \
-         if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then \
-             tr -d '-' < /proc/sys/kernel/random/uuid > /var/lib/dbus/machine-id; \
+         printf '%s\\n' '{c}' > {root}/etc/hostname; \
+         tr -d '-' < /proc/sys/kernel/random/uuid > {root}/etc/machine-id; \
+         if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
+             tr -d '-' < /proc/sys/kernel/random/uuid > {root}/var/lib/dbus/machine-id; \
          fi; \
-         if [ -d /etc/ssh ] && command -v ssh-keygen >/dev/null 2>&1; then \
-             rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; \
-             ssh-keygen -A >/dev/null 2>&1; \
-         fi; \
-         rm -rf /var/lib/cloud/instance /var/lib/cloud/instances/* /var/lib/cloud/data/instance-id 2>/dev/null || true; \
+         {ssh_block}; \
+         rm -rf {root}/var/lib/cloud/instance {root}/var/lib/cloud/instances/* {root}/var/lib/cloud/data/instance-id 2>/dev/null || true; \
          printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
          umask 077; \
          mkdir -p '{state_dir}'; \
@@ -948,10 +1022,10 @@ fn build_rejuvenation_script(clone: &str, seed: &str) -> String {
 /// disk rejuvenation. Likewise this stirs but does not *credit* entropy
 /// (no `RNDADDENTROPY`/VMGENID yet) and does not re-address the network
 /// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
-pub fn rejuvenate_clone(clone: &str) -> Result<()> {
+pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
     let sock = vm_data_dir(clone).join("agent.sock");
     let seed = host_random_hex(64);
-    let script = build_rejuvenation_script(clone, &seed);
+    let script = build_rejuvenation_script(clone, &seed, record);
 
     let mut last_err = String::from("unknown error");
     for attempt in 1..=REJUVENATE_ATTEMPTS {
@@ -1801,9 +1875,19 @@ mod tests {
     // Fix 1: the re-mint script must regenerate the per-machine on-disk secrets
     // that a wholesale CoW disk clone would otherwise share across tenants —
     // above all the SSH host keys.
+    fn bare_vm_record() -> VmRecord {
+        VmRecord::new("clone-a".to_string(), 1, 512, vec![], vec![], false)
+    }
+
+    fn image_record() -> VmRecord {
+        let mut record = bare_vm_record();
+        record.image = Some("alpine:latest".to_string());
+        record
+    }
+
     #[test]
     fn rejuvenation_script_regenerates_per_machine_secrets() {
-        let script = build_rejuvenation_script("clone-a", "deadbeef");
+        let script = build_rejuvenation_script("clone-a", "deadbeef", &bare_vm_record());
 
         // SSH host keys: delete the golden's, then regenerate fresh ones.
         assert!(
@@ -1811,7 +1895,11 @@ mod tests {
             "script must remove the golden's SSH host keys: {script}"
         );
         assert!(
-            script.contains("ssh-keygen -A"),
+            script.contains("/usr/bin/ssh-keygen"),
+            "script must locate ssh-keygen by absolute path: {script}"
+        );
+        assert!(
+            script.contains(r#""$KG" -A"#),
             "script must regenerate SSH host keys: {script}"
         );
         // Fresh machine-id, hostname, and dbus id.
@@ -1829,7 +1917,10 @@ mod tests {
         // Guarded so it fails hard on core identity but no-ops when sshd/dbus
         // are absent (minimal library images).
         assert!(script.contains("set -e"));
-        assert!(script.contains("command -v ssh-keygen"));
+        // Probed by absolute path, not `command -v`: the agent's exec PATH need
+        // not carry the directory, and a miss under `set -e` would abort the
+        // script after the old keys were already deleted.
+        assert!(!script.contains("command -v ssh-keygen"));
     }
 
     // The rejuvenation script must NOT touch the inherited exec overlay: the
@@ -1838,11 +1929,72 @@ mod tests {
     // (ESTALE). Overlay adoption is a host-side lookup alias instead.
     #[test]
     fn rejuvenation_script_leaves_the_inherited_overlay_alone() {
-        let script = build_rejuvenation_script("clone-a", "deadbeef");
+        let script = build_rejuvenation_script("clone-a", "deadbeef", &image_record());
+        // Writing files THROUGH the merged mount is how the workload's rootfs is
+        // reached (same as `write_fork_env`); what breaks a live overlayfs is
+        // renaming or removing its backing dirs.
+        // Paths *inside* the merged mount are the workload's own files; what must
+        // never happen is the overlay root itself being renamed or removed.
+        let merged = "/storage/overlays/persistent-clone-a/merged";
+        for destructive in [
+            format!("mv {merged}"),
+            format!("rmdir {merged}"),
+            format!("rm -rf {merged} "),
+            format!("rm -rf {merged};"),
+        ] {
+            assert!(
+                !script.contains(&destructive),
+                "script must not rename/remove the overlay root: {script}"
+            );
+        }
+    }
+
+    // The regression this guards: identity files written unprefixed land in the
+    // VM rootfs, where no workload reads them, so every clone of an image
+    // machine kept the golden's SSH host keys.
+    #[test]
+    fn image_clones_rejuvenate_identity_inside_the_workload_rootfs() {
+        let script = build_rejuvenation_script("clone-a", "deadbeef", &image_record());
+        let merged = "/storage/overlays/persistent-clone-a/merged";
         assert!(
-            !script.contains("/storage/overlays"),
-            "script must not rename/touch overlay dirs: {script}"
+            script.contains(&format!("{merged}/etc/hostname")),
+            "hostname must be written into the workload rootfs: {script}"
         );
+        assert!(
+            script.contains(&format!("{merged}/etc/machine-id")),
+            "machine-id must be written into the workload rootfs: {script}"
+        );
+        assert!(
+            script.contains(&format!("{merged}/etc/ssh/ssh_host_")),
+            "SSH host keys must be replaced inside the workload rootfs: {script}"
+        );
+        // The container's own ssh-keygen, since `-A` writes to a fixed /etc/ssh.
+        assert!(
+            script.contains(&format!(r#""$CH" {merged}"#)),
+            "keys must be regenerated by the container's own binary: {script}"
+        );
+        assert!(script.contains("/usr/sbin/chroot"));
+        // Fail-closed: a missing overlay, or keys that could not be regenerated,
+        // must abort rather than vend a clone on the golden's identity.
+        assert!(
+            script.contains("exit 41"),
+            "missing overlay must abort: {script}"
+        );
+        assert!(
+            script.contains("exit 42"),
+            "unregenerated keys must abort: {script}"
+        );
+    }
+
+    // A bare VM has no workload container, so paths stay VM-rootfs relative.
+    #[test]
+    fn bare_vm_clones_keep_plain_vm_paths() {
+        let script = build_rejuvenation_script("clone-a", "deadbeef", &bare_vm_record());
+        assert!(script.contains("> /etc/hostname"));
+        assert!(!script.contains("/storage/overlays"));
+        assert!(script.contains(r#""$KG" -A"#));
+        // No chroot on the bare-VM path: the VM rootfs is the workload's rootfs.
+        assert!(!script.contains("chroot"));
     }
 
     // Fix 2 (fail-closed): an Err rejuvenation must tear the clone down and
