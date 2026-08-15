@@ -566,7 +566,7 @@ impl PackRunCmd {
             std::fs::write(&config_path, &config_json)
                 .map_err(|e| Error::agent("write boot config", e.to_string()))?;
 
-            let exe = std::env::current_exe()
+            let exe = smolvm::process::self_exe_for_spawn()
                 .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["_boot-vm", &config_path.to_string_lossy()])
@@ -1576,7 +1576,7 @@ fn run_from_cache(
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
         std::fs::write(&config_path, &config_json)
             .map_err(|e| Error::agent("write boot config", e.to_string()))?;
-        let exe = std::env::current_exe()
+        let exe = smolvm::process::self_exe_for_spawn()
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])

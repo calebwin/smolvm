@@ -1410,6 +1410,28 @@ pub fn setup_pack_idmap_mount(
     result
 }
 
+/// Path to spawn another copy of the currently running executable.
+///
+/// On Linux this returns `/proc/self/exe`, which the kernel resolves at exec
+/// time to the running binary's inode — even after the file at the binary's
+/// on-disk path has been replaced or unlinked. A long-lived `serve` whose
+/// binary is swapped by an install/upgrade would otherwise see
+/// `current_exe()` = "…/smolvm-bin (deleted)" and fail every subsequent VM
+/// boot with ENOENT; spawning through `/proc/self/exe` also guarantees the
+/// boot subprocess runs the same code version as the process that spawned it,
+/// never a half-written replacement. Elsewhere the textual path is the only
+/// option.
+pub fn self_exe_for_spawn() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let proc_self = std::path::Path::new("/proc/self/exe");
+        if proc_self.exists() {
+            return Ok(proc_self.to_path_buf());
+        }
+    }
+    std::env::current_exe()
+}
+
 /// PIDs of detached VM boot subprocesses to reap. Registered by
 /// [`register_vm_child`] right after spawn (the boot subprocess is intentionally
 /// detached — own process group, never `wait()`ed — so it becomes a zombie on

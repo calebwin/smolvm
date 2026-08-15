@@ -1848,7 +1848,7 @@ impl AgentManager {
             ) {
                 let daemon_executable = match std::env::var_os("SMOLVM_BOOT_BINARY") {
                     Some(path) => PathBuf::from(path),
-                    None => std::env::current_exe()
+                    None => crate::process::self_exe_for_spawn()
                         .map_err(|error| Error::agent("find smolvm binary", error.to_string()))?,
                 };
                 crate::cuda_daemon::ensure_running_with_executable(
@@ -2183,7 +2183,7 @@ impl AgentManager {
         );
 
         // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
-        let exe = std::env::current_exe()
+        let exe = crate::process::self_exe_for_spawn()
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
