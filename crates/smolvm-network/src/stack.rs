@@ -347,6 +347,7 @@ fn run_network_stack(
             &mut sockets,
             &egress,
             config.upstream_dns,
+            config.gateway_ipv4,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -356,6 +357,7 @@ fn run_network_stack(
             &mut sockets,
             &egress,
             config.upstream_dns,
+            config.gateway_ipv4,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -771,7 +773,17 @@ enum DnsDecision {
 /// inactive everything is forwarded (no learning); otherwise only allow-listed
 /// names are forwarded and learned, others get NXDOMAIN and unparseable ones
 /// SERVFAIL. Identical policy to the old `filtered_dns_response`.
-fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
+///
+/// The gateway's own name is answered before the filter runs: it names
+/// gateway-internal plumbing, not egress, so it must resolve even under a
+/// strict allow-host policy.
+fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
+    if dns::question_name(query)
+        .and_then(|n| dns::normalize_hostname(&n))
+        .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)
+    {
+        return DnsDecision::Immediate(dns::gateway_response(query, gateway_ipv4));
+    }
     if !egress.dns_filter_active() {
         return DnsDecision::Forward { learn: false };
     }
@@ -799,6 +811,7 @@ fn dispatch_dns_udp(
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
     upstream_dns: Ipv4Addr,
+    gateway_ipv4: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -811,7 +824,7 @@ fn dispatch_dns_udp(
             Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
             Err(_) => break,
         };
-        match classify_dns_query(&query, egress) {
+        match classify_dns_query(&query, egress, gateway_ipv4) {
             DnsDecision::Immediate(response) => {
                 let response_meta = UdpMetadata {
                     endpoint,
@@ -974,6 +987,7 @@ fn process_dns_tcp(
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
     upstream_dns: Ipv4Addr,
+    gateway_ipv4: Ipv4Addr,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -1038,7 +1052,7 @@ fn process_dns_tcp(
                     query.len(),
                     upstream_dns
                 );
-                match classify_dns_query(&query, egress) {
+                match classify_dns_query(&query, egress, gateway_ipv4) {
                     DnsDecision::Immediate(response) => {
                         frame_dns_tcp_response(conn, &response);
                         conn.done = true;
