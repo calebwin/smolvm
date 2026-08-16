@@ -143,8 +143,6 @@ fn parse_answer_ip_records(packet: &[u8]) -> Option<Vec<(IpAddr, u32)>> {
     Some(ips)
 }
 
-/// Build a DNS response carrying just an error `rcode` (e.g. NXDOMAIN), echoing
-/// the query id and question. Mirrors libkrun's `build_error_response`.
 /// A NOERROR answer for the gateway's own name ([`GATEWAY_HOSTNAME`]): an A
 /// query gets the gateway address, any other qtype an empty answer section
 /// (AAAA in particular — v6-first resolvers then settle on the A record).
@@ -169,6 +167,8 @@ pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
     response
 }
 
+/// Build a DNS response carrying just an error `rcode` (e.g. NXDOMAIN), echoing
+/// the query id and question. Mirrors libkrun's `build_error_response`.
 pub fn error_response(query: &[u8], rcode: u16) -> Vec<u8> {
     let id: &[u8] = if query.len() >= DNS_ID_LEN {
         &query[..DNS_ID_LEN]
