@@ -173,7 +173,7 @@ pub fn ethernet_frame_for_guest(
 /// index, raw IP packet)`. Bounded so a peer outage back-pressures into
 /// packet drops (IP semantics) instead of unbounded memory.
 #[cfg(unix)]
-const SENDER_QUEUE_DEPTH: usize = 512;
+const SENDER_QUEUE_DEPTH: usize = 2048;
 
 /// Poll cadence for shutdown checks on the otherwise-blocking fabric
 /// threads (accept loop and per-peer readers).
@@ -260,6 +260,12 @@ fn run_accept_loop(
 /// Deliver one peer connection's packets to the guest. A packet is wrapped
 /// in the Ethernet frame the guest expects from its gateway and pushed onto
 /// the same queue smoltcp egress uses; a full queue drops the packet.
+///
+/// The socket carries a short read timeout purely as a shutdown poll. A
+/// timeout mid-frame is NOT an error: `read_full` resumes where it left off,
+/// because `read_exact` would discard partially-read bytes on timeout and
+/// desync the length-prefixed stream (found the hard way: small packets
+/// survived, bulk transfers corrupted).
 #[cfg(unix)]
 fn run_peer_reader(
     stream: UnixStream,
@@ -270,26 +276,55 @@ fn run_peer_reader(
     let mut stream = stream;
     let _ = stream.set_read_timeout(Some(SHUTDOWN_POLL));
     loop {
-        if queues.is_shutting_down() {
-            return;
+        let mut len_bytes = [0u8; 4];
+        match read_full(&mut stream, &mut len_bytes, &queues) {
+            Ok(true) => {}
+            _ => return, // clean EOF, real error, or shutdown
         }
-        match read_packet(&mut stream) {
-            Ok(Some(packet)) => {
-                let frame = ethernet_frame_for_guest(gateway_mac, guest_mac, &packet);
-                if queues.host_to_guest.push(frame).is_ok() {
-                    queues.host_wake.wake();
-                }
-            }
-            Ok(None) => return, // peer closed
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        if len == 0 || len > MAX_PACKET {
+            return; // corrupt peer; drop the connection
+        }
+        let mut packet = vec![0u8; len];
+        match read_full(&mut stream, &mut packet, &queues) {
+            Ok(true) => {}
+            _ => return,
+        }
+        let frame = ethernet_frame_for_guest(gateway_mac, guest_mac, &packet);
+        if queues.host_to_guest.push(frame).is_ok() {
+            queues.host_wake.wake();
+        }
+    }
+}
+
+/// Fill `buf` completely, resuming across poll-timeout wakeups and stopping
+/// on shutdown. `Ok(false)` = clean EOF before the first byte; EOF mid-buffer
+/// is an error (a torn frame).
+#[cfg(unix)]
+fn read_full(
+    stream: &mut UnixStream,
+    buf: &mut [u8],
+    queues: &NetworkFrameQueues,
+) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        if queues.is_shutting_down() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "shutting down"));
+        }
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => filled += n,
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
                 continue;
             }
-            Err(_) => return,
+            Err(err) => return Err(err),
         }
     }
+    Ok(true)
 }
 
 /// Drain forwarded packets to peer registry sockets, connecting on demand
@@ -309,6 +344,13 @@ fn run_sender(dir: PathBuf, receiver: Receiver<(u8, Vec<u8>)>, queues: Arc<Netwo
     }
 }
 
+/// A peer that stops draining stalls its connection; cap how long one frame
+/// may block the (shared) sender before the connection is torn down. Long
+/// enough to ride out scheduling hiccups, short enough that one wedged peer
+/// cannot freeze the whole fabric for long.
+#[cfg(unix)]
+const WRITE_STALL_LIMIT: Duration = Duration::from_secs(5);
+
 #[cfg(unix)]
 fn send_to_peer(
     dir: &Path,
@@ -321,11 +363,42 @@ fn send_to_peer(
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(slot) => {
             let stream = UnixStream::connect(peer_socket_path(dir, index))?;
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            let _ = stream.set_write_timeout(Some(SHUTDOWN_POLL));
             slot.insert(stream)
         }
     };
-    write_packet(stream, packet)
+    // Frame the packet in one buffer so a partial write can be resumed from
+    // an offset; `write_all` under a socket timeout would corrupt the stream
+    // mid-frame (the bytes already sent cannot be unsent).
+    let mut frame = Vec::with_capacity(4 + packet.len());
+    frame.extend_from_slice(&(packet.len() as u32).to_be_bytes());
+    frame.extend_from_slice(packet);
+    write_full(stream, &frame)
+}
+
+/// Write `buf` completely, resuming across timeout wakeups; give up (so the
+/// caller drops the connection) once a single frame has stalled too long.
+#[cfg(unix)]
+fn write_full(stream: &mut UnixStream, buf: &[u8]) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let mut written = 0;
+    while written < buf.len() {
+        match stream.write(&buf[written..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() > WRITE_STALL_LIMIT {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Non-Unix stub: named networks need Unix domain sockets for the peer
