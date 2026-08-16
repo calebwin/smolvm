@@ -199,6 +199,10 @@ fn run_network_stack(
     let mut device = VirtioNetworkDevice::new(queues.clone(), config.mtu);
     let mut interface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
+    let dns_routing = DnsRouting {
+        upstream: config.upstream_dns,
+        gateway: config.gateway_ipv4,
+    };
     let dns_socket_handle = add_dns_socket(&mut sockets);
     let dns_tcp_handles = add_dns_tcp_sockets(&mut sockets);
     let mut dns_tcp_conns: Vec<DnsTcpConn> = (0..dns_tcp_handles.len())
@@ -346,8 +350,7 @@ fn run_network_stack(
             dns_socket_handle,
             &mut sockets,
             &egress,
-            config.upstream_dns,
-            config.gateway_ipv4,
+            dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -356,8 +359,7 @@ fn run_network_stack(
             &mut dns_tcp_conns,
             &mut sockets,
             &egress,
-            config.upstream_dns,
-            config.gateway_ipv4,
+            dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -758,6 +760,14 @@ impl DnsGateway {
     }
 }
 
+/// Where guest DNS answers come from: the upstream resolver queries are
+/// forwarded to, and the gateway address answered for the gateway's own name.
+#[derive(Clone, Copy)]
+struct DnsRouting {
+    upstream: Ipv4Addr,
+    gateway: Ipv4Addr,
+}
+
 /// The decision for a single guest DNS query, made on the poll thread using the
 /// egress allow-host policy (no host I/O). Mirrors the previous inline filter.
 enum DnsDecision {
@@ -810,8 +820,7 @@ fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
-    upstream_dns: Ipv4Addr,
-    gateway_ipv4: Ipv4Addr,
+    routing: DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -824,7 +833,7 @@ fn dispatch_dns_udp(
             Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
             Err(_) => break,
         };
-        match classify_dns_query(&query, egress, gateway_ipv4) {
+        match classify_dns_query(&query, egress, routing.gateway) {
             DnsDecision::Immediate(response) => {
                 let response_meta = UdpMetadata {
                     endpoint,
@@ -850,7 +859,7 @@ fn dispatch_dns_udp(
                 match to_relay.try_send(DnsQuery {
                     id,
                     transport: DnsTransport::Udp,
-                    upstream: upstream_dns,
+                    upstream: routing.upstream,
                     query,
                 }) {
                     Ok(()) => queued = true,
@@ -986,8 +995,7 @@ fn process_dns_tcp(
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
-    upstream_dns: Ipv4Addr,
-    gateway_ipv4: Ipv4Addr,
+    routing: DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -1050,9 +1058,9 @@ fn process_dns_tcp(
                 virtio_net_log!(
                     "virtio-net: DNS/TCP query query_len={} upstream_dns={}",
                     query.len(),
-                    upstream_dns
+                    routing.upstream
                 );
-                match classify_dns_query(&query, egress, gateway_ipv4) {
+                match classify_dns_query(&query, egress, routing.gateway) {
                     DnsDecision::Immediate(response) => {
                         frame_dns_tcp_response(conn, &response);
                         conn.done = true;
@@ -1065,7 +1073,7 @@ fn process_dns_tcp(
                         match to_relay.try_send(DnsQuery {
                             id,
                             transport: DnsTransport::Tcp,
-                            upstream: upstream_dns,
+                            upstream: routing.upstream,
                             query,
                         }) {
                             Ok(()) => {
