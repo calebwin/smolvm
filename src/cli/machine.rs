@@ -522,6 +522,11 @@ pub struct RunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Join a named inter-VM network (implies --net, virtio-net only): members
+    /// get distinct addresses and can reach each other directly
+    #[arg(long = "network", value_name = "NAME", help_heading = "Network")]
+    pub network_name: Option<String>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
@@ -1067,6 +1072,7 @@ impl RunCmd {
             net,
             self.net_backend,
             self.dns,
+            self.network_name.clone(),
             vec![],
             self.env,
             self.workdir,
@@ -1340,6 +1346,7 @@ impl RunCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1680,6 +1687,7 @@ impl RunCmd {
                                 network: params.net,
                                 network_backend: params.network_backend,
                                 dns: params.dns,
+                                network_name: params.network_name.clone(),
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1842,6 +1850,7 @@ impl RunCmd {
                             network: params.net,
                             network_backend: params.network_backend,
                             dns: params.dns,
+                            network_name: params.network_name.clone(),
                             storage_gb: params.storage_gb,
                             overlay_gb: params.overlay_gb,
                             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -2812,6 +2821,11 @@ pub struct CreateCmd {
     #[arg(long, value_name = "IP")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Join a named inter-VM network (implies --net, virtio-net only): members
+    /// get distinct addresses and can reach each other directly
+    #[arg(long = "network", value_name = "NAME")]
+    pub network_name: Option<String>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
@@ -2976,6 +2990,7 @@ impl CreateCmd {
             net,
             self.net_backend,
             self.dns,
+            self.network_name.clone(),
             self.init,
             self.env,
             self.workdir,
@@ -3011,6 +3026,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            network_name: params.network_name.clone(),
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
@@ -3190,6 +3206,7 @@ impl CreateCmd {
             net: network,
             network_backend: self.net_backend,
             dns: self.dns,
+            network_name: self.network_name.clone(),
             init: self.init.clone(),
             env: {
                 let mut env = manifest.env;
@@ -3232,6 +3249,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            network_name: params.network_name.clone(),
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,

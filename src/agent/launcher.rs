@@ -1032,6 +1032,24 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 if let Some(dns) = resources.dns {
                     guest_network.upstream_dns = dns;
                 }
+                // A named network (--network) leases this VM a distinct /30 so
+                // members can address each other; the lease is handed to the
+                // virtio runtime below, which starts the fabric threads.
+                let mut fabric_lease = None;
+                if let Some(network_name) = resources.network_name.as_deref() {
+                    let registry = crate::agent::manager::network_registry_dir(network_name);
+                    let lease = smolvm_network::fabric::allocate_lease(&registry).map_err(|e| {
+                        krun_free_ctx(ctx);
+                        Error::agent(
+                            "join network",
+                            format!("failed to lease a subnet on network '{network_name}': {e}"),
+                        )
+                    })?;
+                    guest_network.guest_ip = lease.guest_ip;
+                    guest_network.gateway_ip = lease.gateway_ip;
+                    guest_network.dns_server = lease.gateway_ip;
+                    fabric_lease = Some(lease);
+                }
                 let mut guest_mac = guest_network.guest_mac;
 
                 // Kubernetes pod networking: adopt the CNI interface's IP/prefix/
@@ -1139,6 +1157,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                fabric_lease,
                             ) {
                                 Ok(runtime) => runtime,
                                 Err(err) => {
@@ -1224,6 +1243,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                fabric_lease,
                             ) {
                                 Ok(runtime) => {
                                     if let Some(path) = egress_path {

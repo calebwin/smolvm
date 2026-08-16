@@ -498,6 +498,19 @@ pub fn vm_cache_root() -> PathBuf {
         .join("vms")
 }
 
+/// Registry directory for a named inter-VM network
+/// (`<cache_dir>/smolvm/net/<hash16>/`), a sibling of the VM data dirs. Each
+/// member VM binds its fabric subnet's Unix socket here; the same 16-char
+/// name hash as [`vm_data_dir`] keeps every socket path inside the kernel's
+/// `sockaddr_un` budget regardless of the network's name.
+pub fn network_registry_dir(network: &str) -> PathBuf {
+    vm_cache_root()
+        .parent()
+        .map(|smolvm_root| smolvm_root.join("net"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-net"))
+        .join(vm_dir_hash(network))
+}
+
 /// Per-node registry for the collision-free per-VM uid allocator
 /// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
 /// dropped VMMs never touch it. See `process::allocate_vm_uid`.

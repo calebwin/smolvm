@@ -61,6 +61,7 @@ pub mod device;
 pub mod dns;
 pub mod dns_relay;
 pub mod egress;
+pub mod fabric;
 // The libkrun frame bridge speaks over an AF_UNIX stream socket, available on
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
@@ -285,6 +286,7 @@ pub fn start_virtio_network(
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
     egress: EgressPolicy,
+    fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
@@ -293,6 +295,15 @@ pub fn start_virtio_network(
         guest_network.dns_server
     );
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
+    let fabric = match fabric_lease {
+        Some(lease) => Some(fabric::start_fabric(
+            lease,
+            queues.clone(),
+            guest_network.gateway_mac,
+            guest_network.guest_mac,
+        )?),
+        None => None,
+    };
     let frame_bridge = start_frame_stream_bridge(host_stream, queues.clone())?;
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
@@ -322,6 +333,7 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         egress,
+        fabric,
     )?;
 
     Ok(VirtioNetworkRuntime {

@@ -349,6 +349,7 @@ pub fn launch_agent_vm_dynamic(
                     guest_network,
                     &port_mappings,
                     egress,
+                    None,
                 ) {
                     Ok(runtime) => runtime,
                     Err(err) => {
@@ -408,7 +409,7 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress) {
+                            match start_virtio_network(sock, guest_network, &port_mappings, egress, None) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")

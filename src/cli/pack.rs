@@ -318,6 +318,7 @@ impl PackCreateCmd {
                 network: true,
                 network_backend: None,
                 dns: None,
+                network_name: None,
                 gpu: false,
                 cuda: false,
                 storage_gib: None,
