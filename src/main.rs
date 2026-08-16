@@ -34,7 +34,7 @@ enum Commands {
 
     /// Package and run self-contained VM executables
     #[command(subcommand)]
-    Pack(cli::pack::PackCmd),
+    Pack(Box<cli::pack::PackCmd>),
 
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
@@ -168,7 +168,7 @@ fn main() {
     let result = match cli.command {
         Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
-        Commands::Pack(cmd) => cmd.run(),
+        Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
         #[cfg(unix)]
