@@ -2468,7 +2468,7 @@ impl OverlaySetup {
     }
 
     /// Set up the upper layer with DNS resolution and /dev directory.
-    fn setup_upper_layer(&self) -> Result<()> {
+    fn setup_upper_layer(&self, lowerdirs: &[String]) -> Result<()> {
         // Set up DNS resolution BEFORE mounting. Image-backed workloads read
         // `/etc/resolv.conf` from the overlay upper layer, so this file must
         // match the active networking mode rather than always hardcoding
@@ -2479,6 +2479,24 @@ impl OverlaySetup {
         let resolv_contents = overlay_resolv_conf_contents();
         if let Err(e) = std::fs::write(&resolv_path, resolv_contents) {
             warn!(error = %e, "failed to write resolv.conf to upper layer");
+        }
+
+        // Container runtimes are expected to provide /etc/hosts (Docker bind-
+        // mounts a generated one), so minimal images like rancher/k3s ship
+        // without it — and software that templates from it (containerd's pod
+        // sandbox hosts generation, for one) hard-fails on the missing file.
+        // Provide a default only when neither the image nor a previous session
+        // supplies one: unlike resolv.conf this file is never overwritten, so
+        // image-provided copies and in-container edits stay untouched.
+        let hosts_path = upper_etc.join("hosts");
+        let image_has_hosts = lowerdirs
+            .iter()
+            .any(|l| Path::new(l).join("etc/hosts").exists());
+        if !image_has_hosts && !hosts_path.exists() {
+            let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+            if let Err(e) = std::fs::write(&hosts_path, overlay_hosts_contents(hostname.trim())) {
+                warn!(error = %e, "failed to write hosts to upper layer");
+            }
         }
 
         // Create /dev directory in upper layer - we'll bind mount the real /dev later
@@ -2596,7 +2614,7 @@ impl OverlaySetup {
     /// Execute the full overlay setup pipeline with the given lower directories.
     fn execute(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
         self.prepare_directories()?;
-        self.setup_upper_layer()?;
+        self.setup_upper_layer(&lowerdirs)?;
         self.verify_layers(&lowerdirs)?;
         self.mount(&lowerdirs)?;
 
@@ -2689,6 +2707,18 @@ fn overlay_resolv_conf_contents() -> String {
     }
 
     "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+}
+
+/// Default /etc/hosts for images that ship without one, mirroring the file
+/// Docker generates: loopback names plus the guest hostname (Debian-style
+/// 127.0.1.1), so `hostname`-resolving software works out of the box.
+fn overlay_hosts_contents(hostname: &str) -> String {
+    let mut hosts =
+        String::from("127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n");
+    if !hostname.is_empty() && hostname != "localhost" {
+        hosts.push_str(&format!("127.0.1.1\t{}\n", hostname));
+    }
+    hosts
 }
 
 /// Prepare an overlay filesystem for a workload.
@@ -4910,6 +4940,53 @@ mod tests {
             overlay_resolv_conf_contents(),
             "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
         );
+    }
+
+    #[test]
+    fn overlay_hosts_names_loopback_and_the_guest_hostname() {
+        assert_eq!(
+            overlay_hosts_contents("container"),
+            "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\tcontainer\n"
+        );
+        // No hostname (or a redundant one) still yields valid loopback entries.
+        for h in ["", "localhost"] {
+            assert_eq!(
+                overlay_hosts_contents(h),
+                "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_upper_layer_defaults_hosts_only_when_image_lacks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let builder = |name: &str| OverlaySetup {
+            workload_id: format!("hosts-test-{name}"),
+            overlay_root: tmp.path().join(name),
+            upper_path: tmp.path().join(name).join("upper"),
+            work_path: tmp.path().join(name).join("work"),
+            merged_path: tmp.path().join(name).join("merged"),
+        };
+
+        // Image without /etc/hosts: the upper layer gains a default.
+        let bare_layer = tmp.path().join("layer-bare");
+        std::fs::create_dir_all(&bare_layer).unwrap();
+        let b = builder("bare");
+        b.prepare_directories().unwrap();
+        b.setup_upper_layer(&[bare_layer.display().to_string()])
+            .unwrap();
+        let written = std::fs::read_to_string(b.upper_path.join("etc/hosts")).unwrap();
+        assert!(written.contains("127.0.0.1\tlocalhost"));
+
+        // Image that ships /etc/hosts: the upper layer must not shadow it.
+        let full_layer = tmp.path().join("layer-full");
+        std::fs::create_dir_all(full_layer.join("etc")).unwrap();
+        std::fs::write(full_layer.join("etc/hosts"), "10.0.0.9 pinned\n").unwrap();
+        let b = builder("full");
+        b.prepare_directories().unwrap();
+        b.setup_upper_layer(&[full_layer.display().to_string()])
+            .unwrap();
+        assert!(!b.upper_path.join("etc/hosts").exists());
     }
 
     #[test]
