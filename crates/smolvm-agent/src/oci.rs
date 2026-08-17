@@ -598,7 +598,7 @@ impl OciSpec {
                 },
             },
             mounts: default_mounts(unprivileged),
-            hostname: Some("container".to_string()),
+            hostname: Some(container_hostname()),
         }
     }
 
@@ -1164,8 +1164,52 @@ fn proc_filesystems_has(fstype: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// The container's hostname: the machine's name when the host supplied one
+/// and it survives RFC-1123 sanitizing, else the legacy "container". Named
+/// hostnames give distinct Kubernetes node names and recognizable prompts
+/// out of the box.
+pub fn container_hostname() -> String {
+    std::env::var(smolvm_protocol::guest_env::MACHINE_NAME)
+        .ok()
+        .and_then(|name| sanitize_hostname(&name))
+        .unwrap_or_else(|| "container".to_string())
+}
+
+/// Lowercase RFC-1123 label: alphanumerics and hyphens, no edge hyphens,
+/// at most 63 bytes. `None` when nothing survives.
+fn sanitize_hostname(name: &str) -> Option<String> {
+    let mapped: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed: String = mapped
+        .trim_matches('-')
+        .chars()
+        .take(63)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hostnames_sanitize_to_rfc1123_labels() {
+        use super::sanitize_hostname;
+        assert_eq!(sanitize_hostname("my-vm"), Some("my-vm".to_string()));
+        assert_eq!(sanitize_hostname("My_VM.2"), Some("my-vm-2".to_string()));
+        assert_eq!(sanitize_hostname("--__--"), None);
+        assert_eq!(sanitize_hostname(""), None);
+        let long = "a".repeat(100);
+        assert_eq!(sanitize_hostname(&long).unwrap().len(), 63);
+    }
+
     use super::*;
     use tempfile::tempdir;
 

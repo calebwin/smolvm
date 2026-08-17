@@ -1766,6 +1766,22 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             )));
         }
 
+        // The machine's name rides along so the guest can hostname the
+        // container after it — distinct k8s node names, distinguishable
+        // shell prompts — instead of every machine being "container". The
+        // per-VM dir records the plaintext name beside the vsock socket.
+        if let Some(name) = vsock_socket
+            .parent()
+            .and_then(|dir| std::fs::read_to_string(dir.join("name")).ok())
+        {
+            let name = name.trim();
+            if !name.is_empty() {
+                if let Ok(cstr) = CString::new(format!("{}={}", guest_env::MACHINE_NAME, name)) {
+                    env_strings.push(cstr);
+                }
+            }
+        }
+
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {

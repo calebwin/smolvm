@@ -73,6 +73,10 @@ pub const READY_MARKER: &str = "SMOLVM_READY_MARKER";
 /// accurate kvmclock (Linux/KVM) or HVF-seeded RTC (macOS).
 pub const HOST_TIME_NS: &str = "SMOLVM_HOST_TIME_NS";
 
+/// The machine's name, so the guest can use it where identity matters
+/// (the container hostname). Absent for machines whose name is unknown.
+pub const MACHINE_NAME: &str = "SMOLVM_MACHINE_NAME";
+
 /// Selects whether the guest should configure a real virtio NIC.
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".
