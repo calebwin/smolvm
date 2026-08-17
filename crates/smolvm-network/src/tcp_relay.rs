@@ -1073,10 +1073,10 @@ mod tests {
             .unwrap();
 
         let mut now_ms: i64 = 0;
-        let mut poll = |interface: &mut Interface,
-                        device: &mut Loopback,
-                        sockets: &mut SocketSet<'_>,
-                        now_ms: &mut i64| {
+        let poll = |interface: &mut Interface,
+                    device: &mut Loopback,
+                    sockets: &mut SocketSet<'_>,
+                    now_ms: &mut i64| {
             *now_ms += 10;
             interface.poll(Instant::from_millis(*now_ms), device, sockets);
         };
