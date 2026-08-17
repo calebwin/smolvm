@@ -413,14 +413,15 @@ fn export_flattened_from_artifact_sourced(
     for (i, id) in layer_ids.iter().enumerate() {
         let src = format!("/packed_layers/{}", id);
         let dst = format!("/storage/stage/{}", i);
+        // A tar-form layer extracts directly; a dir-form layer streams
+        // through tar so whiteout devices and opaque-dir xattrs stay intact.
+        let stage_cmd = if id.ends_with(".tar") {
+            format!("mkdir -p '{dst}' && tar xf '{src}' -C '{dst}'")
+        } else {
+            format!("mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)")
+        };
         let (exit_code, _, stderr) = client.vm_exec(
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)"
-                ),
-            ],
+            vec!["sh".to_string(), "-c".to_string(), stage_cmd],
             vec![],
             None,
             None,
@@ -443,35 +444,48 @@ fn export_flattened_from_artifact_sourced(
     flatten_and_export(collector, &mut client, vm_name, &lowers)
 }
 
-/// The extracted layer dirs of an imported pack, bottom -> top, as short ids.
-/// `None` when the cache (or its ordering) is gone.
+/// The cached layers of an imported pack, bottom -> top, as paths relative to
+/// the pack content dir. A layer is either an extracted dir (`layers/<id>`,
+/// hosts that can reproduce archived ownership) or a staged tar
+/// (`layers/<id>.tar`, hosts that leave extraction to the guest) — both forms
+/// are written by the artifact import, so both must be exportable. `None`
+/// when the cache (or its ordering) is gone.
 fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
     let order_path = layers_dir.join("layer-order");
-    let ids: Vec<String> = if let Ok(contents) = std::fs::read_to_string(&order_path) {
-        contents
+    let cached_form = |id: &str| -> Option<String> {
+        if layers_dir.join(id).is_dir() {
+            Some(format!("layers/{}", id))
+        } else if layers_dir.join(format!("{id}.tar")).is_file() {
+            Some(format!("layers/{}.tar", id))
+        } else {
+            None
+        }
+    };
+    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+        let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
             .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .collect()
-    } else {
-        // No order file: only unambiguous for a single extracted layer dir.
-        let mut dirs: Vec<String> = std::fs::read_dir(&layers_dir)
-            .ok()?
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
             .collect();
-        if dirs.len() != 1 {
+        if ids.is_empty() {
             return None;
         }
-        vec![dirs.pop().unwrap()]
-    };
-    if ids.is_empty() || !ids.iter().all(|id| layers_dir.join(id).is_dir()) {
+        return ids.iter().map(|id| cached_form(id)).collect();
+    }
+    // No order file: only unambiguous for a single cached layer.
+    let mut entries: Vec<String> = std::fs::read_dir(&layers_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter_map(|name| cached_form(name.strip_suffix(".tar").unwrap_or(&name)))
+        .collect();
+    entries.sort();
+    entries.dedup();
+    if entries.len() != 1 {
         return None;
     }
-    Some(ids.iter().map(|id| format!("layers/{}", id)).collect())
+    Some(entries)
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source
