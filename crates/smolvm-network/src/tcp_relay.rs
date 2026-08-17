@@ -543,12 +543,20 @@ impl TcpRelayTable {
     /// Remove closed sockets and drop their relay endpoints.
     ///
     /// This is the final ownership cleanup step for a guest TCP flow.
+    ///
+    /// An aborted socket reaches `Closed` synchronously, but its RST is only
+    /// emitted on the next interface dispatch — and smoltcp clears the
+    /// endpoint tuple right after sending it. Reaping on `Closed` alone
+    /// therefore destroys the queued RST and the guest never learns the
+    /// connection died (it hangs until its own timeout, which is how a failed
+    /// host-side connect used to black-hole every unreachable destination).
+    /// Wait for `remote_endpoint()` to clear so the RST is on the wire first.
     pub fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
         let keys = &mut self.connection_keys;
         let published_ports = &mut self.used_published_ports;
         self.connections.retain(|&handle, connection| {
             let socket = sockets.get::<tcp::Socket>(handle);
-            if socket.state() == tcp::State::Closed {
+            if socket.state() == tcp::State::Closed && socket.remote_endpoint().is_none() {
                 keys.remove(&(connection.source, connection.destination));
                 if let Some(port) = connection.reserved_published_port {
                     published_ports.remove(&port);
@@ -1010,5 +1018,122 @@ mod tests {
 
         assert_eq!(relay_exit, RelayExitMode::Graceful);
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn aborted_connection_sends_rst_to_the_guest_before_cleanup() {
+        use smoltcp::iface::{Config, Interface};
+        use smoltcp::phy::{Loopback, Medium};
+        use smoltcp::time::Instant;
+        use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+
+        let mut device = Loopback::new(Medium::Ethernet);
+        let mut interface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0, 0, 0, 0, 1,
+            ]))),
+            &mut device,
+            Instant::ZERO,
+        );
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::v4(100, 96, 0, 1), 30))
+                .unwrap();
+        });
+        interface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(100, 96, 0, 1))
+            .unwrap();
+        // Same as the production interface: accept flows to arbitrary
+        // destinations so the relay's listen sockets can intercept them.
+        interface.set_any_ip(true);
+
+        let mut sockets = SocketSet::new(vec![]);
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+
+        // The "guest" dials an external destination; the relay pre-creates the
+        // intercepting listen socket exactly like the poll loop does on SYN.
+        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1)), 40_000);
+        assert!(table.create_tcp_socket(source, destination, &mut sockets));
+
+        // Guest stand-in: a client socket running a real handshake against the
+        // intercepting socket over the loopback device.
+        let client_handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 4096]),
+            tcp::SocketBuffer::new(vec![0u8; 4096]),
+        ));
+        sockets
+            .get_mut::<tcp::Socket>(client_handle)
+            .connect(
+                interface.context(),
+                (IpAddress::v4(192, 0, 2, 10), 443),
+                40_000,
+            )
+            .unwrap();
+
+        let mut now_ms: i64 = 0;
+        let mut poll = |interface: &mut Interface,
+                        device: &mut Loopback,
+                        sockets: &mut SocketSet<'_>,
+                        now_ms: &mut i64| {
+            *now_ms += 10;
+            interface.poll(Instant::from_millis(*now_ms), device, sockets);
+        };
+
+        for _ in 0..10 {
+            poll(&mut interface, &mut device, &mut sockets, &mut now_ms);
+            if sockets.get::<tcp::Socket>(client_handle).state() == tcp::State::Established {
+                break;
+            }
+        }
+        assert_eq!(
+            sockets.get::<tcp::Socket>(client_handle).state(),
+            tcp::State::Established,
+            "handshake must complete before the abort is simulated"
+        );
+
+        // The host-side connect failed: the relay thread reports Abort. (The
+        // intercepting socket trails the client by the final ACK, so poll until
+        // the table observes it as Established.)
+        let mut new_connections = Vec::new();
+        for _ in 0..10 {
+            poll(&mut interface, &mut device, &mut sockets, &mut now_ms);
+            new_connections = table.take_new_connections(&mut sockets);
+            if !new_connections.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(new_connections.len(), 1);
+        new_connections[0].exit_state.store(RelayExitMode::Abort);
+
+        // Poll-loop order under test: relay_data (abort) then cleanup_closed
+        // BEFORE the next egress flush. The aborted socket must survive cleanup
+        // with its RST still queued, or the guest never learns and hangs until
+        // its own timeout.
+        table.relay_data(&mut sockets);
+        table.cleanup_closed(&mut sockets);
+        assert!(
+            table.has_socket_for(&source, &destination),
+            "aborted socket was reaped before its RST was dispatched"
+        );
+
+        // The next flushes deliver the RST; the guest-side socket must observe
+        // the reset instead of staying Established.
+        for _ in 0..10 {
+            poll(&mut interface, &mut device, &mut sockets, &mut now_ms);
+            if sockets.get::<tcp::Socket>(client_handle).state() == tcp::State::Closed {
+                break;
+            }
+        }
+        assert_eq!(
+            sockets.get::<tcp::Socket>(client_handle).state(),
+            tcp::State::Closed,
+            "guest never received the RST for the aborted connection"
+        );
+
+        // With the RST on the wire the connection is finally reaped.
+        table.cleanup_closed(&mut sockets);
+        assert!(!table.has_socket_for(&source, &destination));
     }
 }
