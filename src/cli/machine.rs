@@ -1029,6 +1029,9 @@ impl RunCmd {
                 debug: false,
                 cuda: self.cuda,
                 auto_graph: self.auto_graph,
+                // `--from` rejects the egress flags at parse time
+                // (`conflicts_with_all`), so there is no policy to carry.
+                egress: None,
             }
             .run();
         }
@@ -1153,6 +1156,14 @@ impl RunCmd {
                     debug: false,
                     cuda: self.cuda || params.cuda,
                     auto_graph: self.auto_graph,
+                    // A user-supplied artifact's manifest keeps deciding the
+                    // network default (no override), but any allow-list / DNS
+                    // filter from the flags or Smolfile must still be enforced.
+                    egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
+                        network_override: None,
+                        allowed_cidrs: params.allowed_cidrs.clone(),
+                        dns_filter_hosts: params.dns_filter_hosts.clone(),
+                    }),
                 }
                 .run();
             }
@@ -1254,6 +1265,16 @@ impl RunCmd {
                 debug: false,
                 cuda: self.cuda || params.cuda,
                 auto_graph: self.auto_graph,
+                // The workload's network policy, resolved above from the flags
+                // and Smolfile. The override is absolute: the baked artifact's
+                // manifest records the BAKE VM's networking (enabled, for the
+                // pull), so without it a cache hit would run the workload with
+                // unrestricted egress no matter what the caller asked for.
+                egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
+                    network_override: Some(params.net),
+                    allowed_cidrs: params.allowed_cidrs.clone(),
+                    dns_filter_hosts: params.dns_filter_hosts.clone(),
+                }),
             }
             .run();
         }

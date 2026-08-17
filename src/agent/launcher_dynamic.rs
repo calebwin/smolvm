@@ -70,6 +70,11 @@ pub struct PackedLaunchConfig<'a> {
     /// `cuda_host` server loaded the real driver. Mirrors the non-packed
     /// launcher's `cuda_socket`.
     pub cuda_socket: Option<&'a Path>,
+    /// Hostnames the egress policy permits resolving and connecting to
+    /// (`--allow-host`), mirroring the main launcher's `egress_refresh_hosts`.
+    /// Owned because the launch runs in a forked child that outlives the
+    /// caller's borrows.
+    pub dns_filter_hosts: Option<Vec<String>>,
 }
 
 /// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
@@ -105,7 +110,7 @@ pub fn launch_agent_vm_dynamic(
 ) -> Result<(), String> {
     crate::network::validate_requested_network_backend(
         &config.resources,
-        None,
+        config.dns_filter_hosts.as_deref(),
         config.port_mappings.len(),
     )
     .map_err(|e| e.to_string())?;
@@ -266,38 +271,65 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
-            if let Some(ref cidrs) = config.resources.allowed_cidrs {
-                if !cidrs.is_empty() {
-                    let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                         Update libkrun or remove --allow-cidr flags."
-                            .to_string()
-                    })?;
+            // Egress policy: static CIDRs plus DNS allow-host filtering enforced
+            // inside libkrun, mirroring the main launcher's TSI arm. When
+            // allow-hosts are set, guest UDP:53 queries are forwarded only to the
+            // trusted resolver and A/AAAA answers for allowed hosts become
+            // temporarily allowed IPs.
+            let egress_hosts = config.dns_filter_hosts.clone().unwrap_or_default();
+            let has_cidrs = config
+                .resources
+                .allowed_cidrs
+                .as_ref()
+                .is_some_and(|cidrs| !cidrs.is_empty());
+            if has_cidrs || !egress_hosts.is_empty() {
+                let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                     Update libkrun or remove --allow-cidr/--allow-host flags."
+                        .to_string()
+                })?;
 
-                    let mut all_cidrs = cidrs.clone();
-                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                let mut all_cidrs = config.resources.allowed_cidrs.clone().unwrap_or_default();
+                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
 
-                    let cidr_cstrings: Vec<CString> = match all_cidrs
-                        .iter()
-                        .map(|c| CString::new(c.as_str()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                    {
-                        Ok(v) => v,
-                        Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
-                    };
-                    let mut cidr_ptrs: Vec<*const libc::c_char> =
-                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                    cidr_ptrs.push(std::ptr::null());
+                let cidr_cstrings: Vec<CString> = match all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(v) => v,
+                    Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
+                };
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
 
-                    // The dynamic path enforces CIDR-only egress; DNS allow-host
-                    // filtering (hosts + resolver args) is wired in the main
-                    // launcher path.
-                    if unsafe {
-                        (set_egress)(ctx, cidr_ptrs.as_ptr(), std::ptr::null(), std::ptr::null())
-                    } < 0
-                    {
-                        free_ctx_on_err!("krun_set_egress_policy failed");
-                    }
+                let host_cstrings: Vec<CString> = match egress_hosts
+                    .iter()
+                    .map(|h| CString::new(h.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(v) => v,
+                    Err(_) => free_ctx_on_err!("allow-host contains an interior NUL byte"),
+                };
+                let mut host_ptrs: Vec<*const libc::c_char> =
+                    host_cstrings.iter().map(|s| s.as_ptr()).collect();
+                host_ptrs.push(std::ptr::null());
+
+                let resolver_cstring =
+                    CString::new(crate::data::network::default_dns_addr().to_string())
+                        .expect("resolver IP has no null bytes");
+                let resolver_ptrs: Vec<*const libc::c_char> =
+                    vec![resolver_cstring.as_ptr(), std::ptr::null()];
+
+                let (host_arg, resolver_arg) = if egress_hosts.is_empty() {
+                    (std::ptr::null(), std::ptr::null())
+                } else {
+                    (host_ptrs.as_ptr(), resolver_ptrs.as_ptr())
+                };
+
+                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr(), host_arg, resolver_arg) } < 0 {
+                    free_ctx_on_err!("krun_set_egress_policy failed");
                 }
             }
 
@@ -328,8 +360,9 @@ pub fn launch_agent_vm_dynamic(
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
             // Denial sink beside the vsock socket, mirroring the static launcher.
-            let mut egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
+            let mut egress = smolvm_network::EgressPolicy::new(
                 config.resources.allowed_cidrs.as_deref(),
+                config.dns_filter_hosts.as_deref(),
             );
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
