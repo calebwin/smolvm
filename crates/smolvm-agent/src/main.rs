@@ -254,6 +254,9 @@ fn main() {
         &format!("boot mounts_done uptime_ms={}", uptime_ms()),
     );
 
+    #[cfg(target_os = "linux")]
+    delegate_root_cgroup_controllers();
+
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
     // running it on non-GPU machines wastes the full polling window.
@@ -728,6 +731,65 @@ fn mount_essential_filesystems() {
             // The networking will be set up by TSI anyway
             libc::close(fd);
         }
+    }
+}
+
+/// Enable every available cgroup2 controller for child cgroups, once, at boot.
+///
+/// libkrun mounts `/sys/fs/cgroup` read-only with nothing in
+/// `cgroup.subtree_control`, so software that manages its own sub-cgroups —
+/// kubelet, dockerd, systemd — finds an undelegated hierarchy and either
+/// fails or runs unbounded, and users had to hand-write the delegation
+/// before starting it. The root cgroup is exempt from cgroup2's
+/// no-internal-processes rule, so enabling controllers here while the agent
+/// and its containers stay in the root is valid; the cost is one extra level
+/// of hierarchical accounting. Best-effort: on any failure workloads behave
+/// exactly as before.
+#[cfg(target_os = "linux")]
+fn delegate_root_cgroup_controllers() {
+    use std::ffi::CString;
+    let Ok(target) = CString::new("/sys/fs/cgroup") else {
+        return;
+    };
+    // Remount read-write; MS_REMOUNT preserves the mount and omitting
+    // MS_RDONLY clears the read-only flag.
+    let flags = libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    // SAFETY: `target` is a valid NUL-terminated path; the agent is PID-1 and
+    // holds CAP_SYS_ADMIN. Null source/type/data is valid for a remount.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        boot_log(
+            "WARN",
+            "cgroup2 remount rw failed; controllers not delegated",
+        );
+        return;
+    }
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    let enable: Vec<String> = controllers
+        .split_whitespace()
+        .map(|c| format!("+{c}"))
+        .collect();
+    if enable.is_empty() {
+        return;
+    }
+    match std::fs::write("/sys/fs/cgroup/cgroup.subtree_control", enable.join(" ")) {
+        Ok(()) => boot_log(
+            "INFO",
+            &format!("cgroup2 controllers delegated: {}", controllers.trim()),
+        ),
+        Err(e) => boot_log(
+            "WARN",
+            &format!("cgroup2 controller delegation failed: {e}"),
+        ),
     }
 }
 
