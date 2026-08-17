@@ -1165,49 +1165,48 @@ fn proc_filesystems_has(fstype: &str) -> bool {
 }
 
 /// The container's hostname: the machine's name when the host supplied one
-/// and it survives RFC-1123 sanitizing, else the legacy "container". Named
-/// hostnames give distinct Kubernetes node names and recognizable prompts
-/// out of the box.
+/// out of the box. The name is validated as a lowercase DNS label at machine
+/// creation (see `validate_vm_name`), so it is a valid hostname verbatim — the
+/// name primary key's uniqueness carries straight through to the hostname with
+/// no lossy fold that could collide distinct names. The value is used as-is
+/// when it is a well-formed label (a defensive check, not a transform), and
+/// falls back to "container" only when no name was supplied.
 pub fn container_hostname() -> String {
     std::env::var(smolvm_protocol::guest_env::MACHINE_NAME)
         .ok()
-        .and_then(|name| sanitize_hostname(&name))
+        .map(|name| name.trim().to_string())
+        .filter(|name| is_dns_label(name))
         .unwrap_or_else(|| "container".to_string())
 }
 
-/// Lowercase RFC-1123 label: alphanumerics and hyphens, no edge hyphens,
-/// at most 63 bytes. `None` when nothing survives.
-fn sanitize_hostname(name: &str) -> Option<String> {
-    let mapped: String = name
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let trimmed: String = mapped
-        .trim_matches('-')
-        .chars()
-        .take(63)
-        .collect::<String>()
-        .trim_end_matches('-')
-        .to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+/// Whether `s` is a lowercase DNS label usable verbatim as a hostname:
+/// non-empty, ≤63 bytes, `[a-z0-9-]`, no edge hyphens.
+fn is_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn hostnames_sanitize_to_rfc1123_labels() {
-        use super::sanitize_hostname;
-        assert_eq!(sanitize_hostname("my-vm"), Some("my-vm".to_string()));
-        assert_eq!(sanitize_hostname("My_VM.2"), Some("my-vm-2".to_string()));
-        assert_eq!(sanitize_hostname("--__--"), None);
-        assert_eq!(sanitize_hostname(""), None);
-        let long = "a".repeat(100);
-        assert_eq!(sanitize_hostname(&long).unwrap().len(), 63);
+    fn dns_label_check_accepts_valid_names_rejects_the_rest() {
+        use super::is_dns_label;
+        // Valid machine names (validate_vm_name guarantees this shape) pass verbatim.
+        assert!(is_dns_label("my-vm"));
+        assert!(is_dns_label("worker-1"));
+        assert!(is_dns_label("vm-1a2b3c4d"));
+        // Anything not already a label is rejected (falls back to "container"),
+        // never transformed — so distinct names never collide.
+        assert!(!is_dns_label(""));
+        assert!(!is_dns_label("My-VM")); // uppercase
+        assert!(!is_dns_label("my_vm")); // underscore
+        assert!(!is_dns_label("-edge"));
+        assert!(!is_dns_label("edge-"));
+        assert!(!is_dns_label(&"a".repeat(64)));
     }
 
     use super::*;
