@@ -2487,11 +2487,14 @@ impl OverlaySetup {
         // sandbox hosts generation, for one) hard-fails on the missing file.
         // Provide a default only when neither the image nor a previous session
         // supplies one: unlike resolv.conf this file is never overwritten, so
-        // image-provided copies and in-container edits stay untouched.
+        // image-provided copies and in-container edits stay untouched. "Supplies
+        // one" means actual name mappings — Ubuntu-derived images often ship an
+        // empty or comments-only /etc/hosts, and counting those left `localhost`
+        // unresolvable inside the container.
         let hosts_path = upper_etc.join("hosts");
         let image_has_hosts = lowerdirs
             .iter()
-            .any(|l| Path::new(l).join("etc/hosts").exists());
+            .any(|l| hosts_file_has_entries(&Path::new(l).join("etc/hosts")));
         if !image_has_hosts && !hosts_path.exists() {
             let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
             if let Err(e) = std::fs::write(&hosts_path, overlay_hosts_contents(hostname.trim())) {
@@ -2719,6 +2722,20 @@ fn overlay_hosts_contents(hostname: &str) -> String {
         hosts.push_str(&format!("127.0.1.1\t{}\n", hostname));
     }
     hosts
+}
+
+/// True when this /etc/hosts actually provides name mappings — at least one
+/// non-comment, non-blank line. An empty or comments-only file must not count
+/// as image-provided, or `localhost` never resolves in the container.
+fn hosts_file_has_entries(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .map(str::trim)
+                .any(|line| !line.is_empty() && !line.starts_with('#'))
+        })
+        .unwrap_or(false)
 }
 
 /// Prepare an overlay filesystem for a workload.
@@ -4987,6 +5004,29 @@ mod tests {
         b.setup_upper_layer(&[full_layer.display().to_string()])
             .unwrap();
         assert!(!b.upper_path.join("etc/hosts").exists());
+
+        // An EMPTY image /etc/hosts provides no mappings, so the default must
+        // still be written — otherwise `localhost` never resolves in-container.
+        let empty_layer = tmp.path().join("layer-empty");
+        std::fs::create_dir_all(empty_layer.join("etc")).unwrap();
+        std::fs::write(empty_layer.join("etc/hosts"), "").unwrap();
+        let b = builder("empty");
+        b.prepare_directories().unwrap();
+        b.setup_upper_layer(&[empty_layer.display().to_string()])
+            .unwrap();
+        let written = std::fs::read_to_string(b.upper_path.join("etc/hosts")).unwrap();
+        assert!(written.contains("127.0.0.1\tlocalhost"));
+
+        // Same for a comments-only file (Debian tooling ships these).
+        let comment_layer = tmp.path().join("layer-comments");
+        std::fs::create_dir_all(comment_layer.join("etc")).unwrap();
+        std::fs::write(comment_layer.join("etc/hosts"), "# static hosts\n\n").unwrap();
+        let b = builder("comments");
+        b.prepare_directories().unwrap();
+        b.setup_upper_layer(&[comment_layer.display().to_string()])
+            .unwrap();
+        let written = std::fs::read_to_string(b.upper_path.join("etc/hosts")).unwrap();
+        assert!(written.contains("127.0.0.1\tlocalhost"));
     }
 
     #[test]
