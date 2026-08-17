@@ -55,39 +55,6 @@ fn run(interval: Duration) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::trim_minutes;
-
-    fn with_env<T>(val: Option<&str>, f: impl FnOnce() -> T) -> T {
-        match val {
-            Some(v) => std::env::set_var("SMOLVM_DISK_TRIM", v),
-            None => std::env::remove_var("SMOLVM_DISK_TRIM"),
-        }
-        let out = f();
-        std::env::remove_var("SMOLVM_DISK_TRIM");
-        out
-    }
-
-    #[test]
-    fn trim_interval_parsing() {
-        assert_eq!(
-            with_env(None, trim_minutes),
-            Some(super::DEFAULT_TRIM_MINUTES)
-        );
-        assert_eq!(with_env(Some("off"), trim_minutes), None);
-        assert_eq!(with_env(Some("0"), trim_minutes), None);
-        assert_eq!(with_env(Some("30"), trim_minutes), Some(30));
-        // A garbage value falls back to the default rather than disabling.
-        assert_eq!(
-            with_env(Some("nonsense"), trim_minutes),
-            Some(super::DEFAULT_TRIM_MINUTES)
-        );
-        // Sub-1 is floored to 1 (a value of 1 stays 1).
-        assert_eq!(with_env(Some("1"), trim_minutes), Some(1));
-    }
-}
-
 /// Run one `fstrim -a`. Logged best-effort; never propagates failure.
 fn trim_once() {
     match std::process::Command::new("fstrim").arg("-a").output() {
@@ -103,5 +70,35 @@ fn trim_once() {
         Err(e) => {
             tracing::debug!(error = %e, "disk trim: fstrim not run");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{trim_minutes, DEFAULT_TRIM_MINUTES};
+
+    fn with_env<T>(val: Option<&str>, f: impl FnOnce() -> T) -> T {
+        match val {
+            Some(v) => std::env::set_var("SMOLVM_DISK_TRIM", v),
+            None => std::env::remove_var("SMOLVM_DISK_TRIM"),
+        }
+        let out = f();
+        std::env::remove_var("SMOLVM_DISK_TRIM");
+        out
+    }
+
+    #[test]
+    fn trim_interval_parsing() {
+        assert_eq!(with_env(None, trim_minutes), Some(DEFAULT_TRIM_MINUTES));
+        assert_eq!(with_env(Some("off"), trim_minutes), None);
+        assert_eq!(with_env(Some("0"), trim_minutes), None);
+        assert_eq!(with_env(Some("30"), trim_minutes), Some(30));
+        // A garbage value falls back to the default rather than disabling.
+        assert_eq!(
+            with_env(Some("nonsense"), trim_minutes),
+            Some(DEFAULT_TRIM_MINUTES)
+        );
+        // Sub-1 is floored to 1 (a value of 1 stays 1).
+        assert_eq!(with_env(Some("1"), trim_minutes), Some(1));
     }
 }
