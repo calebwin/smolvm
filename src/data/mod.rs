@@ -50,9 +50,11 @@ impl From<&str> for VmTarget {
 ///
 /// The on-disk layout uses a fixed-length hash of the name as the directory
 /// name (see [`crate::agent::vm_data_dir`]), so name length doesn't affect
-/// the socket path or any other filesystem budget. This constant is purely
-/// a UX cap to reject obviously-absurd input (500+ char names).
-pub const MAX_VM_NAME_LENGTH: usize = 128;
+/// the socket path or any other filesystem budget. The cap is the DNS label
+/// limit because a machine's name is used verbatim as its guest hostname, so
+/// name uniqueness (the `name` primary key) is hostname uniqueness — no lossy
+/// transform in between.
+pub const MAX_VM_NAME_LENGTH: usize = 63;
 
 /// Validate a persisted VM name.
 pub fn validate_vm_name(name: &str, label: &str) -> Result<(), String> {
@@ -90,11 +92,18 @@ pub fn validate_vm_name(name: &str, label: &str) -> Result<(), String> {
             prev_was_hyphen = false;
         }
 
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+        if !c.is_ascii_digit() && !c.is_ascii_lowercase() && c != '-' {
             if c == '/' || c == '\\' {
                 return Err(format!("{label} cannot contain path separators"));
             }
-
+            if c.is_ascii_uppercase() || c == '_' {
+                // A name is used verbatim as the guest hostname, which is a
+                // lowercase DNS label — accepting uppercase or underscores
+                // would need a lossy fold that collides distinct names.
+                return Err(format!(
+                    "{label} must be a lowercase DNS label (a-z, 0-9, hyphen); got: '{c}'"
+                ));
+            }
             return Err(format!("{label} contains invalid character: '{c}'"));
         }
     }
@@ -111,12 +120,11 @@ mod tests {
         let valid = [
             "test",
             "my-resource",
-            "my_resource",
             "test123",
             "123test",
             "a",
             "test-resource-123",
-            "TEST_RESOURCE",
+            "vm-1a2b3c4d",
         ];
 
         for name in valid {
@@ -150,6 +158,9 @@ mod tests {
             ("test.name", "dot"),
             ("test:name", "colon"),
             ("test#name", "hash"),
+            ("Test", "uppercase"),
+            ("TEST_RESOURCE", "uppercase and underscore"),
+            ("my_resource", "underscore"),
         ];
 
         for (name, desc) in invalid {
