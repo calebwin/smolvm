@@ -3,7 +3,6 @@
 //! The AgentManager is responsible for starting and stopping the agent VM,
 //! which runs the smolvm-agent for OCI image management and command execution.
 
-use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
@@ -759,10 +758,12 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        if let Some(ref vm_name) = name {
-            validate_vm_name(vm_name, "machine name")
-                .map_err(|e| Error::config("validate machine name", e))?;
-        }
+        // Name validation lives on the create boundaries (CLI/API create, fork
+        // clone, pool, embedded control), NOT here: this constructor is also
+        // the open path for `machine start/stop/exec/delete`, so validating it
+        // would make a machine whose name predates a stricter rule (e.g. a
+        // pre-DNS-label name) unmanageable — unstoppable AND undeletable. A
+        // stricter rule must never strand an already-created machine.
 
         // Named VMs colocate runtime artifacts (sockets, logs, pid, config) in
         // their hash-derived data directory — matching where `storage_disk`
