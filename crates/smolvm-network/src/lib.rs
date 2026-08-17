@@ -192,6 +192,22 @@ impl GuestNetworkConfig {
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
 
+/// Whether the host can route IPv6 to the internet.
+///
+/// Advertising the guest a global-scope IPv6 address (the ULA link pair) makes
+/// every dual-stack client sort AAAA answers first (RFC 6724) — but the
+/// gateway can only relay v6 flows the host itself can dial. On a v6-less
+/// host every such connection dies, so callers use this probe to withhold the
+/// guest's IPv6 configuration entirely and keep such guests v4-first.
+///
+/// A connected UDP socket performs only a local route lookup — no packets are
+/// sent — which is the same signal the host's own applications act on.
+pub fn host_has_ipv6_route() -> bool {
+    std::net::UdpSocket::bind("[::]:0")
+        .and_then(|socket| socket.connect("[2001:4860:4860::8888]:53"))
+        .is_ok()
+}
+
 pub(crate) fn format_network_log_line(timestamp: SystemTime, message: &str) -> String {
     format!(
         "[{}]: {}",

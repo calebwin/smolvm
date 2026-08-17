@@ -100,9 +100,16 @@ pub(crate) fn guest_network_env(
         push(guest_env::GATEWAY, n.gateway_ip.to_string());
         push(guest_env::PREFIX_LEN, n.prefix_len.to_string());
         push(guest_env::GUEST_MAC, format_mac(n.guest_mac));
-        push(guest_env::GUEST_IP6, n.guest_ip6.to_string());
-        push(guest_env::GATEWAY6, n.gateway_ip6.to_string());
-        push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
+        // Only hand the guest an IPv6 identity when the host can actually
+        // route v6: a global-scope guest address makes dual-stack clients
+        // sort AAAA answers first (RFC 6724), and on a v6-less host every
+        // such connection is refused. Omitting the trio keeps the guest
+        // v4-first; the agent treats the absent set as a valid contract.
+        if smolvm_network::host_has_ipv6_route() {
+            push(guest_env::GUEST_IP6, n.guest_ip6.to_string());
+            push(guest_env::GATEWAY6, n.gateway_ip6.to_string());
+            push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
+        }
         push(guest_env::DNS, n.dns_server.to_string());
     } else if let Some(dns) = dns_override {
         push(guest_env::DNS, dns.to_string());
