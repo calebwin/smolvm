@@ -3859,22 +3859,36 @@ impl EgressEventsCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.as_deref().unwrap_or("default");
         let events = smolvm::agent::read_egress_denials(name, self.limit);
-        if self.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&events).unwrap_or_default()
-            );
-            return Ok(());
+        // Write through the io API instead of println!: piping into a pager
+        // that exits early (`| head`) closes stdout, and println! turns that
+        // EPIPE into a panic. A closed pipe just means the reader is done.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            if self.json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&events).unwrap_or_default()
+                )?;
+                return Ok(());
+            }
+            if events.is_empty() {
+                writeln!(out, "No egress denials recorded for '{name}'.")?;
+                return Ok(());
+            }
+            writeln!(out, "{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP")?;
+            for e in &events {
+                writeln!(out, "{:<30} {:<9} {}", e.timestamp, e.operation, e.dest)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(smolvm::Error::config("egress-events", e.to_string())),
+            Ok(()) => Ok(()),
         }
-        if events.is_empty() {
-            println!("No egress denials recorded for '{name}'.");
-            return Ok(());
-        }
-        println!("{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP");
-        for e in &events {
-            println!("{:<30} {:<9} {}", e.timestamp, e.operation, e.dest);
-        }
-        Ok(())
     }
 }
 
