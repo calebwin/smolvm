@@ -1766,6 +1766,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             )));
         }
 
+        // The disk-trim tunable is read by the guest agent (fstrim runs in the
+        // guest), so forward the host's setting into the guest environment.
+        if let Ok(trim) = std::env::var(guest_env::DISK_TRIM) {
+            env_strings.push(cstr(&format!("{}={}", guest_env::DISK_TRIM, trim)));
+        }
+
         // The machine's name rides along so the guest can hostname the
         // container after it — distinct k8s node names, distinguishable
         // shell prompts — instead of every machine being "container". The

@@ -80,6 +80,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod cuda;
+mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
 mod forkpoint;
@@ -489,6 +490,10 @@ fn main() {
     // ensure_storage_mounted() also guards any concurrent call from a request
     // that races in the brief window on very fast hosts.
     ensure_storage_mounted();
+
+    // With the disks mounted, start reclaiming freed blocks back to the host
+    // sparse files so disk footprint tracks live data (see disk_trim).
+    disk_trim::spawn();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
