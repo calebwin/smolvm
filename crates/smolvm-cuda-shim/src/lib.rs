@@ -1617,12 +1617,22 @@ pub extern "C" fn cuModuleLoad(module: *mut *mut c_void, fname: *const c_char) -
     }
 }
 
-/// Smolvm resolves and loads a module's full image before returning its handle,
-/// so its observable loading mode is eager even when the guest requested lazy
-/// kernel loading.
+/// Report the host driver's actual loading mode. Modern CUDA defaults to lazy
+/// kernel loading; advertising eager here made guest runtimes materialize every
+/// registered kernel even though the remote driver could load them on demand.
 #[no_mangle]
 pub extern "C" fn cuModuleGetLoadingMode(mode: *mut c_int) -> c_int {
-    ret(unsafe { out(mode, 1) }) // CU_MODULE_EAGER_LOADING
+    if mode.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match cuda_driver_lib_call(CUDA_MODULE_GET_LOADING_MODE, Vec::new()) {
+        Ok(bytes) if bytes.len() == 4 => {
+            let value = i32::from_le_bytes(bytes.try_into().unwrap());
+            ret(unsafe { out(mode, value) })
+        }
+        Ok(_) => CUDA_ERROR_UNKNOWN,
+        Err(status) => status,
+    }
 }
 
 const CUDA_LIBRARY_BEGIN: u16 = 3;
@@ -1636,6 +1646,9 @@ const CUDA_LIBRARY_CANCEL: u16 = 10;
 const CUDA_MODULE_GET_GLOBAL: u16 = 11;
 const CUDA_HOST_REGISTER_GPA: u16 = 12;
 const CUDA_HOST_UNREGISTER_GPA: u16 = 13;
+const CUDA_KERNEL_GET_ATTRIBUTE: u16 = 15;
+const CUDA_KERNEL_SET_ATTRIBUTE: u16 = 16;
+const CUDA_MODULE_GET_LOADING_MODE: u16 = 17;
 
 fn native_libraries() -> &'static Mutex<std::collections::HashSet<usize>> {
     static HANDLES: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
@@ -3215,6 +3228,8 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuLibraryGetKernel" => cuLibraryGetKernel,
         "cuLibraryGetModule" => cuLibraryGetModule,
         "cuKernelGetFunction" => cuKernelGetFunction,
+        "cuKernelGetAttribute" => cuKernelGetAttribute,
+        "cuKernelSetAttribute" => cuKernelSetAttribute,
         "cuMemAlloc" => cuMemAlloc_v2,
         "cuMemFree" => cuMemFree_v2,
         "cuMemPoolCreate" => cuMemPoolCreate,
@@ -3422,6 +3437,53 @@ pub extern "C" fn cuFuncGetAttribute(pi: *mut c_int, attrib: c_int, func: *mut c
         Err(status) => status,
     }
 }
+/// Query a CUDA Library API kernel for a specific device. CUDA 13's CUTLASS
+/// DSL uses this before launching generated kernels, so preserve the CUkernel
+/// handle and device instead of approximating it through CUfunction state.
+#[no_mangle]
+pub extern "C" fn cuKernelGetAttribute(
+    pi: *mut c_int,
+    attrib: c_int,
+    kernel: *mut c_void,
+    device: c_int,
+) -> c_int {
+    if pi.is_null() || kernel.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let mut args = Vec::with_capacity(16);
+    args.extend_from_slice(&(kernel as u64).to_le_bytes());
+    args.extend_from_slice(&attrib.to_le_bytes());
+    args.extend_from_slice(&device.to_le_bytes());
+    match cuda_driver_lib_call(CUDA_KERNEL_GET_ATTRIBUTE, args) {
+        Ok(bytes) if bytes.len() == 4 => {
+            let value = i32::from_le_bytes(bytes.try_into().unwrap());
+            ret(unsafe { out(pi, value) })
+        }
+        Ok(_) => CUDA_ERROR_UNKNOWN,
+        Err(status) => status,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuKernelSetAttribute(
+    attrib: c_int,
+    value: c_int,
+    kernel: *mut c_void,
+    device: c_int,
+) -> c_int {
+    if kernel.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let mut args = Vec::with_capacity(20);
+    args.extend_from_slice(&(kernel as u64).to_le_bytes());
+    args.extend_from_slice(&attrib.to_le_bytes());
+    args.extend_from_slice(&value.to_le_bytes());
+    args.extend_from_slice(&device.to_le_bytes());
+    match cuda_driver_lib_call(CUDA_KERNEL_SET_ATTRIBUTE, args) {
+        Ok(_) => CUDA_SUCCESS,
+        Err(status) => status,
+    }
+}
 // Triton/vLLM kernels needing >48 KiB shared memory must raise
 // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES here before launching, or the
 // launch fails with INVALID_VALUE. Forward it so the host function's real limit
@@ -3570,5 +3632,22 @@ mod mem_pool_abi_tests {
         assert_eq!(std::mem::size_of::<CUmemLocation>(), 8);
         assert_eq!(std::mem::size_of::<CUmemAccessDesc>(), 12);
         assert_eq!(std::mem::size_of::<CUmemPoolProps>(), 88);
+    }
+}
+
+#[cfg(test)]
+mod cuda_13_proc_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_cuda_library_kernel_attribute_entry_points() {
+        assert_eq!(
+            proc_table("cuKernelGetAttribute"),
+            Some(cuKernelGetAttribute as *mut c_void)
+        );
+        assert_eq!(
+            proc_table("cuKernelSetAttribute"),
+            Some(cuKernelSetAttribute as *mut c_void)
+        );
     }
 }

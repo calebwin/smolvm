@@ -33,7 +33,7 @@ use smolvm_cuda::client::{Client, CudaRpcError};
 mod cublas_stubs;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
@@ -202,6 +202,18 @@ struct SymbolRec {
     address: u64,
 }
 
+#[derive(Clone)]
+struct StaticFuncRec {
+    fatbin: usize,
+    name: String,
+}
+
+#[derive(Clone)]
+struct StaticSymbolRec {
+    fatbin: usize,
+    name: String,
+}
+
 struct ShimState {
     client: Client<Stream>,
     initialized: bool,
@@ -251,6 +263,13 @@ struct ShimState {
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
+// Native libcudart only records static fatbins during ELF initialization and
+// materializes a module when one of its kernels/globals is first used. Keep the
+// same split here: registration must not connect to the host or upload hundreds
+// of unused modules in tokenizer/controller processes that merely import torch.
+static STATIC_MODULES: Mutex<Option<HashMap<usize, Vec<u8>>>> = Mutex::new(None);
+static STATIC_FUNCS: Mutex<Option<HashMap<usize, StaticFuncRec>>> = Mutex::new(None);
+static STATIC_SYMBOLS: Mutex<Option<HashMap<usize, StaticSymbolRec>>> = Mutex::new(None);
 
 thread_local! {
     /// `__cudaPushCallConfiguration` stash, popped by `__cudaPopCallConfiguration`.
@@ -2933,11 +2952,7 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) 
     // CUfunction_attribute: MAX_THREADS_PER_BLOCK=0, SHARED=1, CONST=2,
     // LOCAL=3, NUM_REGS=4, PTX_VERSION=5, BINARY_VERSION=6.
     let r = with_state(|s| {
-        let fid = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
-            .fid;
+        let (fid, _) = ensure_registered_func(s, func as usize)?;
         let get = |s: &mut ShimState, a: i32| s.client.func_get_attribute(fid, a).unwrap_or(0);
         let shared = get(s, 1);
         let cst = get(s, 2);
@@ -2990,11 +3005,7 @@ pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: 
         return CUDA_SUCCESS;
     }
     let r = with_state(|s| {
-        let fid = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
-            .fid;
+        let (fid, _) = ensure_registered_func(s, func as usize)?;
         s.client
             .func_set_attribute(fid, attr, value)
             .map_err(map_err)
@@ -3413,11 +3424,32 @@ fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
         return Err(CUDA_ERROR_INVALID_SYMBOL);
     }
     with_state(|s| {
-        let rec = s
-            .symbols
-            .get(&(symbol as usize))
-            .cloned()
-            .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+        let key = symbol as usize;
+        if !s.symbols.contains_key(&key) {
+            let source = STATIC_SYMBOLS
+                .lock()
+                .map_err(|_| CUDA_ERROR_UNKNOWN)?
+                .as_ref()
+                .and_then(|symbols| symbols.get(&key))
+                .cloned()
+                .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+            let module = ensure_static_module(s, source.fatbin)?;
+            let (address, size) = s
+                .client
+                .module_get_global(module, &source.name)
+                .map_err(map_symbol_err)?;
+            s.dev_allocs.insert(address, size);
+            s.symbols.insert(
+                key,
+                SymbolRec {
+                    module,
+                    name: source.name,
+                    address,
+                },
+            );
+            return Ok((address, size));
+        }
+        let rec = s.symbols.get(&key).cloned().expect("checked above");
         let result = s
             .client
             .module_get_global(rec.module, &rec.name)
@@ -3426,7 +3458,7 @@ fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
             s.dev_allocs.remove(&rec.address);
         }
         s.dev_allocs.insert(result.0, result.1);
-        if let Some(stored) = s.symbols.get_mut(&(symbol as usize)) {
+        if let Some(stored) = s.symbols.get_mut(&key) {
             stored.address = result.0;
         }
         Ok(result)
@@ -3516,6 +3548,49 @@ pub extern "C" fn cudaDeviceGetByPCIBusId(device: *mut c_int, pci_bus_id: *const
 }
 
 // ---- kernel registration + launch -------------------------------------------
+
+fn ensure_static_module(s: &mut ShimState, fatbin: usize) -> Result<u64, c_int> {
+    if let Some(&module) = s.modules.get(&fatbin) {
+        return Ok(module);
+    }
+    let blob = STATIC_MODULES
+        .lock()
+        .map_err(|_| CUDA_ERROR_UNKNOWN)?
+        .as_ref()
+        .and_then(|modules| modules.get(&fatbin))
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+    let module = s.client.module_load_data(&blob).map_err(map_err)?;
+    s.modules.insert(fatbin, module);
+    Ok(module)
+}
+
+fn ensure_registered_func(s: &mut ShimState, key: usize) -> Result<(u64, Vec<u32>), c_int> {
+    if let Some(rec) = s.funcs.get(&key) {
+        return Ok((rec.fid, rec.param_sizes.clone()));
+    }
+    let source = STATIC_FUNCS
+        .lock()
+        .map_err(|_| CUDA_ERROR_UNKNOWN)?
+        .as_ref()
+        .and_then(|funcs| funcs.get(&key))
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
+    let module = ensure_static_module(s, source.fatbin)?;
+    let fid = s
+        .client
+        .module_get_function(module, &source.name)
+        .map_err(map_err)?;
+    let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
+    s.funcs.insert(
+        key,
+        FuncRec {
+            fid,
+            param_sizes: param_sizes.clone(),
+        },
+    );
+    Ok((fid, param_sizes))
+}
 
 /// `__fatBinC_Wrapper_t`: what `__cudaRegisterFatBinary` receives. `data` points
 /// at the fatbin container (its own header carries the length).
@@ -3642,8 +3717,8 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
 
 #[no_mangle]
 pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c_void {
-    // Mint a stable handle the app hands back to Register/Unregister; map it to
-    // the driver module we load from the embedded fatbin.
+    // Mint a stable handle the app hands back to Register/Unregister. Preserve
+    // the image locally; the first kernel/global use uploads it to the host.
     let handle = Box::into_raw(Box::new(0u8)) as *mut *mut c_void;
     if fat_cubin.is_null() {
         return handle;
@@ -3654,15 +3729,11 @@ pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c
         return handle;
     };
     let blob = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
-    let _ = with_state(|s| {
-        match s.client.module_load_data(&blob) {
-            Ok(module) => {
-                s.modules.insert(handle as usize, module);
-            }
-            Err(e) => return Err(map_err(e)),
-        }
-        Ok(())
-    });
+    if let Ok(mut modules) = STATIC_MODULES.lock() {
+        modules
+            .get_or_insert_with(HashMap::new)
+            .insert(handle as usize, blob);
+    }
     handle
 }
 
@@ -3698,21 +3769,15 @@ pub extern "C" fn __cudaRegisterFunction(
         Ok(n) => n.to_string(),
         Err(_) => return,
     };
-    let _ = with_state(|s| {
-        let module = *s
-            .modules
-            .get(&(fat_cubin_handle as usize))
-            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
-        let cname = CString::new(name.clone()).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
-        let fid = s
-            .client
-            .module_get_function(module, cname.to_str().unwrap())
-            .map_err(map_err)?;
-        let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
-        s.funcs
-            .insert(host_fun as usize, FuncRec { fid, param_sizes });
-        Ok(())
-    });
+    if let Ok(mut funcs) = STATIC_FUNCS.lock() {
+        funcs.get_or_insert_with(HashMap::new).insert(
+            host_fun as usize,
+            StaticFuncRec {
+                fatbin: fat_cubin_handle as usize,
+                name,
+            },
+        );
+    }
 }
 
 #[no_mangle]
@@ -3742,48 +3807,82 @@ pub extern "C" fn __cudaRegisterVar(
         Ok(name) => name.to_owned(),
         Err(_) => return,
     };
-    let _ = with_state(|s| {
-        let module = *s
-            .modules
-            .get(&(fat_cubin_handle as usize))
-            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
-        // Validate the registration now. Calls re-resolve by module/name so an
-        // isolating fork can translate the inherited module to its local copy.
-        let (address, size) = s
-            .client
-            .module_get_global(module, &name)
-            .map_err(map_symbol_err)?;
-        s.dev_allocs.insert(address, size);
-        s.symbols.insert(
+    if let Ok(mut symbols) = STATIC_SYMBOLS.lock() {
+        symbols.get_or_insert_with(HashMap::new).insert(
             host_var as usize,
-            SymbolRec {
-                module,
+            StaticSymbolRec {
+                fatbin: fat_cubin_handle as usize,
                 name,
-                address,
             },
         );
-        Ok(())
-    });
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __cudaUnregisterFatBinary(handle: *mut *mut c_void) {
-    let _ = with_state(|s| {
-        if let Some(module) = s.modules.remove(&(handle as usize)) {
-            let global_addresses: Vec<u64> = s
-                .symbols
-                .values()
-                .filter(|symbol| symbol.module == module)
-                .map(|symbol| symbol.address)
-                .collect();
-            s.symbols.retain(|_, symbol| symbol.module != module);
-            for address in global_addresses {
-                s.dev_allocs.remove(&address);
-            }
-            let _ = s.client.module_unload(module);
+    let fatbin = handle as usize;
+    if let Ok(mut modules) = STATIC_MODULES.lock() {
+        if let Some(modules) = modules.as_mut() {
+            modules.remove(&fatbin);
         }
-        Ok(())
-    });
+    }
+    let function_keys = STATIC_FUNCS
+        .lock()
+        .ok()
+        .and_then(|mut funcs| {
+            let funcs = funcs.as_mut()?;
+            let keys: Vec<usize> = funcs
+                .iter()
+                .filter_map(|(&key, rec)| (rec.fatbin == fatbin).then_some(key))
+                .collect();
+            for key in &keys {
+                funcs.remove(key);
+            }
+            Some(keys)
+        })
+        .unwrap_or_default();
+    let symbol_keys = STATIC_SYMBOLS
+        .lock()
+        .ok()
+        .and_then(|mut symbols| {
+            let symbols = symbols.as_mut()?;
+            let keys: Vec<usize> = symbols
+                .iter()
+                .filter_map(|(&key, rec)| (rec.fatbin == fatbin).then_some(key))
+                .collect();
+            for key in &keys {
+                symbols.remove(key);
+            }
+            Some(keys)
+        })
+        .unwrap_or_default();
+    // Do not create a CUDA connection during ELF teardown. Unload only when
+    // this process actually materialized the module earlier.
+    if let Ok(mut state) = STATE.lock() {
+        if let Some(s) = state.as_mut() {
+            for key in function_keys {
+                s.funcs.remove(&key);
+            }
+            for key in symbol_keys {
+                if let Some(symbol) = s.symbols.remove(&key) {
+                    s.dev_allocs.remove(&symbol.address);
+                }
+            }
+            if let Some(module) = s.modules.remove(&fatbin) {
+                let global_addresses: Vec<u64> = s
+                    .symbols
+                    .values()
+                    .filter(|symbol| symbol.module == module)
+                    .map(|symbol| symbol.address)
+                    .collect();
+                s.symbols.retain(|_, symbol| symbol.module != module);
+                for address in global_addresses {
+                    s.dev_allocs.remove(&address);
+                }
+                let _ = s.client.module_unload(module);
+            }
+        }
+    }
     if !handle.is_null() {
         unsafe { drop(Box::from_raw(handle as *mut u8)) };
     }
@@ -3909,12 +4008,7 @@ fn do_launch_inner(
         return CUDA_SUCCESS;
     }
     with_state(|s| {
-        let rec = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
-        let fid = rec.fid;
-        let sizes = rec.param_sizes.clone();
+        let (fid, sizes) = ensure_registered_func(s, func as usize)?;
         // Reconstruct one byte-blob per kernel argument from `args[i]`.
         let params: Vec<Vec<u8>> = if sizes.is_empty() {
             Vec::new()
@@ -5177,6 +5271,55 @@ mod tests {
             unsafe { module_image_len(oversized_elf.as_ptr().cast()) },
             Err(CUDA_ERROR_INVALID_VALUE)
         );
+    }
+
+    #[test]
+    fn static_registration_stays_local_until_first_use() {
+        let ptx = b".version 7.0\n.entry lazy_test() { ret; }\0";
+        let wrapper = FatBinWrapper {
+            magic: 0x4662_43b1_u32 as c_int,
+            version: 1,
+            data: ptx.as_ptr().cast(),
+            filename_or_fatbins: std::ptr::null(),
+        };
+        let handle = __cudaRegisterFatBinary((&wrapper as *const FatBinWrapper).cast_mut().cast());
+        let host_stub = std::ptr::dangling::<c_char>();
+        __cudaRegisterFunction(
+            handle,
+            host_stub,
+            std::ptr::null_mut(),
+            c"lazy_test".as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        assert!(STATIC_MODULES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|modules| modules.contains_key(&(handle as usize))));
+        assert!(STATIC_FUNCS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|funcs| funcs.contains_key(&(host_stub as usize))));
+        assert!(STATE.lock().unwrap().is_none());
+
+        __cudaUnregisterFatBinary(handle);
+        assert!(!STATIC_MODULES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|modules| modules.contains_key(&(handle as usize))));
+        assert!(!STATIC_FUNCS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|funcs| funcs.contains_key(&(host_stub as usize))));
     }
 
     #[test]

@@ -1017,10 +1017,6 @@ pub extern "C" fn cuIpcOpenMemHandle_v2() -> c_int {
     unsupported(stringify!(cuIpcOpenMemHandle_v2))
 }
 #[no_mangle]
-pub extern "C" fn cuKernelGetAttribute() -> c_int {
-    unsupported(stringify!(cuKernelGetAttribute))
-}
-#[no_mangle]
 pub extern "C" fn cuKernelGetLibrary() -> c_int {
     unsupported(stringify!(cuKernelGetLibrary))
 }
@@ -1035,10 +1031,6 @@ pub extern "C" fn cuKernelGetParamCount() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuKernelGetParamInfo() -> c_int {
     unsupported(stringify!(cuKernelGetParamInfo))
-}
-#[no_mangle]
-pub extern "C" fn cuKernelSetAttribute() -> c_int {
-    unsupported(stringify!(cuKernelSetAttribute))
 }
 #[no_mangle]
 pub extern "C" fn cuKernelSetCacheConfig() -> c_int {
