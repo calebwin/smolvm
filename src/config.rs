@@ -884,6 +884,34 @@ impl VmRecord {
         ))
     }
 
+    /// Remote volumes mount via rclone inside the workload image over the
+    /// guest network; refuse configurations that can never mount at create
+    /// instead of failing every start. Shared by the CLI and API create paths.
+    pub fn validate_remote_volumes(&self) -> crate::Result<()> {
+        if self.remote_volumes.is_empty() {
+            return Ok(());
+        }
+        if self.image.is_none() {
+            return Err(crate::Error::config(
+                "create machine",
+                "remote volumes (s3:// or rclone remotes) require an image machine \
+                 whose image provides `rclone` and `fusermount3`",
+            ));
+        }
+        let plan = crate::network::plan_launch_network(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len(),
+        );
+        if !plan.has_network() {
+            return Err(crate::Error::config(
+                "create machine",
+                "remote volumes need network access: add --net (or an egress policy)",
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert record fields to VmResources.
     pub fn vm_resources(&self) -> crate::agent::VmResources {
         crate::agent::VmResources {

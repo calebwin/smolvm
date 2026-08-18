@@ -712,20 +712,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     // Remote volumes mount via rclone inside the workload image; an imageless
     // machine has nowhere to run it, and they also need network to reach the
     // remote. Refuse at create instead of failing every start.
-    if !record.remote_volumes.is_empty() {
-        if record.image.is_none() {
-            return Err(smolvm::Error::config(
-                "create machine",
-                "remote volumes (s3:// or rclone remotes) require an image machine                  whose image provides `rclone` and `fusermount3`",
-            ));
-        }
-        if !params.net && params.allowed_cidrs.is_none() && params.dns_filter_hosts.is_none() {
-            return Err(smolvm::Error::config(
-                "create machine",
-                "remote volumes need network access: add --net (or an egress policy)",
-            ));
-        }
-    }
+    record.validate_remote_volumes()?;
 
     Ok(record)
 }

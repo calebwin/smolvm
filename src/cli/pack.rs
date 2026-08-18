@@ -542,6 +542,22 @@ impl PackCreateCmd {
             ));
         }
 
+        // The pack format has no notion of remote volumes; packing quietly
+        // producing an artifact without them would look like data loss at run
+        // time, so say it up front.
+        if !vm.remote_volumes.is_empty() {
+            warn!(
+                "VM '{}' has remote volumes ({}); .smolmachine artifacts do not carry them — \
+                 re-attach with -v when creating machines from this artifact",
+                vm_name,
+                vm.remote_volumes
+                    .iter()
+                    .map(|v| v.target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 2. Create temporary staging directory

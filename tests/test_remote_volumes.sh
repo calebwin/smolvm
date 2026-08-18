@@ -16,7 +16,7 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3' got '$2')"; 
 
 CREDS="--env AWS_ACCESS_KEY_ID=smoltest --env AWS_SECRET_ACCESS_KEY=smoltest123 --env AWS_ENDPOINT_URL=http://100.96.0.1:9000"
 RCLONE_REMOTE=':s3,provider=Minio,access_key_id=smoltest,secret_access_key=smoltest123,endpoint="http://100.96.0.1:9000"'
-NAMES="rv-minio rv-ver rv-rw rv-ro rv-notools rv-badremote"
+NAMES="rv-minio rv-ver rv-rw rv-ro rv-notools rv-badremote rv-sf rv-api"
 cleanup() { for n in $NAMES; do $S machine delete --name "$n" --force >/dev/null 2>&1; done; }
 cleanup
 
@@ -81,6 +81,69 @@ echo "$OUT" | grep -qi "read-only" && ok "ro mount rejects writes" || bad "ro mo
 # ---- 8. fork of a remote-volume golden is refused cleanly -----------------
 OUT=$($S machine fork --golden rv-ro --name rv-clone 2>&1)
 echo "$OUT" | grep -q "cannot be forked yet" && ok "fork refused for remote-volume golden" || bad "fork refused for remote-volume golden"
+
+# ---- 9. Smolfile surface: volumes = ["s3://..."] flows through create -----
+TMPD=$(mktemp -d)
+cat > "$TMPD/Smolfile" <<'SMOLEOF'
+image = "alpine:latest"
+net = true
+cmd = ["sleep", "infinity"]
+env = [
+  "AWS_ACCESS_KEY_ID=smoltest",
+  "AWS_SECRET_ACCESS_KEY=smoltest123",
+  "AWS_ENDPOINT_URL=http://100.96.0.1:9000",
+]
+volumes = ["s3://rv-bucket:/mnt/sf"]
+init = ["apk add -q rclone fuse3"]
+SMOLEOF
+$S machine create --name rv-sf --smolfile "$TMPD/Smolfile" --net-backend virtio-net >/dev/null 2>&1 \
+  && $S machine start --name rv-sf >/dev/null 2>&1 \
+  && ok "smolfile machine with remote volume starts" || bad "smolfile machine with remote volume starts"
+$S machine exec --name rv-sf -- sh -c 'echo sf-1 > /mnt/sf/sf.txt && sync && sleep 5' >/dev/null 2>&1
+check "smolfile write visible out-of-band" "$(oob sf.txt)" "sf-1"
+rm -rf "$TMPD"
+
+# ---- 10. serve API surface: structured MountSpec with a remote source ------
+# Needs its own serve (the guest-rollout ingress port is exclusive) with the
+# egress floor lowered so the guest may dial the host-local MinIO; skipped if
+# a serve is already running.
+if pgrep -f "smolvm.* serve start" >/dev/null 2>&1; then
+  echo "SKIP: serve API cases (a serve is already running)"
+else
+  RVSOCK=$(mktemp -u /tmp/rv-serve.XXXXXX.sock)
+  SMOLVM_EGRESS_FLOOR=metadata "$S" serve start --listen "unix://$RVSOCK" >/dev/null 2>&1 &
+  SERVE_PID=$!
+  i=0; until [ -S "$RVSOCK" ]; do i=$((i+1)); [ $i -gt 20 ] && break; sleep 1; done
+  api() { curl -s -m 300 --unix-socket "$RVSOCK" "$@"; }
+  CODE=$(api -o /dev/null -w '%{http_code}' -X POST http://localhost/api/v1/machines \
+    -H 'Content-Type: application/json' -d '{
+    "name": "rv-api", "image": "rclone/rclone",
+    "network": true, "network_backend": "virtio-net",
+    "entrypoint": ["sleep"], "cmd": ["infinity"],
+    "env": [
+      {"name": "AWS_ACCESS_KEY_ID", "value": "smoltest"},
+      {"name": "AWS_SECRET_ACCESS_KEY", "value": "smoltest123"},
+      {"name": "AWS_ENDPOINT_URL", "value": "http://100.96.0.1:9000"}
+    ],
+    "mounts": [{"source": "s3://rv-bucket", "target": "/mnt/api"}]}')
+  check "api create accepts remote mount" "$CODE" "200"
+  CODE=$(api -o /dev/null -w '%{http_code}' -X POST http://localhost/api/v1/machines/rv-api/start)
+  check "api start mounts the volume" "$CODE" "200"
+  sleep 10
+  api -X POST http://localhost/api/v1/machines/rv-api/exec -H 'Content-Type: application/json' \
+    -d '{"command":["sh","-c","echo api-1 > /mnt/api/api.txt && sync && sleep 6"]}' >/dev/null 2>&1
+  check "api-machine write visible out-of-band" "$(oob api.txt)" "api-1"
+  CODE=$(api -o "$TMPD.badjson" -w '%{http_code}' -X POST http://localhost/api/v1/machines \
+    -H 'Content-Type: application/json' -d '{
+    "name": "rv-api-bad", "image": "alpine:latest", "network": true,
+    "mounts": [{"source": ":http,url=\"https://h\"", "target": "/mnt/x"}]}')
+  check "api rejects malformed rclone remote (400)" "$CODE" "400"
+  grep -q "::" "$TMPD.badjson" 2>/dev/null && ok "api 400 carries the :: hint" || bad "api 400 carries the :: hint"
+  rm -f "$TMPD.badjson"
+  api -X DELETE "http://localhost/api/v1/machines/rv-api?force=true" >/dev/null 2>&1
+  kill "$SERVE_PID" 2>/dev/null
+  rm -f "$RVSOCK"
+fi
 
 cleanup
 echo ""

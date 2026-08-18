@@ -405,9 +405,21 @@ pub async fn create_machine(
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
-    // Validate mount paths
-    let host_mounts: Vec<HostMount> = req
-        .mounts
+    // Split remote volumes (s3:// or rclone-remote sources) from host mounts,
+    // mirroring the CLI's -v handling, then validate the host mount paths.
+    let mut remote_volumes = Vec::new();
+    let mut host_mount_specs: Vec<crate::api::types::MountSpec> = Vec::new();
+    for m in &req.mounts {
+        if crate::remote_volume::is_remote_source(&m.source) {
+            remote_volumes.push(
+                crate::remote_volume::from_parts(&m.source, &m.target, m.readonly)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            );
+        } else {
+            host_mount_specs.push(m.clone());
+        }
+    }
+    let host_mounts: Vec<HostMount> = host_mount_specs
         .iter()
         .map(|m| HostMount::try_from(m).map_err(|e| ApiError::BadRequest(e.to_string())))
         .collect::<Result<_, _>>()?;
@@ -415,6 +427,20 @@ pub async fn create_machine(
     // ambiguous same-target mount is a clean 400 rather than a silent shadow.
     HostMount::ensure_unique_targets(&host_mounts)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    {
+        let mut seen = std::collections::HashSet::new();
+        for target in remote_volumes
+            .iter()
+            .map(|v| v.target.as_str())
+            .chain(host_mount_specs.iter().map(|m| m.target.as_str()))
+        {
+            if !seen.insert(target) {
+                return Err(ApiError::BadRequest(format!(
+                    "duplicate mount target: {target} is specified more than once"
+                )));
+            }
+        }
+    }
 
     // Validate published ports, matching the CLI (which rejects these before
     // launch): port 0 is invalid for forwarding, and each host port may be
@@ -777,7 +803,8 @@ pub async fn create_machine(
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
         manager,
-        mounts: req.mounts.clone(),
+        mounts: host_mount_specs,
+        remote_volumes,
         ports: req.ports.clone(),
         resources: resources.clone(),
         restart: match req.restart {
@@ -1206,6 +1233,13 @@ pub async fn start_machine(
         env.extend(crate::secrets::expose_into_env(
             super::record_secret_refs_env(&entry)?,
         ));
+        // Remote volumes mount inside the workload container; every launch
+        // path must wrap the command or the mounts are silently absent.
+        if !record.remote_volumes.is_empty() {
+            command =
+                crate::remote_volume::wrap_workload_command(&record.remote_volumes, &env, command)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
         let workdir = record.workdir.clone();
         let user = record.user.clone();
         let mounts_config = {

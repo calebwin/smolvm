@@ -128,6 +128,33 @@ fn parse_spec(spec: &str) -> crate::Result<Option<RemoteVolume>> {
     }))
 }
 
+/// Whether a structured mount source (the API's `MountSpec.source`) denotes a
+/// remote volume rather than a host directory.
+pub fn is_remote_source(source: &str) -> bool {
+    source.starts_with("s3://") || source.starts_with(':')
+}
+
+/// Build a remote volume from already-split parts (the API's structured mount
+/// spec), reusing the colon-spec parser so both entry points validate
+/// identically.
+pub fn from_parts(source: &str, target: &str, read_only: bool) -> crate::Result<RemoteVolume> {
+    // The parser is right-anchored, so a colon in the target would mis-split
+    // the reassembled spec; targets never legitimately contain one.
+    if target.contains(':') {
+        return Err(crate::Error::config(
+            "parse remote volume",
+            format!("remote volume guest path must not contain ':': '{target}'"),
+        ));
+    }
+    let spec = format!("{source}:{target}{}", if read_only { ":ro" } else { "" });
+    parse_spec(&spec)?.ok_or_else(|| {
+        crate::Error::config(
+            "parse remote volume",
+            format!("not a remote volume source: '{source}'"),
+        )
+    })
+}
+
 /// Whether a raw rclone connection string still has its remote-terminating
 /// `:path` colon. Colons inside double-quoted option values (URLs, mostly)
 /// don't count — rclone's own parser treats those as part of the value.
@@ -395,6 +422,23 @@ mod tests {
 
         let holder = wrap_workload_command(&vols, &[], vec![]).unwrap();
         assert!(holder[2].ends_with("&& exec sleep infinity"));
+    }
+
+    #[test]
+    fn from_parts_matches_colon_parser() {
+        let structured = from_parts("s3://bucket/pfx", "/mnt/d", true).unwrap();
+        let parsed = &split(&["s3://bucket/pfx:/mnt/d:ro"]).1[0];
+        assert_eq!(&structured, parsed);
+        // Same validation as the colon parser: relative target, missing
+        // rclone path colon, empty bucket.
+        assert!(from_parts("s3://b", "relative", false).is_err());
+        assert!(from_parts(":http,url=\"https://h\"", "/mnt/x", false).is_err());
+        assert!(from_parts("s3://", "/mnt/x", false).is_err());
+        // Colon in a structured target would mis-split the reassembled spec.
+        assert!(from_parts("s3://b", "/mnt/a:ro", false).is_err());
+        assert!(!is_remote_source("/host/dir"));
+        assert!(is_remote_source("s3://b"));
+        assert!(is_remote_source(":http,url=\"https://h\":"));
     }
 
     #[test]

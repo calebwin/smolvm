@@ -120,6 +120,8 @@ pub struct MachineRegistration {
     pub manager: AgentManager,
     /// Host mounts to configure.
     pub mounts: Vec<MountSpec>,
+    /// Remote volumes (s3:// or rclone remotes) to mount in the workload.
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
     /// Port mappings to configure.
     pub ports: Vec<PortSpec>,
     /// VM resources to configure.
@@ -886,6 +888,10 @@ impl ApiState {
         record.env = reg.env;
         record.workdir = reg.workdir;
         record.secret_refs = reg.secret_refs.clone();
+        record.remote_volumes = reg.remote_volumes.clone();
+        record
+            .validate_remote_volumes()
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         // A registry image with no network can never be pulled (the guest runs
         // the pull), so reject with a 400 here instead of persisting a machine
@@ -1361,6 +1367,12 @@ async fn relaunch_image_workload(
         crate::api::handlers::record_secret_refs_env(entry)
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
     ));
+    // Remote volumes mount inside the workload container; every launch path
+    // must wrap the command or a serve-side (re)start silently loses them.
+    if !record.remote_volumes.is_empty() {
+        command =
+            crate::remote_volume::wrap_workload_command(&record.remote_volumes, &env, command)?;
+    }
     let workdir = record.workdir.clone();
     let user = record.user.clone();
     let mounts_config = {
