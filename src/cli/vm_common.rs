@@ -811,6 +811,21 @@ pub struct ForkVmOptions<'a> {
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
+    // A live FUSE mount does not survive the freeze/restore: the restored
+    // clone's mount wedges its container namespace and every exec hangs.
+    // Refuse cleanly until fork remounts remote volumes on restore.
+    if let Some(record) = db.get_vm(golden)? {
+        if !record.remote_volumes.is_empty() {
+            return Err(smolvm::Error::config(
+                "machine fork",
+                format!(
+                    "machine '{golden}' has remote volumes, which cannot be forked yet: \
+                     a mounted remote filesystem does not survive the freeze/restore"
+                ),
+            ));
+        }
+    }
+
     if let Some(timeout) = options.wait_ready {
         eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
@@ -897,6 +912,22 @@ pub fn fork_vm_batch(
     hold: bool,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
+
+    // A live FUSE mount does not survive the freeze/restore: the restored
+    // clone's mount wedges its container namespace and every exec hangs.
+    // Refuse cleanly until fork remounts remote volumes on restore.
+    if let Some(record) = db.get_vm(golden)? {
+        if !record.remote_volumes.is_empty() {
+            return Err(smolvm::Error::config(
+                "machine fork",
+                format!(
+                    "machine '{golden}' has remote volumes, which cannot be forked yet: \
+                     a mounted remote filesystem does not survive the freeze/restore"
+                ),
+            ));
+        }
+    }
+
     if let Some(timeout) = wait_ready {
         eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
@@ -1567,6 +1598,33 @@ fn start_vm_named_with_db(
         // entirely when restoring from a snapshot — the forked container is
         // inherited as-is.
         let _ = img;
+        // The remote-volume mounts run inside the detached workload container,
+        // whose failures are invisible to this caller. Catch the common one
+        // (image without the tools) synchronously first, with the actionable
+        // message, instead of leaving a "running" machine with a dead workload.
+        if !from_snapshot {
+            if let Some(preflight) =
+                smolvm::remote_volume::preflight_command(&record.remote_volumes)
+            {
+                if let Err(e) = run_init_commands(
+                    &mut client,
+                    &[preflight],
+                    InitRunContext {
+                        image: record.image.as_deref(),
+                        image_info: None,
+                        env: &exec_env,
+                        workdir: record.workdir.as_deref(),
+                        record_mounts: &record.mounts,
+                        overlay_id: name,
+                    },
+                ) {
+                    if let Err(stop_err) = manager.stop() {
+                        tracing::warn!(error = %stop_err, "failed to stop machine after remote volume preflight failure");
+                    }
+                    return Err(e);
+                }
+            }
+        }
         if !from_snapshot {
             if let Err(e) = smolvm::workload::launch_image_workload(
                 &mut client,
@@ -1583,6 +1641,29 @@ fn start_vm_named_with_db(
             tracing::info!(
                 "clone booted from snapshot: workload container inherited from fork, skipping relaunch"
             );
+        }
+        // Confirm every remote volume actually mounted (also covers a clone's
+        // restored mounts): a failed mount kills the detached workload
+        // silently, so without this the machine would report running while
+        // the volume is simply absent.
+        if let Some(verify) = smolvm::remote_volume::verify_command(&record.remote_volumes) {
+            if let Err(e) = run_init_commands(
+                &mut client,
+                &[verify],
+                InitRunContext {
+                    image: record.image.as_deref(),
+                    image_info: None,
+                    env: &exec_env,
+                    workdir: record.workdir.as_deref(),
+                    record_mounts: &record.mounts,
+                    overlay_id: name,
+                },
+            ) {
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(error = %stop_err, "failed to stop machine after remote volume verification failure");
+                }
+                return Err(e);
+            }
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {

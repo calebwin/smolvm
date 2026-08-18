@@ -87,6 +87,12 @@ fn parse_spec(spec: &str) -> crate::Result<Option<RemoteVolume>> {
             format!("remote volume guest path must be absolute: '{spec}'"),
         ));
     }
+    if target.contains(' ') {
+        return Err(crate::Error::config(
+            "parse remote volume",
+            format!("remote volume guest path must not contain spaces: '{spec}'"),
+        ));
+    }
     // Both values end up inside a single-quoted shell word.
     if source.contains('\'') || target.contains('\'') {
         return Err(crate::Error::config(
@@ -197,6 +203,49 @@ pub fn mount_commands(
     env: &[(String, String)],
 ) -> crate::Result<Vec<String>> {
     volumes.iter().map(|v| v.mount_command(env)).collect()
+}
+
+/// A synchronous pre-launch check that the image can mount remote volumes at
+/// all. The mount itself runs inside the detached workload container, whose
+/// failures are not surfaced to the caller — so the most common failure
+/// (image without the tools) is caught here first, where it can fail the
+/// start with an actionable message.
+pub fn preflight_command(volumes: &[RemoteVolume]) -> Option<String> {
+    if volumes.is_empty() {
+        return None;
+    }
+    Some(
+        "command -v rclone >/dev/null 2>&1 && command -v fusermount3 >/dev/null 2>&1 || \
+         { echo \"remote volumes need rclone and fuse3 in the image \
+         (alpine: apk add rclone fuse3 | debian/ubuntu: apt-get install -y rclone fuse3; \
+         or install them with --init, which runs before the mounts)\" >&2; exit 1; }"
+            .to_string(),
+    )
+}
+
+/// A post-launch check that every remote volume actually mounted. Joins the
+/// workload container (like any exec) and polls /proc/mounts: if the mount
+/// script failed, the workload container is dead and the fresh exec container
+/// sees no mounts either way — so this fails the start instead of leaving a
+/// silently broken machine.
+pub fn verify_command(volumes: &[RemoteVolume]) -> Option<String> {
+    if volumes.is_empty() {
+        return None;
+    }
+    let checks: Vec<String> = volumes
+        .iter()
+        .map(|v| {
+            format!(
+                "awk -v m='{}' '$2==m' /proc/mounts | grep -q rclone",
+                v.target
+            )
+        })
+        .collect();
+    let all = checks.join(" && ");
+    Some(format!(
+        "t=0; while [ $t -lt 30 ]; do if {all}; then exit 0; fi; t=$((t+1)); sleep 0.5; done; \
+         echo \"remote volume(s) failed to mount — check the machine's agent-console.log for the rclone error\" >&2; exit 1"
+    ))
 }
 
 /// Wrap a machine's workload command so its container mounts the remote
