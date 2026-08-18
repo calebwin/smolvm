@@ -51,27 +51,6 @@ $T/smolvm-cuda-run --proto-hash > $R/proto-hash
 ./summarize.py                    # median + spread per (arm, N, batch), and the ratio
 ```
 
-## CUDA graph regression probe
-
-`segmented_graph_throughput.py` compares identical launch-bound math in four
-modes: eager execution, one full graph, two graph segments around an eager
-island, and the same segmented graph with side-stream capture. It validates the
-result against eager execution, reports graph construction separately, and
-prints repeated steady-state timings as JSON.
-
-Run every mode natively and through the release CUDA shims on an otherwise idle
-GPU. For remoted side-stream capture, set `SMOLVM_CUDART_QUERY_LIB` to the
-release `libcudart.so` shim so the probe can call the capture-info ABI directly.
-
-```sh
-python bench/segmented_graph_throughput.py \
-  --mode segmented-side --iters 5000 --reps 5 --warmup 200
-```
-
-Use eager, full, and segmented results from the parent revision as regression
-controls. The side-stream mode is the newly enabled path and is expected to fail
-on revisions that predate multi-stream capture support.
-
 Flags that exist because leaving them out produces misleading numbers:
 
 - `--cpus K` — pin **each** native learner to its own K-core set, matching the
