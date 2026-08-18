@@ -220,10 +220,12 @@ struct ShimState {
     /// interior to a cudaMalloc'd block — `cudaPointerGetAttributes` on one
     /// must still report Device or torch's `getDeviceFromPtr` throws.
     dev_allocs: std::collections::BTreeMap<u64, u64>,
-    /// Active CUDA graph capture, `(stream_handle, capture_id)`. Kept
-    /// guest-side so the per-launch hot queries (`cudaStreamIsCapturing`,
+    /// Active CUDA graph capture, `(root_stream_handle, capture_id)`. Kept
+    /// guest-side so the root-stream hot queries (`cudaStreamIsCapturing`,
     /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
-    /// answer locally instead of round-tripping.
+    /// answer locally instead of round-tripping. A non-root stream may have
+    /// joined the same capture through an event edge; those queries must ask
+    /// the host driver because only it owns the multi-stream capture DAG.
     capture: Option<(u64, u64)>,
     /// PID that opened `client`. If the process forks (or a snapshotted VM is
     /// restored as a clone), the inherited socket fd + ring mapping belong to
@@ -2350,10 +2352,52 @@ pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
 // recorded (not executed) by the real driver. Replay is a single GraphLaunch
 // message for the whole graph — the antidote to per-launch round-trips in
 // launch-bound inference. The hot capture-status queries answer from the
-// guest-side `capture` field, costing nothing outside capture.
+// guest-side `capture` field, costing nothing outside capture and on the root
+// stream. Queries for side streams participating through event edges go to the
+// host driver; treating them as inactive leaves a forked capture branch
+// unjoined and breaks segmented graph implementations that track side-stream
+// forks.
 
+/// cudaStreamCaptureStatusNone.
+const CAPTURE_NONE: c_int = 0;
 /// cudaStreamCaptureStatusActive.
 const CAPTURE_ACTIVE: c_int = 1;
+
+/// Resolve capture information while preserving the root-stream zero-RTT path.
+/// CUDA owns side-stream participation: an event recorded on the capturing
+/// stream and waited by another stream adds that stream to the capture DAG, so
+/// local root-only bookkeeping cannot answer a side-stream query correctly.
+fn resolve_capture_info<E>(
+    capture: Option<(u64, u64)>,
+    stream: u64,
+    query_host: impl FnOnce(u64) -> Result<(u64, u64), E>,
+) -> Result<(c_int, u64), E> {
+    match capture {
+        None => Ok((CAPTURE_NONE, 0)),
+        Some((root, local_id)) if root == stream => Ok((CAPTURE_ACTIVE, local_id)),
+        Some((_, local_id)) => {
+            let (status, _) = query_host(stream)?;
+            let status = status as c_int;
+            // The host and guest mint capture IDs independently. Frameworks
+            // require every stream in one capture to report the same ID, so
+            // expose the local root ID for participating side streams.
+            Ok((
+                status,
+                if status == CAPTURE_ACTIVE {
+                    local_id
+                } else {
+                    0
+                },
+            ))
+        }
+    }
+}
+
+fn capture_info_for_stream(s: &mut ShimState, stream: u64) -> Result<(c_int, u64), c_int> {
+    resolve_capture_info(s.capture, stream, |side| {
+        s.client.stream_capture_info(side).map_err(map_err)
+    })
+}
 
 #[no_mangle]
 pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
@@ -2409,9 +2453,15 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
 
 #[no_mangle]
 pub extern "C" fn cudaStreamIsCapturing(stream: *mut c_void, status: *mut c_int) -> c_int {
-    let active = with_state(|s| Ok(matches!(s.capture, Some((cs, _)) if cs == stream as u64)))
-        .unwrap_or(false);
-    set_last(unsafe { out(status, if active { CAPTURE_ACTIVE } else { 0 }) })
+    if status.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|s| capture_info_for_stream(s, stream as u64)) {
+            Ok((capture_status, _)) => unsafe { out(status, capture_status) },
+            Err(error) => error,
+        },
+    )
 }
 
 #[no_mangle]
@@ -2423,10 +2473,12 @@ pub extern "C" fn cudaStreamGetCaptureInfo_v2(
     deps: *mut *mut *const c_void,
     num_deps: *mut usize,
 ) -> c_int {
-    let cap = with_state(|s| Ok(s.capture)).unwrap_or(None);
-    let (st, cid) = match cap {
-        Some((cs, cid)) if cs == stream as u64 => (CAPTURE_ACTIVE, cid),
-        _ => (0, 0),
+    if status.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let (st, cid) = match with_state(|s| capture_info_for_stream(s, stream as u64)) {
+        Ok(info) => info,
+        Err(error) => return set_last(error),
     };
     unsafe {
         let _ = out(status, st);
@@ -2980,8 +3032,17 @@ pub extern "C" fn cudaStreamGetCaptureInfo(
     id: *mut u64,
     graph: *mut *mut c_void,
     deps: *mut *mut *const c_void,
+    edge_data: *mut *const c_void,
     num_deps: *mut usize,
 ) -> c_int {
+    // CUDA 13 added the edge-data output before `numDependencies`; current
+    // cuda-python bindings call this seven-argument ABI.
+    if !edge_data.is_null() && deps.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    if !edge_data.is_null() {
+        unsafe { *edge_data = std::ptr::null() };
+    }
     cudaStreamGetCaptureInfo_v2(stream, status, id, graph, deps, num_deps)
 }
 
@@ -5041,6 +5102,43 @@ pub extern "C" fn cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_info_uses_host_only_for_side_streams() {
+        let mut host_queries = Vec::new();
+        let inactive = resolve_capture_info(None, 22, |stream| {
+            host_queries.push(stream);
+            Ok::<_, ()>((CAPTURE_ACTIVE as u64, 900))
+        })
+        .unwrap();
+        assert_eq!(inactive, (CAPTURE_NONE, 0));
+        assert!(host_queries.is_empty());
+
+        let root = resolve_capture_info(Some((11, 77)), 11, |stream| {
+            host_queries.push(stream);
+            Ok::<_, ()>((CAPTURE_NONE as u64, 0))
+        })
+        .unwrap();
+        assert_eq!(root, (CAPTURE_ACTIVE, 77));
+        assert!(host_queries.is_empty());
+
+        let side = resolve_capture_info(Some((11, 77)), 22, |stream| {
+            host_queries.push(stream);
+            Ok::<_, ()>((CAPTURE_ACTIVE as u64, 900))
+        })
+        .unwrap();
+        assert_eq!(side, (CAPTURE_ACTIVE, 77));
+        assert_eq!(host_queries, [22]);
+    }
+
+    #[test]
+    fn unrelated_side_stream_stays_outside_capture() {
+        let info = resolve_capture_info(Some((11, 77)), 22, |_| {
+            Ok::<_, ()>((CAPTURE_NONE as u64, 0))
+        })
+        .unwrap();
+        assert_eq!(info, (CAPTURE_NONE, 0));
+    }
 
     #[test]
     fn module_image_lengths_cover_ptx_fatbin_and_elf() {
