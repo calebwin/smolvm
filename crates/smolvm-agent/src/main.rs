@@ -3324,6 +3324,10 @@ impl ResolvedLaunch {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
             if resolved.is_empty() {
+                // The host's workload launcher matches on this exact phrase to
+                // downgrade a metadata-less image (e.g. a bare rootfs
+                // directory) to a bare-agent boot instead of failing the
+                // machine start — keep the wording stable.
                 return Err(format!(
                     "no command given and image '{image}' defines no entrypoint or cmd"
                 )

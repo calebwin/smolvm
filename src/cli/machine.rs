@@ -2938,8 +2938,10 @@ pub struct CreateCmd {
 
     /// Command to run as the machine's persistent workload (image machines).
     /// Launched as a detached container on every `start`, so it stays running
-    /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
-    /// boots to a bare agent and the image's CMD is not run.
+    /// (e.g. a pre-warmed browser to be forked). Without this, the image's own
+    /// ENTRYPOINT/CMD is launched instead; if the image defines neither (e.g.
+    /// a bare rootfs directory), the machine boots to just the agent and
+    /// commands come from `exec`/`shell`.
     ///
     /// `last = true` requires the `--` separator. With the machine name now a
     /// flag, a bare positional (an old-style `machine create myvm`) must fail
