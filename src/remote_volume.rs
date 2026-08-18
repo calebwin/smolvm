@@ -160,6 +160,13 @@ impl RemoteVolume {
                 ));
             }
             opts.push_str(&format!(",endpoint=\"{url}\""));
+            // Streaming single-part uploads to a plain-http endpoint fail in
+            // rclone's aws-sdk-v2 backend (a signed payload needs a seekable
+            // body; https avoids it via UNSIGNED-PAYLOAD). Local MinIO-style
+            // endpoints are exactly the http case, so force multipart there.
+            if url.starts_with("http://") {
+                opts.push_str(",upload_cutoff=0");
+            }
         }
         Ok(format!("{opts}:{}", bucket.trim_matches('/')))
     }
@@ -291,6 +298,16 @@ mod tests {
         assert_eq!(
             v.rclone_remote(&env).unwrap(),
             ":s3,provider=AWS,env_auth=true,endpoint=\"https://acc.r2.cloudflarestorage.com\":bucket"
+        );
+        // http endpoints additionally force multipart uploads — streaming
+        // single-part PUTs to plain http fail in rclone's aws-sdk-v2 backend.
+        let http_env = vec![(
+            "AWS_ENDPOINT_URL".to_string(),
+            "http://100.96.0.1:9000".to_string(),
+        )];
+        assert_eq!(
+            v.rclone_remote(&http_env).unwrap(),
+            ":s3,provider=AWS,endpoint=\"http://100.96.0.1:9000\",upload_cutoff=0:bucket"
         );
     }
 
