@@ -9,6 +9,11 @@
 //! periodic `fstrim` makes disk usage shrink symmetrically with the guest's
 //! own usage — the disk counterpart to the host-side idle memory reclaim.
 //!
+//! `fstrim` is self-throttling — it is a ~0ms no-op when nothing has been freed
+//! since the last run (measured: 0ms idle, ~40ms to reclaim 1 GiB, no I/O
+//! contention) — so a short interval costs nothing on an idle machine and keeps
+//! disk footprint within a minute of live usage.
+//!
 //! `fstrim -a` trims every mounted filesystem that supports discard (the ext4
 //! storage disk at `/storage` and the ext4 rootfs overlay) and skips the rest
 //! (virtiofs, overlay, tmpfs) without error, so it needs no mount enumeration.
@@ -21,7 +26,7 @@
 
 use std::time::Duration;
 
-const DEFAULT_TRIM_MINUTES: u64 = 10;
+const DEFAULT_TRIM_MINUTES: u64 = 1;
 
 /// Minutes between trims, or `None` when disabled.
 fn trim_minutes() -> Option<u64> {
