@@ -436,6 +436,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub init_completed: bool,
 
+    /// Remote volumes (object stores / network filesystems) mounted inside
+    /// the guest via rclone on every start. See `crate::remote_volume`.
+    #[serde(default)]
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
+
     /// Environment variables for init commands.
     #[serde(default)]
     pub env: Vec<(String, String)>,
@@ -666,6 +671,7 @@ impl VmRecord {
             last_exit_code: None,
             init: Vec::new(),
             init_completed: false,
+            remote_volumes: Vec::new(),
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
@@ -731,6 +737,7 @@ impl VmRecord {
             last_exit_code: None,
             init: Vec::new(),
             init_completed: false,
+            remote_volumes: Vec::new(),
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,

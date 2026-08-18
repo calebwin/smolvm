@@ -90,6 +90,7 @@ pub mod platform;
 pub mod pool;
 pub mod process;
 pub mod registry;
+pub mod remote_volume;
 pub mod secrets;
 pub mod settings;
 pub mod smolfile;

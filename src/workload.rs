@@ -61,6 +61,16 @@ pub fn launch_image_workload(
     };
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
+    // Remote volumes mount inside the workload container (the one namespace
+    // exec/shell sessions join), so the workload command is wrapped with the
+    // mount script; see `crate::remote_volume::wrap_workload_command`.
+    if !record.remote_volumes.is_empty() {
+        command = crate::remote_volume::wrap_workload_command(
+            &record.remote_volumes,
+            &exec_env,
+            command,
+        )?;
+    }
     match client.run_container_detached(
         RunConfig::new(image, command)
             .with_env(exec_env)

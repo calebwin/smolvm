@@ -586,11 +586,27 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     validate_vm_name(&params.name, "machine name")
         .map_err(|reason| smolvm::Error::config("create machine", reason))?;
 
+    // Peel off remote volume specs (s3:// and raw rclone remotes) before the
+    // host-directory parse; they mount inside the guest at start instead of
+    // through virtiofs.
+    let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
+
     // Parse and validate volume mounts
-    let mounts = HostMount::parse(&params.volume)?
+    let mounts: Vec<(String, String, bool)> = HostMount::parse(&host_volume_specs)?
         .into_iter()
         .map(|m| m.to_storage_tuple())
         .collect();
+    for volume in &remote_volumes {
+        if mounts.iter().any(|(_, target, _)| target == &volume.target) {
+            return Err(smolvm::Error::config(
+                "create machine",
+                format!(
+                    "duplicate mount target: {} is specified more than once",
+                    volume.target
+                ),
+            ));
+        }
+    }
 
     // Convert port mappings to tuple format for storage
     let ports = PortMapping::to_tuples(&params.port);
@@ -653,6 +669,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         restart,
     );
     record.init = params.init.clone();
+    record.remote_volumes = remote_volumes;
     record.env = env;
     record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
@@ -691,6 +708,24 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     // A registry image with no network can never be pulled (the guest runs the
     // pull), so refuse here rather than deferring to a `start` that must fail.
     record.validate_image_fetchable()?;
+
+    // Remote volumes mount via rclone inside the workload image; an imageless
+    // machine has nowhere to run it, and they also need network to reach the
+    // remote. Refuse at create instead of failing every start.
+    if !record.remote_volumes.is_empty() {
+        if record.image.is_none() {
+            return Err(smolvm::Error::config(
+                "create machine",
+                "remote volumes (s3:// or rclone remotes) require an image machine                  whose image provides `rclone` and `fusermount3`",
+            ));
+        }
+        if !params.net && params.allowed_cidrs.is_none() && params.dns_filter_hosts.is_none() {
+            return Err(smolvm::Error::config(
+                "create machine",
+                "remote volumes need network access: add --net (or an egress policy)",
+            ));
+        }
+    }
 
     Ok(record)
 }
