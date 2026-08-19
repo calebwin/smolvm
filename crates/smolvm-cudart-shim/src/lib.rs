@@ -2118,19 +2118,36 @@ pub extern "C" fn cudaSetDeviceFlags(_flags: c_uint) -> c_int {
     CUDA_SUCCESS
 }
 
-/// Whole-graph exec update: report "update failed" — ggml (and torch) fall
-/// back to destroying and re-instantiating the graph, which we forward.
+/// Whole-graph exec update. The host driver checks topology compatibility and
+/// patches the executable graph in place; error-node handles remain host-local,
+/// so only the portable result enum is returned to the guest.
 #[no_mangle]
 pub extern "C" fn cudaGraphExecUpdate(
-    _exec: *mut c_void,
-    _graph: *mut c_void,
+    exec: *mut c_void,
+    graph: *mut c_void,
     result_info: *mut c_void,
 ) -> c_int {
-    if !result_info.is_null() {
-        // cudaGraphExecUpdateResultInfo { result, errorNode, errorFromNode }
-        unsafe { std::ptr::write_bytes(result_info as *mut u8, 0, 24) };
+    if result_info.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    910 // cudaErrorGraphExecUpdateFailure
+    set_last(
+        match with_client_retrying(|c| c.graph_exec_update(exec as u64, graph as u64)) {
+            Ok(result) => {
+                // cudaGraphExecUpdateResultInfo { i32 result; pad; ptr; ptr }.
+                // Raw host graph-node pointers cannot cross the transport.
+                unsafe {
+                    std::ptr::write_bytes(result_info as *mut u8, 0, 24);
+                    (result_info as *mut c_int).write(result);
+                }
+                if result == 0 {
+                    CUDA_SUCCESS
+                } else {
+                    910 // cudaErrorGraphExecUpdateFailure
+                }
+            }
+            Err(error) => error,
+        },
+    )
 }
 
 /// Cooperative launches need grid-wide sync the transport can't fake; the

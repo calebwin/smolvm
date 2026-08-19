@@ -209,6 +209,11 @@ pub struct GpuBackend {
     graph_instantiate_with_flags:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> CuResultCode,
     graph_launch: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResultCode,
+    graph_exec_update: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut GraphExecUpdateResultInfo,
+    ) -> CuResultCode,
     graph_exec_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_get_nodes:
@@ -605,6 +610,10 @@ impl GpuBackend {
                 )?,
                 graph_instantiate_with_flags: sym(&lib, b"cuGraphInstantiateWithFlags\0")?,
                 graph_launch: sym(&lib, b"cuGraphLaunch\0")?,
+                // The unversioned symbol retains the legacy four-argument ABI
+                // on older drivers; the public CUDA 12+ header maps the modern
+                // result-info API to this explicit v2 symbol.
+                graph_exec_update: sym(&lib, b"cuGraphExecUpdate_v2\0")?,
                 graph_exec_destroy: sym(&lib, b"cuGraphExecDestroy\0")?,
                 graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
                 graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
@@ -1931,6 +1940,23 @@ impl Backend for GpuBackend {
                 graph_exec as *mut c_void,
                 stream as *mut c_void,
             ))
+        }
+    }
+    fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> CuResult<i32> {
+        let mut info = GraphExecUpdateResultInfo {
+            result: 0,
+            error_node: std::ptr::null_mut(),
+            error_from_node: std::ptr::null_mut(),
+        };
+        let status = unsafe {
+            (self.graph_exec_update)(graph_exec as *mut c_void, graph as *mut c_void, &mut info)
+        };
+        // CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE (910) is a compatibility result,
+        // not a transport failure; the specific reason is carried in `result`.
+        if status == 0 || status == 910 {
+            Ok(info.result)
+        } else {
+            Err(status)
         }
     }
     fn graph_exec_patch(
@@ -3610,6 +3636,13 @@ pub struct KernelNodeParams {
     extra: *mut *mut c_void,
     kern: *mut c_void, // v2: CUkernel
     ctx: *mut c_void,  // v2: CUcontext
+}
+
+#[repr(C)]
+struct GraphExecUpdateResultInfo {
+    result: c_int,
+    error_node: *mut c_void,
+    error_from_node: *mut c_void,
 }
 
 /// `CUDA_MEMSET_NODE_PARAMS` — a graph memset node's target + fill.

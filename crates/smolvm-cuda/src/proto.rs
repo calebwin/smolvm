@@ -116,6 +116,7 @@ pub enum Op {
     MemcpyDtoDAsync = 0xC8,
     GraphGetNodes = 0xC9,
     ThreadExchangeCaptureMode = 0xCA,
+    GraphExecUpdate = 0xCB,
     // nvcomp (forward-to-host-lib): batched Deflate decompression. Device-pointer
     // args are real host device addresses, forwarded by value.
     NvcompDeflateTempSize = 0x80,
@@ -228,6 +229,7 @@ impl Op {
             0xC8 => Op::MemcpyDtoDAsync,
             0xC9 => Op::GraphGetNodes,
             0xCA => Op::ThreadExchangeCaptureMode,
+            0xCB => Op::GraphExecUpdate,
             0x60 => Op::StreamCreate,
             0x61 => Op::StreamDestroy,
             0x62 => Op::StreamSynchronize,
@@ -476,6 +478,10 @@ pub enum Request {
     GraphLaunch {
         graph_exec: u64,
         stream: u64,
+    },
+    GraphExecUpdate {
+        graph_exec: u64,
+        graph: u64,
     },
     GraphExecDestroy {
         graph_exec: u64,
@@ -1143,6 +1149,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *graph_exec);
             w_u64(&mut b, *stream);
         }
+        Request::GraphExecUpdate { graph_exec, graph } => {
+            w_u8(&mut b, Op::GraphExecUpdate as u8);
+            w_u64(&mut b, *graph_exec);
+            w_u64(&mut b, *graph);
+        }
         Request::GraphExecDestroy { graph_exec } => {
             w_u8(&mut b, Op::GraphExecDestroy as u8);
             w_u64(&mut b, *graph_exec);
@@ -1656,6 +1667,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             graph_exec: c.u64()?,
             stream: c.u64()?,
         },
+        Op::GraphExecUpdate => Request::GraphExecUpdate {
+            graph_exec: c.u64()?,
+            graph: c.u64()?,
+        },
         Op::GraphExecDestroy => Request::GraphExecDestroy {
             graph_exec: c.u64()?,
         },
@@ -1928,7 +1943,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         // nvcomp calls carry their own nvcompStatus in the body (transport
         // status stays 0): TempSize -> (status, temp_bytes); Decompress -> status.
         Op::NvcompDeflateTempSize => Response::Pair(c.u64()?, c.u64()?),
-        Op::NvcompDeflateDecompress => Response::Count(c.i32()?),
+        Op::NvcompDeflateDecompress | Op::GraphExecUpdate => Response::Count(c.i32()?),
         Op::CublasCreate => Response::Handle(c.u64()?),
         Op::LibCall => Response::LibResult(c.i32()?, c.bytes()?),
         Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
@@ -2181,6 +2196,10 @@ mod tests {
         });
         roundtrip(Request::EventQuery { event: 4 });
         roundtrip(Request::ThreadExchangeCaptureMode { mode: 2 });
+        roundtrip(Request::GraphExecUpdate {
+            graph_exec: 0x8000_0000_0000_0011,
+            graph: 0x8000_0000_0000_0022,
+        });
         roundtrip(Request::PublishTensorBundle {
             manifest: br#"{"name":"adapter"}"#.to_vec(),
             tensors: vec![(0x1000, 64), (0x2200, 128)],
@@ -2216,6 +2235,7 @@ mod tests {
                 ),
             ),
             (Op::EventElapsedTime, Response::Millis(1.25)),
+            (Op::GraphExecUpdate, Response::Count(0)),
             (
                 Op::PublishTensorBundle,
                 Response::Data(b"one-use-token".to_vec()),

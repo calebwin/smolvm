@@ -47,6 +47,7 @@ const CUDA_ERROR_NOT_INITIALIZED: c_int = 3;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
 const CUDA_ERROR_INVALID_IMAGE: c_int = 200;
 const CUDA_ERROR_INVALID_CONTEXT: c_int = 201;
+const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
 const CUDA_ERROR_NOT_FOUND: c_int = 500;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
@@ -225,6 +226,9 @@ struct ShimState {
     primary_ctx: HashMap<i32, u64>,
     /// Process-global "current context" stack (bottom = cuCtxSetCurrent slot).
     ctx_stack: Vec<u64>,
+    /// Captured graph handle -> exact node count returned by EndCapture.
+    /// Driver clients use count-only GraphGetNodes to detect empty captures.
+    graph_node_counts: HashMap<u64, usize>,
     /// Fork-reconnect bookkeeping for a standalone (non-bridged) connection:
     /// pid that opened it, its socket fd (liveness peek), and the host-assigned
     /// lineage token to resume. Bridged connections leave these inert (fd -1).
@@ -293,6 +297,7 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
         param_sizes: HashMap::new(),
         primary_ctx: HashMap::new(),
         ctx_stack: Vec::new(),
+        graph_node_counts: HashMap::new(),
         conn_pid: std::process::id() as i32,
         conn_fd: fd,
         conn_token: token,
@@ -3099,6 +3104,240 @@ pub extern "C" fn cuThreadExchangeStreamCaptureMode(mode: *mut c_int) -> c_int {
     }
 }
 
+/// Guest-owned graph handles are tagged so the host can distinguish them from
+/// raw CUDA handles when mapping captures and executable graphs.
+fn alloc_graph_vhandle() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Runtime and Driver shims can share one bridged Client/session. Reserve a
+    // disjoint tagged range so their independent allocators cannot overwrite
+    // one another's graph mappings.
+    static NEXT: AtomicU64 = AtomicU64::new((1 << 63) | (1 << 62) | 1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn stream_begin_capture(stream: *mut c_void, mode: c_int) -> c_int {
+    ret(with_state(|s| {
+        s.client.stream_begin_capture(stream as u64, mode)
+    }))
+}
+
+/// Pre-CUDA-10 capture entry point: the original ABI had no mode argument and
+/// used global capture semantics.
+#[no_mangle]
+pub extern "C" fn cuStreamBeginCapture(stream: *mut c_void) -> c_int {
+    stream_begin_capture(stream, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamBeginCapture_ptsz(stream: *mut c_void) -> c_int {
+    cuStreamBeginCapture(stream)
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamBeginCapture_v2(stream: *mut c_void, mode: c_int) -> c_int {
+    stream_begin_capture(stream, mode)
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamBeginCapture_v2_ptsz(stream: *mut c_void, mode: c_int) -> c_int {
+    cuStreamBeginCapture_v2(stream, mode)
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> c_int {
+    if graph.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { graph.write(std::ptr::null_mut()) };
+    match with_state(|s| {
+        let virtual_graph = alloc_graph_vhandle();
+        let node_count = s.client.stream_end_capture(stream as u64, virtual_graph)?;
+        s.graph_node_counts
+            .insert(virtual_graph, node_count as usize);
+        Ok(virtual_graph)
+    }) {
+        Ok(virtual_graph) => ret(unsafe { out(graph, virtual_graph as *mut c_void) }),
+        Err(status) => status,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamEndCapture_ptsz(stream: *mut c_void, graph: *mut *mut c_void) -> c_int {
+    cuStreamEndCapture(stream, graph)
+}
+
+fn graph_instantiate(graph_exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> c_int {
+    if graph_exec.is_null() || flags != 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|s| {
+        let virtual_exec = alloc_graph_vhandle();
+        s.client.graph_instantiate(graph as u64, virtual_exec)?;
+        Ok(virtual_exec)
+    }) {
+        Ok(virtual_exec) => ret(unsafe { out(graph_exec, virtual_exec as *mut c_void) }),
+        Err(status) => status,
+    }
+}
+
+/// CUDA 12.0+ aliases cuGraphInstantiate to the flags ABI.
+#[no_mangle]
+pub extern "C" fn cuGraphInstantiateWithFlags(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    flags: u64,
+) -> c_int {
+    graph_instantiate(graph_exec, graph, flags)
+}
+
+/// Legacy graph-instantiation ABI retained for older Driver API consumers.
+#[no_mangle]
+pub extern "C" fn cuGraphInstantiate(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    error_node: *mut *mut c_void,
+    log_buffer: *mut c_char,
+    buffer_size: usize,
+) -> c_int {
+    if !error_node.is_null() {
+        unsafe { error_node.write(std::ptr::null_mut()) };
+    }
+    if !log_buffer.is_null() && buffer_size != 0 {
+        unsafe { log_buffer.write(0) };
+    }
+    graph_instantiate(graph_exec, graph, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphInstantiate_v2(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    error_node: *mut *mut c_void,
+    log_buffer: *mut c_char,
+    buffer_size: usize,
+) -> c_int {
+    cuGraphInstantiate(graph_exec, graph, error_node, log_buffer, buffer_size)
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) -> c_int {
+    ret(with_state(|s| {
+        s.client.graph_launch(graph_exec as u64, stream as u64)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphLaunch_ptsz(graph_exec: *mut c_void, stream: *mut c_void) -> c_int {
+    cuGraphLaunch(graph_exec, stream)
+}
+
+#[repr(C)]
+pub struct CUgraphExecUpdateResultInfo {
+    result: c_int,
+    error_node: *mut c_void,
+    error_from_node: *mut c_void,
+}
+
+fn graph_exec_update(
+    exec: *mut c_void,
+    graph: *mut c_void,
+    result_info: *mut CUgraphExecUpdateResultInfo,
+) -> c_int {
+    if result_info.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|s| s.client.graph_exec_update(exec as u64, graph as u64)) {
+        Ok(result) => {
+            unsafe {
+                result_info.write(CUgraphExecUpdateResultInfo {
+                    result,
+                    // Graph nodes are host pointers and cannot cross the RPC
+                    // boundary. The portable result enum remains truthful.
+                    error_node: std::ptr::null_mut(),
+                    error_from_node: std::ptr::null_mut(),
+                });
+            }
+            if result == 0 {
+                CUDA_SUCCESS
+            } else {
+                910 // CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE
+            }
+        }
+        Err(status) => status,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphExecUpdate(
+    exec: *mut c_void,
+    graph: *mut c_void,
+    error_node: *mut *mut c_void,
+    update_result: *mut c_int,
+) -> c_int {
+    if update_result.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let mut result_info = CUgraphExecUpdateResultInfo {
+        result: 0,
+        error_node: std::ptr::null_mut(),
+        error_from_node: std::ptr::null_mut(),
+    };
+    let status = graph_exec_update(exec, graph, &mut result_info);
+    unsafe {
+        update_result.write(result_info.result);
+        if !error_node.is_null() {
+            error_node.write(std::ptr::null_mut());
+        }
+    }
+    status
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphExecUpdate_v2(
+    exec: *mut c_void,
+    graph: *mut c_void,
+    result_info: *mut CUgraphExecUpdateResultInfo,
+) -> c_int {
+    graph_exec_update(exec, graph, result_info)
+}
+
+/// Count-only graph introspection. Node handles are raw host pointers and are
+/// deliberately not exposed through the guest ABI.
+#[no_mangle]
+pub extern "C" fn cuGraphGetNodes(
+    graph: *mut c_void,
+    nodes: *mut *mut c_void,
+    num_nodes: *mut usize,
+) -> c_int {
+    if num_nodes.is_null() || !nodes.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|s| {
+        s.graph_node_counts
+            .get(&(graph as u64))
+            .copied()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_RESOURCE_HANDLE))
+    }) {
+        Ok(count) => ret(unsafe { out(num_nodes, count) }),
+        Err(status) => status,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphExecDestroy(graph_exec: *mut c_void) -> c_int {
+    ret(with_state(|s| {
+        s.client.graph_exec_destroy(graph_exec as u64)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuGraphDestroy(graph: *mut c_void) -> c_int {
+    ret(with_state(|s| {
+        s.graph_node_counts.remove(&(graph as u64));
+        s.client.graph_destroy(graph as u64)
+    }))
+}
+
 #[no_mangle]
 pub extern "C" fn cuStreamCreate(stream: *mut *mut c_void, flags: c_uint) -> c_int {
     match with_state(|s| s.client.stream_create(flags)) {
@@ -3314,12 +3553,22 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuLaunchKernelEx" => cuLaunchKernelEx,
         "cuTensorMapEncodeTiled" => cuTensorMapEncodeTiled,
         "cuThreadExchangeStreamCaptureMode" => cuThreadExchangeStreamCaptureMode,
+        "cuStreamBeginCapture" => cuStreamBeginCapture_v2,
+        "cuStreamEndCapture" => cuStreamEndCapture,
+        "cuStreamIsCapturing" => cuStreamIsCapturing,
         "cuStreamCreate" => cuStreamCreate,
         "cuStreamCreateWithPriority" => cuStreamCreateWithPriority,
         "cuStreamDestroy" => cuStreamDestroy_v2,
         "cuStreamSynchronize" => cuStreamSynchronize,
         "cuStreamQuery" => cuStreamQuery,
         "cuStreamWaitEvent" => cuStreamWaitEvent,
+        "cuGraphInstantiate" => cuGraphInstantiateWithFlags,
+        "cuGraphInstantiateWithFlags" => cuGraphInstantiateWithFlags,
+        "cuGraphLaunch" => cuGraphLaunch,
+        "cuGraphExecUpdate" => cuGraphExecUpdate_v2,
+        "cuGraphGetNodes" => cuGraphGetNodes,
+        "cuGraphExecDestroy" => cuGraphExecDestroy,
+        "cuGraphDestroy" => cuGraphDestroy,
         "cuEventCreate" => cuEventCreate,
         "cuEventDestroy" => cuEventDestroy_v2,
         "cuEventRecord" => cuEventRecord,
@@ -3352,6 +3601,27 @@ fn resolve_proc(name: &str, cuda_version: c_int) -> Option<*mut c_void> {
             cuGetProcAddress_v2 as *mut c_void
         } else {
             cuGetProcAddress as *mut c_void
+        });
+    }
+    if base == "cuStreamBeginCapture" {
+        return Some(if name.ends_with("_v2") || cuda_version >= 10000 {
+            cuStreamBeginCapture_v2 as *mut c_void
+        } else {
+            cuStreamBeginCapture as *mut c_void
+        });
+    }
+    if base == "cuGraphExecUpdate" {
+        return Some(if name.ends_with("_v2") || cuda_version >= 12000 {
+            cuGraphExecUpdate_v2 as *mut c_void
+        } else {
+            cuGraphExecUpdate as *mut c_void
+        });
+    }
+    if base == "cuGraphInstantiate" {
+        return Some(if name.ends_with("_v2") || cuda_version < 12000 {
+            cuGraphInstantiate_v2 as *mut c_void
+        } else {
+            cuGraphInstantiateWithFlags as *mut c_void
         });
     }
     let resolved = proc_table(base);
@@ -3698,6 +3968,34 @@ mod cuda_13_proc_tests {
         assert_eq!(
             proc_table("cuKernelSetAttribute"),
             Some(cuKernelSetAttribute as *mut c_void)
+        );
+    }
+
+    #[test]
+    fn resolves_versioned_graph_abis_without_signature_mismatch() {
+        assert_eq!(
+            resolve_proc("cuStreamBeginCapture", 9020),
+            Some(cuStreamBeginCapture as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuStreamBeginCapture", 12040),
+            Some(cuStreamBeginCapture_v2 as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuGraphExecUpdate", 11080),
+            Some(cuGraphExecUpdate as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuGraphExecUpdate", 12040),
+            Some(cuGraphExecUpdate_v2 as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuGraphInstantiate", 11080),
+            Some(cuGraphInstantiate_v2 as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuGraphInstantiate", 12040),
+            Some(cuGraphInstantiateWithFlags as *mut c_void)
         );
     }
 }

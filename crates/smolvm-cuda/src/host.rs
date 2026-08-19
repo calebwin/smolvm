@@ -212,6 +212,10 @@ pub trait Backend: Send {
     fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64>;
     /// Replay an instantiated graph on `stream`.
     fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()>;
+    /// Update an instantiated graph from a topology-compatible graph. Returns
+    /// `CUgraphExecUpdateResult`; update incompatibility is reported through
+    /// that value while transport/driver failures remain `Err`.
+    fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> CuResult<i32>;
     /// Rewrite `exec`'s node params so device pointers baked in at capture are
     /// translated through `trans` to a fork clone's private copies (Path 2).
     /// Default: no-op (a backend without graph support has nothing to patch).
@@ -3165,8 +3169,22 @@ fn serve_rings<S: Read + Write>(
         exec: u128,
         resp: u128,
         ops: u64,
+        op_counts: [u64; 256],
+        op_exec_us: [u128; 256],
     }
     impl Prof {
+        fn note(&mut self, op: u8) {
+            if self.on {
+                self.op_counts[op as usize] += 1;
+            }
+        }
+
+        fn note_exec(&mut self, op: u8, elapsed_us: u128) {
+            if self.on {
+                self.op_exec_us[op as usize] += elapsed_us;
+            }
+        }
+
         fn dump_maybe(&mut self) {
             if self.on && self.ops.is_multiple_of(8192) && self.ops > 0 {
                 eprintln!(
@@ -3177,6 +3195,46 @@ fn serve_rings<S: Read + Write>(
                     self.exec / 1000,
                     self.resp / 1000
                 );
+                let mut top: Vec<(u8, u64)> = self
+                    .op_counts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(op, &count)| (count > 0).then_some((op as u8, count)))
+                    .collect();
+                top.sort_unstable_by_key(|&(_, count)| std::cmp::Reverse(count));
+                let summary = top
+                    .into_iter()
+                    .take(12)
+                    .map(|(op, count)| match crate::proto::Op::from_u8(op) {
+                        Some(name) => format!("{name:?}={count}"),
+                        None => format!("0x{op:02x}={count}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("[serve-prof-ops] {summary}");
+                let mut by_time: Vec<(u8, u128)> = self
+                    .op_exec_us
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(op, &elapsed)| (elapsed > 0).then_some((op as u8, elapsed)))
+                    .collect();
+                by_time.sort_unstable_by_key(|&(_, elapsed)| std::cmp::Reverse(elapsed));
+                let summary = by_time
+                    .into_iter()
+                    .take(12)
+                    .map(|(op, elapsed)| {
+                        let count = self.op_counts[op as usize].max(1);
+                        let name = crate::proto::Op::from_u8(op)
+                            .map_or_else(|| format!("0x{op:02x}"), |name| format!("{name:?}"));
+                        format!(
+                            "{name}={}ms/{:.1}us",
+                            elapsed / 1000,
+                            elapsed as f64 / count as f64
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("[serve-prof-exec] {summary}");
             }
         }
     }
@@ -3187,6 +3245,8 @@ fn serve_rings<S: Read + Write>(
         exec: 0,
         resp: 0,
         ops: 0,
+        op_counts: [0; 256],
+        op_exec_us: [0; 256],
     };
     // Reassembly buffer for oversized frames arriving as bounce chunks.
     let mut pending: Vec<u8> = Vec::new();
@@ -3340,11 +3400,14 @@ fn serve_rings<S: Read + Write>(
                 }
                 if prof.on {
                     prof.decode += t_dec.elapsed().as_micros();
+                    prof.note(frame[1]);
                 }
                 let t_exec = std::time::Instant::now();
                 let (status, _) = dispatch_quiet(sess, backend, req, &mut quiet_sticky);
                 if prof.on {
-                    prof.exec += t_exec.elapsed().as_micros();
+                    let elapsed = t_exec.elapsed().as_micros();
+                    prof.exec += elapsed;
+                    prof.note_exec(frame[1], elapsed);
                     prof.ops += 1;
                     prof.dump_maybe();
                 }
@@ -3379,11 +3442,14 @@ fn serve_rings<S: Read + Write>(
                 }
                 if prof.on {
                     prof.decode += t_dec.elapsed().as_micros();
+                    prof.note(frame[0]);
                 }
                 let t_exec = std::time::Instant::now();
                 let (status, resp) = dispatch(sess, backend, req);
                 if prof.on {
-                    prof.exec += t_exec.elapsed().as_micros();
+                    let elapsed = t_exec.elapsed().as_micros();
+                    prof.exec += elapsed;
+                    prof.note_exec(frame[0], elapsed);
                 }
                 if status != 0 && oplog {
                     eprintln!("[op!] status={status}");
@@ -4857,6 +4923,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = raw_stream(sess, stream)?;
             b.graph_launch(launch, raw).map(|_| Response::Ok)
         }
+        Request::GraphExecUpdate { graph_exec, graph } => {
+            let real_exec = raw_graph(sess, graph_exec);
+            let real_graph = raw_graph(sess, graph);
+            if real_exec == 0 || real_graph == 0 {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            }
+            b.graph_exec_update(real_exec, real_graph)
+                .map(Response::Count)
+        }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
             sess.graph_vhandles.lock().unwrap().remove(&graph_exec);
@@ -5756,6 +5831,9 @@ impl Backend for CpuBackend {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     fn graph_launch(&mut self, _graph_exec: u64, _stream: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_exec_update(&mut self, _graph_exec: u64, _graph: u64) -> CuResult<i32> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     fn graph_exec_destroy(&mut self, _graph_exec: u64) -> CuResult<()> {

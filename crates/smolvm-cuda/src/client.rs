@@ -1278,6 +1278,19 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
+    /// Patch an instantiated graph from a topology-compatible captured graph.
+    /// The returned value is `cudaGraphExecUpdateResult`; transport/driver
+    /// failures remain ordinary RPC errors.
+    pub fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> Result<i32> {
+        match self.call(
+            &Request::GraphExecUpdate { graph_exec, graph },
+            Op::GraphExecUpdate,
+        )? {
+            Response::Count(result) => Ok(result),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
     /// Node count of a captured graph (count-only query; PyTorch uses it to
     /// warn about empty captures).
     pub fn graph_get_node_count(&mut self, graph: u64) -> Result<u64> {
