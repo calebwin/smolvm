@@ -240,13 +240,21 @@ fn shared_store_is_not_lru_evicted_by_a_later_pack() {
         "first shared entry must SURVIVE a later extraction (not be LRU-evicted)"
     );
     assert!(db.is_dir(), "second shared entry must exist");
-    // Both entries keep their extracted layer dirs (not just an empty shell).
+    // Both entries keep their layer payloads (not just an empty shell). A
+    // privileged Linux host extracts directories here; an unprivileged host
+    // intentionally retains the tar for faithful in-guest ownership restore.
     for d in [&da, &db] {
-        let n = fs::read_dir(d.join("layers"))
+        let entries: Vec<_> = fs::read_dir(d.join("layers"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .count();
-        assert!(n > 0, "{} must keep its layer dirs", d.display());
+            .collect();
+        let has_payload = entries.iter().any(|entry| {
+            entry.path().is_dir()
+                || entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "tar")
+        });
+        assert!(has_payload, "{} must keep its layer payloads", d.display());
     }
 }
