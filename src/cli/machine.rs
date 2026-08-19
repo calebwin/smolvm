@@ -1981,6 +1981,14 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cp_mode_parses_common_octal_forms_and_rejects_garbage() {
+        assert_eq!(super::parse_octal_mode("644").unwrap(), 0o644);
+        assert_eq!(super::parse_octal_mode("0755").unwrap(), 0o755);
+        assert_eq!(super::parse_octal_mode("0o600").unwrap(), 0o600);
+        assert!(super::parse_octal_mode("8x").is_err());
+        assert!(super::parse_octal_mode("77777").is_err());
+    }
 
     use super::*;
     use clap::Parser;
@@ -4690,6 +4698,32 @@ pub struct CpCmd {
     /// Destination path (local file or machine:path)
     #[arg(value_name = "DST")]
     pub dst: String,
+
+    /// Set the file's mode on upload (octal, e.g. 644)
+    #[arg(long, value_name = "OCTAL")]
+    pub mode: Option<String>,
+
+    /// Set the file's owner uid on upload (default: root)
+    #[arg(long, value_name = "UID")]
+    pub uid: Option<u32>,
+
+    /// Set the file's owner gid on upload (default: root)
+    #[arg(long, value_name = "GID")]
+    pub gid: Option<u32>,
+}
+
+/// Parse a chmod-style octal mode ("644", "0755", "0o600").
+fn parse_octal_mode(s: &str) -> smolvm::Result<u32> {
+    let digits = s.trim_start_matches("0o");
+    u32::from_str_radix(digits, 8)
+        .ok()
+        .filter(|m| *m <= 0o7777)
+        .ok_or_else(|| {
+            smolvm::Error::config(
+                "cp",
+                format!("invalid octal mode '{s}' (expected e.g. 644)"),
+            )
+        })
 }
 
 impl CpCmd {
@@ -4708,6 +4742,13 @@ impl CpCmd {
                     "one of SRC or DST must use machine:path syntax (e.g., myvm:/workspace/file)",
                 ));
             };
+
+        if !is_upload && (self.mode.is_some() || self.uid.is_some() || self.gid.is_some()) {
+            return Err(smolvm::Error::config(
+                "cp",
+                "--mode/--uid/--gid apply to uploads only (host -> machine)",
+            ));
+        }
 
         let (manager, mut client) =
             vm_common::ensure_running_and_connect(&Some(machine_name.clone()))?;
@@ -4730,6 +4771,11 @@ impl CpCmd {
         }
 
         if is_upload {
+            let meta = smolvm::agent::FileWriteMeta {
+                mode: self.mode.as_deref().map(parse_octal_mode).transpose()?,
+                uid: self.uid,
+                gid: self.gid,
+            };
             // Stream from file — only one chunk (~1 MiB) in memory at a time.
             let file = std::fs::File::open(&local_path).map_err(|e| {
                 smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
@@ -4741,7 +4787,7 @@ impl CpCmd {
                 format!("Uploading {} -> {}", local_path, guest_path),
                 Some(size),
             );
-            client.write_file_from_reader_with_progress(&guest_path, file, size, None, |sent| {
+            client.write_file_from_reader_with_progress(&guest_path, file, size, meta, |sent| {
                 bar.update(sent)
             })?;
             bar.finish(size);

@@ -54,18 +54,19 @@ pub fn helper_requested() -> bool {
     std::env::args().nth(1).as_deref() == Some(HELPER_ARG)
 }
 
-/// Entry point for `smolvm-agent ns-file <op> <pid> <path> [mode]`.
+/// Entry point for `smolvm-agent ns-file <op> <pid> <path> [mode [uid gid]]`.
 ///
 /// Protocol, chosen so the parent never buffers a whole file:
 /// * `read`  — stdout gets `OK <size>\n` then exactly `<size>` raw bytes, or
 ///   `ERR <message>\n`.
 /// * `write` — raw bytes arrive on stdin until EOF; stdout gets `OK\n` or
-///   `ERR <message>\n`.
+///   `ERR <message>\n`. mode/uid/gid are positional with `-` meaning
+///   "not requested".
 pub fn run_helper() -> i32 {
     let args: Vec<String> = std::env::args().collect();
-    // argv: [bin, "ns-file", op, pid, path, (mode)]
+    // argv: [bin, "ns-file", op, pid, path, (mode), (uid), (gid)]
     if args.len() < 5 {
-        eprintln!("ns-file: usage: ns-file <read|write> <pid> <path> [mode]");
+        eprintln!("ns-file: usage: ns-file <read|write> <pid> <path> [mode [uid gid]]");
         return 2;
     }
     let op = args[2].as_str();
@@ -74,7 +75,10 @@ pub fn run_helper() -> i32 {
         return 2;
     };
     let path = args[4].clone();
-    let mode = args.get(5).and_then(|m| u32::from_str_radix(m, 8).ok());
+    let opt = |i: usize| args.get(i).filter(|v| v.as_str() != "-");
+    let mode = opt(5).and_then(|m| u32::from_str_radix(m, 8).ok());
+    let uid = opt(6).and_then(|u| u.parse::<u32>().ok());
+    let gid = opt(7).and_then(|g| g.parse::<u32>().ok());
 
     if let Err(e) = enter_mount_namespace(pid) {
         // Report through the protocol so the parent surfaces one clean error.
@@ -84,7 +88,7 @@ pub fn run_helper() -> i32 {
 
     let result = match op {
         "read" => helper_read(&path),
-        "write" => helper_write(&path, mode),
+        "write" => helper_write(&path, mode, uid, gid),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -150,7 +154,12 @@ fn helper_read(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn helper_write(path: &str, mode: Option<u32>) -> Result<(), String> {
+fn helper_write(
+    path: &str,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), String> {
     let target = Path::new(path);
     let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(dir) = parent {
@@ -183,6 +192,12 @@ fn helper_write(path: &str, mode: Option<u32>) -> Result<(), String> {
         if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m)) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("chmod {path}: {e}"));
+        }
+    }
+    if uid.is_some() || gid.is_some() {
+        if let Err(e) = std::os::unix::fs::chown(&tmp, uid, gid) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("chown {path}: {e}"));
         }
     }
     if let Err(e) = std::fs::rename(&tmp, target) {
@@ -290,21 +305,54 @@ pub fn write_to_container(
     path: &str,
     data: &[u8],
     mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
 ) -> Option<Result<(), String>> {
     let pid = workload_container_pid()?;
-    Some(write_via_helper(pid, path, data, mode))
+    Some(write_via_helper(
+        pid,
+        path,
+        &mut std::io::Cursor::new(data),
+        mode,
+        uid,
+        gid,
+    ))
 }
 
-fn write_via_helper(pid: u32, path: &str, data: &[u8], mode: Option<u32>) -> Result<(), String> {
-    let mut args = vec![
+/// Stream an already-staged file into the workload container's namespace.
+/// Used by the streaming upload's finalize so large files land where the
+/// workload reads, exactly like the single-shot path. `None` = no running
+/// workload; the caller keeps its agent-namespace placement.
+pub fn write_reader_to_container<R: std::io::Read>(
+    path: &str,
+    reader: &mut R,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Option<Result<(), String>> {
+    let pid = workload_container_pid()?;
+    Some(write_via_helper(pid, path, reader, mode, uid, gid))
+}
+
+fn write_via_helper<R: std::io::Read>(
+    pid: u32,
+    path: &str,
+    data: &mut R,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), String> {
+    // Fixed positional args; "-" is the explicit "not requested" placeholder
+    // so uid/gid can follow an absent mode unambiguously.
+    let args = vec![
         HELPER_ARG.to_string(),
         "write".to_string(),
         pid.to_string(),
         path.to_string(),
+        mode.map_or_else(|| "-".to_string(), |m| format!("{m:o}")),
+        uid.map_or_else(|| "-".to_string(), |u| u.to_string()),
+        gid.map_or_else(|| "-".to_string(), |g| g.to_string()),
     ];
-    if let Some(m) = mode {
-        args.push(format!("{m:o}"));
-    }
     let mut child = Command::new(AGENT_BINARY)
         .args(&args)
         .stdin(Stdio::piped())
@@ -314,9 +362,7 @@ fn write_via_helper(pid: u32, path: &str, data: &[u8], mode: Option<u32>) -> Res
         .map_err(|e| format!("spawn ns-file helper: {e}"))?;
     {
         let mut stdin = child.stdin.take().expect("piped");
-        stdin
-            .write_all(data)
-            .map_err(|e| format!("ns-file helper write: {e}"))?;
+        std::io::copy(data, &mut stdin).map_err(|e| format!("ns-file helper write: {e}"))?;
     } // drop closes stdin → helper sees EOF
     let out = child
         .wait_with_output()

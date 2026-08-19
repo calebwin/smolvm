@@ -2094,6 +2094,8 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         if let AgentRequest::FileWriteBegin {
             path,
             mode,
+            uid,
+            gid,
             total_size,
         } = request
         {
@@ -2101,7 +2103,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             // starting a new one. `take()` makes the drop explicit and keeps the
             // value from looking like a dead store.
             let _ = write_session.take();
-            let (new_session, response) = handle_file_write_begin(path, mode, total_size);
+            let (new_session, response) = handle_file_write_begin(path, mode, uid, gid, total_size);
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
@@ -2380,7 +2382,13 @@ fn handle_request(
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
 
-        AgentRequest::FileWrite { path, data, mode } => handle_file_write(&path, &data, mode),
+        AgentRequest::FileWrite {
+            path,
+            data,
+            mode,
+            uid,
+            gid,
+        } => handle_file_write(&path, &data, mode, uid, gid),
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
@@ -2683,7 +2691,13 @@ fn resolve_guest_io_path(
 /// finalize step. The atomic-rename pattern is the thing both paths
 /// need to guarantee: partial contents never appear at `path` under
 /// any error or kill scenario.
-fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+fn install_file_atomic(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
     let resolved = match resolve_guest_io_path(path, FilePathAccess::Write) {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -2726,6 +2740,17 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
     if let Some(m) = mode {
         apply_mode_best_effort(target, m);
     }
+    // Ownership was requested explicitly, so a failure is an error, not a
+    // best-effort shrug — a non-root workload silently unable to read its own
+    // upload is exactly the bug this exists to prevent.
+    if uid.is_some() || gid.is_some() {
+        if let Err(e) = std::os::unix::fs::chown(target, uid, gid) {
+            return AgentResponse::error(
+                format!("failed to chown {}: {}", path, e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+    }
     info!(path = %path, size = data.len(), "file written");
     AgentResponse::Ok { data: None }
 }
@@ -2741,8 +2766,14 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
 /// With no running workload the local write is correct and is kept: overlayfs
 /// reads `upper` at mount time, so seeding it before the container starts is
 /// exactly how the file becomes visible once it does.
-fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    if let Some(result) = nsfile::write_to_container(path, data, mode) {
+fn handle_file_write(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
+    if let Some(result) = nsfile::write_to_container(path, data, mode, uid, gid) {
         return match result {
             Ok(()) => AgentResponse::Ok { data: None },
             Err(e) => AgentResponse::error(
@@ -2751,7 +2782,7 @@ fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespons
             ),
         };
     }
-    install_file_atomic(path, data, mode)
+    install_file_atomic(path, data, mode, uid, gid)
 }
 
 /// State for an in-progress streaming file upload on one connection.
@@ -2770,6 +2801,10 @@ struct WriteSession {
     tmp_file: std::fs::File,
     /// Permissions to apply after rename.
     mode: Option<u32>,
+    /// Owner uid to apply after rename.
+    uid: Option<u32>,
+    /// Owner gid to apply after rename.
+    gid: Option<u32>,
     /// Running total — compared against `total_size` as a DoS guard.
     bytes_written: u64,
     /// Caller-declared total; the agent refuses chunks that would
@@ -2782,6 +2817,8 @@ impl WriteSession {
     fn open(
         target: std::path::PathBuf,
         mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         total_size: u64,
     ) -> std::io::Result<Self> {
         if let Some(parent) = target.parent() {
@@ -2813,6 +2850,8 @@ impl WriteSession {
             tmp_path,
             tmp_file,
             mode,
+            uid,
+            gid,
             bytes_written: 0,
             total_size,
         })
@@ -2867,6 +2906,48 @@ impl WriteSession {
                 error_codes::FILE_IO_FAILED,
             );
         }
+        // A running workload reads the CONTAINER filesystem, not the agent's
+        // namespace — finalize through the ns helper there, mirroring the
+        // single-shot path (writing here would land in the overlay's upper
+        // beneath a live overlayfs, invisible to the workload: BUG-240's
+        // streaming twin). The staged bytes are piped, never re-buffered.
+        match std::fs::File::open(&self.tmp_path) {
+            Ok(mut staged) => {
+                if let Some(result) = nsfile::write_reader_to_container(
+                    &self.target.to_string_lossy(),
+                    &mut staged,
+                    self.mode,
+                    self.uid,
+                    self.gid,
+                ) {
+                    // Session Drop still cleans the staging file.
+                    return match result {
+                        Ok(()) => {
+                            info!(
+                                path = %self.target.display(),
+                                size = self.bytes_written,
+                                "file written into workload container"
+                            );
+                            AgentResponse::Ok { data: None }
+                        }
+                        Err(e) => AgentResponse::error(
+                            format!(
+                                "failed to write {} in the workload container: {}",
+                                self.target.display(),
+                                e
+                            ),
+                            error_codes::FILE_IO_FAILED,
+                        ),
+                    };
+                }
+            }
+            Err(e) => {
+                return AgentResponse::error(
+                    format!("failed to reopen staging file: {}", e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+        }
         // Disarm Drop before rename; if the rename fails we'll
         // re-arm below by restoring the path.
         let tmp = std::mem::take(&mut self.tmp_path);
@@ -2881,6 +2962,14 @@ impl WriteSession {
         }
         if let Some(m) = self.mode {
             apply_mode_best_effort(&self.target, m);
+        }
+        if self.uid.is_some() || self.gid.is_some() {
+            if let Err(e) = std::os::unix::fs::chown(&self.target, self.uid, self.gid) {
+                return AgentResponse::error(
+                    format!("failed to chown {}: {}", self.target.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
         }
         info!(
             path = %self.target.display(),
@@ -2907,6 +2996,8 @@ impl Drop for WriteSession {
 fn handle_file_write_begin(
     path: String,
     mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
     total_size: u64,
 ) -> (Option<WriteSession>, AgentResponse) {
     if total_size > smolvm_protocol::FILE_TRANSFER_MAX_TOTAL {
@@ -2926,7 +3017,7 @@ fn handle_file_write_begin(
         Ok(p) => p,
         Err(resp) => return (None, resp),
     };
-    match WriteSession::open(resolved, mode, total_size) {
+    match WriteSession::open(resolved, mode, uid, gid, total_size) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
         Err(e) => (
             None,
@@ -6704,6 +6795,8 @@ mod tests {
         let (session, resp) = handle_file_write_begin(
             target.to_string_lossy().into(),
             None,
+            None,
+            None,
             smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
         );
         assert!(session.is_none(), "session must not be created");
@@ -6759,6 +6852,8 @@ mod tests {
         let (session, resp) = handle_file_write_begin(
             target.to_string_lossy().into(),
             Some(0o600),
+            None,
+            None,
             payload.len() as u64,
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
@@ -6796,8 +6891,13 @@ mod tests {
         let target = tmp_target(&tmp, "multi.bin");
         let total = 1024usize;
 
-        let (mut session, resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, total as u64);
+        let (mut session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            total as u64,
+        );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
         // Three chunks: 400 + 400 + 224 bytes, each a distinct fill byte.
@@ -6831,7 +6931,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "overflow.bin");
 
-        let (session, _resp) = handle_file_write_begin(target.to_string_lossy().into(), None, 10);
+        let (session, _resp) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
         assert!(session.is_some());
 
         // First chunk fits.
@@ -6860,7 +6961,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "dropped.bin");
 
-        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 100);
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100);
         let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
         assert!(session.is_some());
         // Staging file exists mid-stream.
@@ -6888,7 +6990,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "empty.bin");
 
-        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 0);
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0);
         let (session, resp) = handle_file_write_chunk(session, &[], true);
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         assert!(session.is_none());
@@ -6911,7 +7014,7 @@ mod tests {
         let target = tmp_target(&tmp, "single.bin");
         let payload = b"small file contents".to_vec();
 
-        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644));
+        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644), None, None);
         assert!(
             matches!(resp, AgentResponse::Ok { .. }),
             "write failed: {:?}",
