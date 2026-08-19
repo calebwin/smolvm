@@ -28,6 +28,8 @@ pub type CuResult<T> = Result<T, i32>;
 pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
 /// `CUDA_ERROR_INVALID_VALUE`.
 pub const CUDA_ERROR_INVALID_VALUE: i32 = 1;
+/// `CUDA_ERROR_INVALID_CONTEXT`.
+pub const CUDA_ERROR_INVALID_CONTEXT: i32 = 201;
 /// Bit-63 marks a guest-minted virtual handle (see `raw_graph`, cublas vh).
 const VHANDLE_TAG: u64 = 1 << 63;
 /// `CUDA_ERROR_NOT_FOUND`.
@@ -72,6 +74,97 @@ pub type TensorBundlePublisher =
 /// never use a shared CUDA context to name another session's allocation.
 #[cfg(unix)]
 static TENSOR_BUNDLE_PUBLISHER: Mutex<Option<Arc<TensorBundlePublisher>>> = Mutex::new(None);
+
+const AUTO_GRAPH_CACHE_ENTRIES: usize = 32;
+const AUTO_GRAPH_MAX_OPS: usize = 512;
+const AUTO_GRAPH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct AutoGraphEntry {
+    /// One eager observation is required before capture so CUDA libraries can
+    /// lazily initialize outside a capture window.
+    seen: u8,
+    exec: Option<u64>,
+    last_ops: Vec<Vec<u8>>,
+    failures: u8,
+    last_used: u64,
+    eager_time_ns: u128,
+    eager_samples: u32,
+    exact_time_ns: u128,
+    exact_samples: u32,
+    update_time_ns: u128,
+    update_samples: u32,
+    exact_disabled: bool,
+    update_disabled: bool,
+}
+
+#[derive(Clone, Copy)]
+enum AutoGraphMeasureMode {
+    Eager,
+    Exact,
+    Update,
+}
+
+struct AutoGraphMeasurement {
+    signature: Vec<u8>,
+    stream: u64,
+    started: std::time::Instant,
+    mode: AutoGraphMeasureMode,
+}
+
+#[derive(Clone, Copy)]
+enum IpcExport {
+    Memory {
+        dptr: u64,
+        handle: [u8; 64],
+        bytes: u64,
+        context: u64,
+        device: i32,
+    },
+    Event {
+        event: u64,
+        handle: [u8; 64],
+        context: u64,
+    },
+}
+
+/// CUDA IPC handles exchanged by guest processes are daemon-local opaque
+/// capabilities. Keeping the driver's raw handle behind a random token stops
+/// one VM from probing another connection's CUDA address space while retaining
+/// the fixed 64-byte ABI expected by NCCL and CUDA-aware multiprocessing.
+static IPC_EXPORTS: std::sync::Mutex<Option<HashMap<[u8; 64], IpcExport>>> =
+    std::sync::Mutex::new(None);
+
+fn publish_ipc_handle(export: IpcExport) -> CuResult<[u8; 64]> {
+    let mut token = [0u8; 64];
+    let mut exports = IPC_EXPORTS.lock().unwrap();
+    let exports = exports.get_or_insert_with(HashMap::new);
+    for _ in 0..8 {
+        getrandom::fill(&mut token).map_err(|_| 999)?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = exports.entry(token) {
+            entry.insert(export);
+            return Ok(token);
+        }
+    }
+    Err(999)
+}
+
+fn resolve_ipc_handle(token: &[u8]) -> CuResult<IpcExport> {
+    let token: [u8; 64] = token.try_into().map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+    IPC_EXPORTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|exports| exports.get(&token))
+        .copied()
+        .ok_or(CUDA_ERROR_INVALID_HANDLE)
+}
+
+fn remove_ipc_handle(token: &[u8; 64]) {
+    if let Some(exports) = IPC_EXPORTS.lock().unwrap().as_mut() {
+        exports.remove(token);
+    }
+}
 
 /// Install or clear the clone worker's tensor-bundle sink.
 #[cfg(unix)]
@@ -122,8 +215,20 @@ pub trait Backend: Send {
     fn device_get_uuid(&mut self, device: i32) -> CuResult<[u8; 16]>;
     fn device_get_pci_bus_id(&mut self, device: i32) -> CuResult<String>;
     fn device_get_by_pci_bus_id(&mut self, pci_bus_id: &str) -> CuResult<i32>;
+    fn device_can_access_peer(&mut self, _device: i32, _peer: i32) -> CuResult<i32> {
+        Ok(0)
+    }
     fn ctx_create(&mut self, device: i32) -> CuResult<u64>;
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()>;
+    fn ctx_set_current(&mut self, _ctx: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ctx_enable_peer_access(&mut self, _peer_ctx: u64, _flags: u32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ctx_disable_peer_access(&mut self, _peer_ctx: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
     fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)>;
     fn primary_ctx_retain(&mut self, device: i32) -> CuResult<u64>;
     fn primary_ctx_release(&mut self, device: i32) -> CuResult<()>;
@@ -177,6 +282,33 @@ pub trait Backend: Send {
     /// See `memcpy_htod` for the `stream` contract.
     fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> CuResult<Vec<u8>>;
     fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> CuResult<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn memcpy_peer_async(
+        &mut self,
+        _dst: u64,
+        _dst_ctx: u64,
+        _src: u64,
+        _src_ctx: u64,
+        _bytes: u64,
+        _stream: u64,
+    ) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ipc_get_mem_handle(&mut self, _dptr: u64) -> CuResult<[u8; 64]> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ipc_open_mem_handle(&mut self, _handle: [u8; 64], _flags: u32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ipc_close_mem_handle(&mut self, _dptr: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ipc_get_event_handle(&mut self, _event: u64) -> CuResult<[u8; 64]> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn ipc_open_event_handle(&mut self, _handle: [u8; 64]) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
     fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> CuResult<()>;
     fn mem_get_info(&mut self) -> CuResult<(u64, u64)>;
     fn launch_kernel(
@@ -188,6 +320,21 @@ pub trait Backend: Send {
         stream: u64,
         params: &[Vec<u8>],
     ) -> CuResult<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn launch_kernel_packed(
+        &mut self,
+        _function: u64,
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_bytes: u32,
+        _stream: u64,
+        _args: &[u8],
+    ) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn host_get_device_pointer(&mut self, _source: u8, _address: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
     fn ctx_synchronize(&mut self) -> CuResult<()>;
     fn stream_create(&mut self, flags: u32) -> CuResult<u64>;
     /// Begin capturing `stream`'s work into a CUDA graph (mode per
@@ -561,6 +708,9 @@ struct Session {
     modules: HashMap<u64, u64>,
     functions: HashMap<u64, u64>,
     contexts: HashMap<u64, u64>,
+    context_devices: HashMap<u64, i32>,
+    primary_contexts: HashMap<i32, u64>,
+    current_context: u64,
     streams: HashMap<u64, u64>,
     events: HashMap<u64, u64>,
     mem_pools: HashMap<u64, u64>,
@@ -596,7 +746,14 @@ struct Session {
     owned_modules: std::collections::HashSet<u64>,
     owned_streams: std::collections::HashSet<u64>,
     owned_events: std::collections::HashSet<u64>,
-    primary_retains: u32,
+    primary_retains: HashMap<i32, u32>,
+    peer_contexts: HashMap<i32, u64>,
+    ipc_exports: Vec<[u8; 64]>,
+    /// Imported pointer → (bytes, requires cuIpcCloseMemHandle). Same-context
+    /// opens borrow the producer's raw object and must not close it.
+    ipc_opened_mem: HashMap<u64, (u64, bool)>,
+    /// Guest event id → requires cuEventDestroy for an actual IPC import.
+    ipc_opened_events: HashMap<u64, bool>,
     /// This session's live device allocations (dptr → size), shared via
     /// [`DPTR_HANDOFF`] so a fork clone in isolation mode can enumerate the
     /// parent's buffers and give itself private copies. Mirrors `owned_dptrs`.
@@ -648,11 +805,37 @@ struct Session {
     /// exec vhandle: the ordered op payloads to re-capture on first launch.
     /// Drained from the layout at clone resume.
     clone_graph_oplogs: HashMap<u64, Vec<Vec<u8>>>,
+    /// Transparent, fence-delimited graph segments keyed by normalized CUDA
+    /// operation shape. Entries are per session/context and never shared
+    /// across trust or device boundaries.
+    auto_graphs: HashMap<Vec<u8>, AutoGraphEntry>,
+    auto_graph_clock: u64,
+    auto_graph_measurements: Vec<AutoGraphMeasurement>,
 }
 
 /// Free everything a finished connection still owns. Failures are ignored —
 /// the driver may already have reclaimed (context destruction, device reset).
 fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
+    for token in std::mem::take(&mut sess.ipc_exports) {
+        remove_ipc_handle(&token);
+    }
+    for (dptr, (_, needs_close)) in std::mem::take(&mut sess.ipc_opened_mem) {
+        if needs_close {
+            let _ = b.ipc_close_mem_handle(dptr);
+        }
+    }
+    for (event, needs_destroy) in std::mem::take(&mut sess.ipc_opened_events) {
+        if let Some(raw) = sess.events.remove(&event) {
+            if needs_destroy {
+                let _ = b.event_destroy(raw);
+            }
+        }
+    }
+    for entry in std::mem::take(&mut sess.auto_graphs).into_values() {
+        if let Some(exec) = entry.exec {
+            let _ = b.graph_exec_destroy(exec);
+        }
+    }
     for (d, _size) in std::mem::take(&mut sess.owned_dptrs) {
         let _ = b.mem_free(d);
     }
@@ -693,8 +876,10 @@ fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
             .graph_exec_destroy(real)
             .or_else(|_| b.graph_destroy(real));
     }
-    for _ in 0..std::mem::take(&mut sess.primary_retains) {
-        let _ = b.primary_ctx_release(0);
+    for (device, count) in std::mem::take(&mut sess.primary_retains) {
+        for _ in 0..count {
+            let _ = b.primary_ctx_release(device);
+        }
     }
 }
 
@@ -2483,9 +2668,9 @@ fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
         | Request::MemsetD8Async { dptr, .. }
         | Request::MemcpyShmHtoD { dptr, .. }
         | Request::MemcpyGpaHtoD { dptr, .. } => cow_one(sess, b, *dptr),
-        Request::MemcpyDtoD { dst, .. } | Request::MemcpyDtoDAsync { dst, .. } => {
-            cow_one(sess, b, *dst)
-        }
+        Request::MemcpyDtoD { dst, .. }
+        | Request::MemcpyDtoDAsync { dst, .. }
+        | Request::MemcpyPeerAsync { dst, .. } => cow_one(sess, b, *dst),
         _ => {}
     }
 }
@@ -2562,9 +2747,9 @@ fn cow_worker_vmm_written(sess: &Session, b: &mut dyn Backend, req: &Request) ->
                 .fold(0_u64, |total, (_, len)| total.saturating_add(*len));
             Some((*dptr, bytes))
         }
-        Request::MemcpyDtoD { dst, bytes, .. } | Request::MemcpyDtoDAsync { dst, bytes, .. } => {
-            Some((*dst, *bytes))
-        }
+        Request::MemcpyDtoD { dst, bytes, .. }
+        | Request::MemcpyDtoDAsync { dst, bytes, .. }
+        | Request::MemcpyPeerAsync { dst, bytes, .. } => Some((*dst, *bytes)),
         _ => None,
     };
     match written {
@@ -2636,6 +2821,24 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
             src: xlat(trans, src),
             bytes,
             stream,
+        },
+        Request::MemcpyPeerAsync {
+            dst,
+            dst_device,
+            src,
+            src_device,
+            bytes,
+            stream,
+        } => Request::MemcpyPeerAsync {
+            dst: xlat(trans, dst),
+            dst_device,
+            src: xlat(trans, src),
+            src_device,
+            bytes,
+            stream,
+        },
+        Request::IpcGetMemHandle { dptr } => Request::IpcGetMemHandle {
+            dptr: xlat(trans, dptr),
         },
         Request::MemsetD8 { dptr, value, bytes } => Request::MemsetD8 {
             dptr: xlat(trans, dptr),
@@ -2732,6 +2935,35 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
                 shared_bytes,
                 stream,
                 params,
+            }
+        }
+        Request::LaunchKernelPacked {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            stream,
+            mut args,
+        } => {
+            // Packed launch buffers preserve compiler-selected padding. CUDA
+            // provides no pointer metadata, so apply the same conservative
+            // live-range translation used for individual argument blobs.
+            let mut off = 0;
+            while off + 8 <= args.len() {
+                let value = u64::from_le_bytes(args[off..off + 8].try_into().unwrap());
+                let translated = xlat(trans, value);
+                if translated != value {
+                    args[off..off + 8].copy_from_slice(&translated.to_le_bytes());
+                }
+                off += 8;
+            }
+            Request::LaunchKernelPacked {
+                function,
+                grid,
+                block,
+                shared_bytes,
+                stream,
+                args,
             }
         }
         Request::CublasSgemm {
@@ -2853,6 +3085,16 @@ pub fn serve_with_options<S: Read + Write>(
     // The connection is over (guest exit, crash, or transport error): free
     // everything it still owns so a dead client can't hold GPU memory.
     reclaim_session(&mut sess, backend);
+    // Module staging and NCCL initialization transiently allocate large host
+    // buffers on short-lived serving threads. glibc otherwise keeps those
+    // freed arenas resident indefinitely; repeated process groups grew daemon
+    // RSS even though every CUDA allocation and handle was reclaimed. Trimming
+    // at connection teardown returns completely free pages without touching
+    // the live process-wide module cache.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
     r
 }
 
@@ -3600,6 +3842,17 @@ fn optrace_summary(req: &Request) -> Option<String> {
                 args.join(" ")
             )
         }
+        Request::LaunchKernelPacked {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            args,
+            ..
+        } => format!(
+            "LaunchPacked fn={function:#x} grid={grid:?} block={block:?} smem={shared_bytes:#x} args={:#x}",
+            args.len()
+        ),
         Request::GraphLaunch { graph_exec, .. } => format!("GraphLaunch exec={graph_exec:#x}"),
         Request::LibCall { lib, func, args } => {
             format!("LibCall lib={lib} func={func} alen={}", args.len())
@@ -3674,12 +3927,487 @@ fn is_capturable(req: &Request) -> bool {
     matches!(
         req,
         Request::LaunchKernel { .. }
+            | Request::LaunchKernelPacked { .. }
             | Request::LibCall { .. }
             | Request::MemsetD8Async { .. }
             | Request::MemcpyDtoDAsync { .. }
             | Request::EventRecord { .. }
             | Request::StreamWaitEvent { .. }
     )
+}
+
+fn auto_graph_capturable(req: &Request) -> bool {
+    is_capturable(req) && !matches!(req, Request::AutoGraphSegment { .. })
+}
+
+fn normalized_id(map: &mut HashMap<u64, u32>, value: u64) -> u32 {
+    let next = map.len() as u32;
+    *map.entry(value).or_insert(next)
+}
+
+/// Shape key for graph-update compatibility. Dynamic kernel arguments,
+/// device pointers, scalar values, event handles, and concrete stream handles
+/// are deliberately omitted or normalized; CUDA validates the final update.
+fn auto_graph_signature(reqs: &[Request]) -> Vec<u8> {
+    let mut signature = Vec::with_capacity(reqs.len() * 32);
+    let mut streams = HashMap::new();
+    let mut events = HashMap::new();
+    for req in reqs {
+        match req {
+            Request::LaunchKernel {
+                function,
+                grid,
+                block,
+                shared_bytes,
+                stream,
+                params,
+            } => {
+                signature.push(1);
+                signature.extend_from_slice(&function.to_le_bytes());
+                for value in grid.iter().chain(block) {
+                    signature.extend_from_slice(&value.to_le_bytes());
+                }
+                signature.extend_from_slice(&shared_bytes.to_le_bytes());
+                signature.extend_from_slice(&normalized_id(&mut streams, *stream).to_le_bytes());
+                signature.extend_from_slice(&(params.len() as u32).to_le_bytes());
+                for param in params {
+                    signature.extend_from_slice(&(param.len() as u32).to_le_bytes());
+                }
+            }
+            Request::LaunchKernelPacked {
+                function,
+                grid,
+                block,
+                shared_bytes,
+                stream,
+                args,
+            } => {
+                signature.push(7);
+                signature.extend_from_slice(&function.to_le_bytes());
+                for value in grid.iter().chain(block) {
+                    signature.extend_from_slice(&value.to_le_bytes());
+                }
+                signature.extend_from_slice(&shared_bytes.to_le_bytes());
+                signature.extend_from_slice(&normalized_id(&mut streams, *stream).to_le_bytes());
+                signature.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            }
+            Request::LibCall { lib, func, args } => {
+                signature.push(2);
+                signature.push(*lib);
+                signature.extend_from_slice(&func.to_le_bytes());
+                signature.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            }
+            Request::MemsetD8Async { bytes, stream, .. } => {
+                signature.push(3);
+                signature.extend_from_slice(&bytes.to_le_bytes());
+                signature.extend_from_slice(&normalized_id(&mut streams, *stream).to_le_bytes());
+            }
+            Request::MemcpyDtoDAsync { bytes, stream, .. } => {
+                signature.push(4);
+                signature.extend_from_slice(&bytes.to_le_bytes());
+                signature.extend_from_slice(&normalized_id(&mut streams, *stream).to_le_bytes());
+            }
+            Request::EventRecord { event, stream } => {
+                signature.push(5);
+                signature.extend_from_slice(&normalized_id(&mut events, *event).to_le_bytes());
+                signature.extend_from_slice(&normalized_id(&mut streams, *stream).to_le_bytes());
+            }
+            Request::StreamWaitEvent {
+                stream,
+                event,
+                flags,
+            } => {
+                signature.push(6);
+                signature.extend_from_slice(&normalized_id(&mut streams, *stream).to_le_bytes());
+                signature.extend_from_slice(&normalized_id(&mut events, *event).to_le_bytes());
+                signature.extend_from_slice(&flags.to_le_bytes());
+            }
+            _ => signature.push(0xff),
+        }
+    }
+    signature
+}
+
+fn request_stream(req: &Request) -> Option<u64> {
+    match req {
+        Request::LaunchKernel { stream, .. }
+        | Request::LaunchKernelPacked { stream, .. }
+        | Request::MemsetD8Async { stream, .. }
+        | Request::MemcpyDtoDAsync { stream, .. }
+        | Request::EventRecord { stream, .. }
+        | Request::StreamWaitEvent { stream, .. } => Some(*stream),
+        _ => None,
+    }
+}
+
+fn segment_stream(sess: &Session, stream: u64) -> u64 {
+    xlat_stream(sess.streams.get(&stream).copied().unwrap_or(stream))
+}
+
+fn execute_auto_graph_eager(
+    sess: &mut Session,
+    b: &mut dyn Backend,
+    reqs: &[Request],
+) -> CuResult<()> {
+    for req in reqs {
+        let (status, _) = dispatch(sess, b, req.clone());
+        if status != 0 {
+            return Err(status);
+        }
+    }
+    Ok(())
+}
+
+/// Capture one segment on a private stream. Redirecting every known stream,
+/// including stream zero, prevents concurrent framework traffic from entering
+/// the capture and safely linearizes multi-stream event DAGs.
+fn capture_auto_graph(sess: &mut Session, b: &mut dyn Backend, reqs: &[Request]) -> CuResult<u64> {
+    let private = b.stream_create(1)?; // CU_STREAM_NON_BLOCKING
+    let mut names = vec![0u64];
+    for req in reqs {
+        if let Some(stream) = request_stream(req) {
+            names.push(stream);
+            names.push(sess.streams.get(&stream).copied().unwrap_or(stream));
+        }
+    }
+    names.extend(sess.streams.keys().copied());
+    names.extend(sess.streams.values().copied());
+    names.extend(sess.owned_streams.iter().copied());
+    names.sort_unstable();
+    names.dedup();
+    let saved: Vec<(u64, Option<u64>)> = names
+        .into_iter()
+        .map(|stream| (stream, stream_trans_override(stream, private)))
+        .collect();
+    let restore = |saved: &[(u64, Option<u64>)]| {
+        for &(stream, previous) in saved {
+            stream_trans_restore(stream, previous);
+        }
+    };
+
+    if let Err(error) = b.stream_begin_capture(private, 2) {
+        restore(&saved);
+        let _ = b.stream_destroy(private);
+        return Err(error);
+    }
+    let mut op_error = None;
+    for req in reqs {
+        let (status, _) = dispatch(sess, b, req.clone());
+        if status != 0 {
+            op_error = Some(status);
+            break;
+        }
+    }
+    let ended = b.stream_end_capture(private);
+    restore(&saved);
+    let _ = b.stream_destroy(private);
+    if let Some(error) = op_error {
+        if let Ok(graph) = ended {
+            let _ = b.graph_destroy(graph);
+        }
+        return Err(error);
+    }
+    ended
+}
+
+fn insert_auto_graph_entry(
+    sess: &mut Session,
+    b: &mut dyn Backend,
+    signature: Vec<u8>,
+    entry: AutoGraphEntry,
+) {
+    if sess.auto_graphs.len() >= AUTO_GRAPH_CACHE_ENTRIES {
+        if let Some(oldest) = sess
+            .auto_graphs
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            if let Some(evicted) = sess.auto_graphs.remove(&oldest) {
+                if let Some(exec) = evicted.exec {
+                    let _ = b.graph_exec_destroy(exec);
+                }
+            }
+        }
+    }
+    sess.auto_graphs.insert(signature, entry);
+}
+
+fn record_auto_graph_measurement(
+    sess: &mut Session,
+    signature: Vec<u8>,
+    stream: u64,
+    started: std::time::Instant,
+    mode: AutoGraphMeasureMode,
+    result: CuResult<()>,
+) -> CuResult<()> {
+    if result.is_ok() {
+        // One fence-delimited segment per stream is the normal client shape.
+        // Replace an unfinished sample rather than growing without bound when
+        // an application never synchronizes that stream.
+        sess.auto_graph_measurements
+            .retain(|measurement| measurement.stream != stream);
+        sess.auto_graph_measurements.push(AutoGraphMeasurement {
+            signature,
+            stream,
+            started,
+            mode,
+        });
+    }
+    result
+}
+
+fn complete_auto_graph_measurements(sess: &mut Session, stream: Option<u64>) {
+    let mut completed = Vec::new();
+    let mut pending = Vec::new();
+    for measurement in std::mem::take(&mut sess.auto_graph_measurements) {
+        if stream.is_none_or(|stream| stream == measurement.stream) {
+            completed.push(measurement);
+        } else {
+            pending.push(measurement);
+        }
+    }
+    sess.auto_graph_measurements = pending;
+    for measurement in completed {
+        let Some(entry) = sess.auto_graphs.get_mut(&measurement.signature) else {
+            continue;
+        };
+        let elapsed = measurement.started.elapsed().as_nanos();
+        match measurement.mode {
+            AutoGraphMeasureMode::Eager => {
+                entry.eager_time_ns = entry.eager_time_ns.saturating_add(elapsed);
+                entry.eager_samples = entry.eager_samples.saturating_add(1);
+            }
+            AutoGraphMeasureMode::Exact => {
+                entry.exact_time_ns = entry.exact_time_ns.saturating_add(elapsed);
+                entry.exact_samples = entry.exact_samples.saturating_add(1);
+            }
+            AutoGraphMeasureMode::Update => {
+                entry.update_time_ns = entry.update_time_ns.saturating_add(elapsed);
+                entry.update_samples = entry.update_samples.saturating_add(1);
+            }
+        }
+        if entry.eager_samples >= 3 && entry.exact_samples >= 3 {
+            let eager = entry.eager_time_ns / u128::from(entry.eager_samples);
+            let exact = entry.exact_time_ns / u128::from(entry.exact_samples);
+            entry.exact_disabled = exact > eager.saturating_mul(105) / 100;
+        }
+        if entry.eager_samples >= 3 && entry.update_samples >= 3 {
+            let eager = entry.eager_time_ns / u128::from(entry.eager_samples);
+            let update = entry.update_time_ns / u128::from(entry.update_samples);
+            entry.update_disabled = update > eager.saturating_mul(105) / 100;
+        }
+    }
+}
+
+fn execute_auto_graph_segment(
+    sess: &mut Session,
+    b: &mut dyn Backend,
+    ops: Vec<Vec<u8>>,
+) -> CuResult<()> {
+    let started = std::time::Instant::now();
+    if ops.len() < 2 || ops.len() > AUTO_GRAPH_MAX_OPS {
+        return Err(CUDA_ERROR_INVALID_VALUE);
+    }
+    let bytes = ops
+        .iter()
+        .try_fold(0usize, |total, op| total.checked_add(op.len()));
+    if bytes.is_none_or(|bytes| bytes > AUTO_GRAPH_MAX_BYTES) {
+        return Err(CUDA_ERROR_INVALID_VALUE);
+    }
+    let reqs: Vec<Request> = ops
+        .iter()
+        .map(|op| decode_request(op).map_err(|_| CUDA_ERROR_INVALID_VALUE))
+        .collect::<CuResult<_>>()?;
+    if reqs.iter().any(|req| !auto_graph_capturable(req)) {
+        return Err(CUDA_ERROR_INVALID_VALUE);
+    }
+    let Some(root) = reqs.iter().find_map(request_stream) else {
+        // Opaque library-only sequences do not expose a launch stream. Keep
+        // their behavior eager instead of guessing at library handle state.
+        return execute_auto_graph_eager(sess, b, &reqs);
+    };
+    let launch_stream = segment_stream(sess, root);
+    let signature = auto_graph_signature(&reqs);
+    sess.auto_graph_clock = sess.auto_graph_clock.wrapping_add(1);
+    let mut entry = sess.auto_graphs.remove(&signature).unwrap_or_default();
+    entry.last_used = sess.auto_graph_clock;
+
+    if entry.seen < 3 {
+        entry.seen = entry.seen.saturating_add(1);
+        let result = execute_auto_graph_eager(sess, b, &reqs);
+        insert_auto_graph_entry(sess, b, signature, entry);
+        return record_auto_graph_measurement(
+            sess,
+            auto_graph_signature(&reqs),
+            launch_stream,
+            started,
+            AutoGraphMeasureMode::Eager,
+            result,
+        );
+    }
+    if let Some(exec) = entry.exec {
+        if entry.last_ops == ops {
+            let (mode, result) = if entry.exact_disabled {
+                (
+                    AutoGraphMeasureMode::Eager,
+                    execute_auto_graph_eager(sess, b, &reqs),
+                )
+            } else {
+                (
+                    AutoGraphMeasureMode::Exact,
+                    b.graph_launch(exec, launch_stream),
+                )
+            };
+            insert_auto_graph_entry(sess, b, signature, entry);
+            return record_auto_graph_measurement(
+                sess,
+                auto_graph_signature(&reqs),
+                launch_stream,
+                started,
+                mode,
+                result,
+            );
+        }
+    }
+    if entry.failures >= 3 || (entry.exec.is_some() && entry.update_disabled) {
+        let result = execute_auto_graph_eager(sess, b, &reqs);
+        insert_auto_graph_entry(sess, b, signature, entry);
+        return record_auto_graph_measurement(
+            sess,
+            auto_graph_signature(&reqs),
+            launch_stream,
+            started,
+            AutoGraphMeasureMode::Eager,
+            result,
+        );
+    }
+
+    let updating_existing = entry.exec.is_some();
+    let graph = match capture_auto_graph(sess, b, &reqs) {
+        Ok(graph) => graph,
+        Err(_) => {
+            entry.failures = entry.failures.saturating_add(1);
+            let result = execute_auto_graph_eager(sess, b, &reqs);
+            insert_auto_graph_entry(sess, b, signature, entry);
+            return record_auto_graph_measurement(
+                sess,
+                auto_graph_signature(&reqs),
+                launch_stream,
+                started,
+                AutoGraphMeasureMode::Eager,
+                result,
+            );
+        }
+    };
+    if b.graph_get_node_count(graph).unwrap_or(0) == 0 {
+        let _ = b.graph_destroy(graph);
+        entry.failures = 3;
+        let result = execute_auto_graph_eager(sess, b, &reqs);
+        insert_auto_graph_entry(sess, b, signature, entry);
+        return record_auto_graph_measurement(
+            sess,
+            auto_graph_signature(&reqs),
+            launch_stream,
+            started,
+            AutoGraphMeasureMode::Eager,
+            result,
+        );
+    }
+
+    let mut replaced = None;
+    let exec = if let Some(exec) = entry.exec {
+        match b.graph_exec_update(exec, graph) {
+            Ok(0) => exec,
+            _ => match b.graph_instantiate(graph) {
+                Ok(new_exec) => {
+                    replaced = Some(exec);
+                    new_exec
+                }
+                Err(_) => {
+                    let _ = b.graph_destroy(graph);
+                    entry.failures = entry.failures.saturating_add(1);
+                    let result = execute_auto_graph_eager(sess, b, &reqs);
+                    insert_auto_graph_entry(sess, b, signature, entry);
+                    return record_auto_graph_measurement(
+                        sess,
+                        auto_graph_signature(&reqs),
+                        launch_stream,
+                        started,
+                        AutoGraphMeasureMode::Eager,
+                        result,
+                    );
+                }
+            },
+        }
+    } else {
+        match b.graph_instantiate(graph) {
+            Ok(exec) => exec,
+            Err(_) => {
+                let _ = b.graph_destroy(graph);
+                entry.failures = entry.failures.saturating_add(1);
+                let result = execute_auto_graph_eager(sess, b, &reqs);
+                insert_auto_graph_entry(sess, b, signature, entry);
+                return record_auto_graph_measurement(
+                    sess,
+                    auto_graph_signature(&reqs),
+                    launch_stream,
+                    started,
+                    AutoGraphMeasureMode::Eager,
+                    result,
+                );
+            }
+        }
+    };
+    let _ = b.graph_destroy(graph);
+    if let Some(old_exec) = replaced {
+        let _ = b.graph_exec_destroy(old_exec);
+    }
+    entry.exec = Some(exec);
+    entry.last_ops = ops;
+    entry.failures = 0;
+    let result = b.graph_launch(exec, launch_stream);
+    insert_auto_graph_entry(sess, b, signature, entry);
+    // The first capture/instantiate is promotion overhead, not representative
+    // replay cost. It remains unscored; subsequent exact/update executions are
+    // compared against the eager observations above.
+    if updating_existing {
+        record_auto_graph_measurement(
+            sess,
+            auto_graph_signature(&reqs),
+            launch_stream,
+            started,
+            AutoGraphMeasureMode::Update,
+            result,
+        )
+    } else {
+        result
+    }
+}
+
+fn retain_primary_context(sess: &mut Session, b: &mut dyn Backend, device: i32) -> CuResult<u64> {
+    let raw = b.primary_ctx_retain(device)?;
+    sess.primary_contexts.insert(device, raw);
+    sess.context_devices.insert(raw, device);
+    *sess.primary_retains.entry(device).or_insert(0) += 1;
+    sess.current_context = raw;
+    Ok(raw)
+}
+
+/// Return a retained primary context without changing its reference count when
+/// this session already owns one. Newly retaining a peer makes it current, so
+/// restore the caller's context before issuing work.
+fn ensure_primary_context(sess: &mut Session, b: &mut dyn Backend, device: i32) -> CuResult<u64> {
+    if let Some(&ctx) = sess.primary_contexts.get(&device) {
+        return Ok(ctx);
+    }
+    let previous = sess.current_context;
+    let ctx = retain_primary_context(sess, b, device)?;
+    if previous != 0 {
+        b.ctx_set_current(previous)?;
+        sess.current_context = previous;
+    }
+    Ok(ctx)
 }
 
 /// P3b: execs this worker process has already re-captured, keyed by the
@@ -3795,6 +4523,7 @@ fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -
     fn op_tag(req: &Request) -> &'static str {
         match req {
             Request::LaunchKernel { .. } => "LaunchKernel",
+            Request::LaunchKernelPacked { .. } => "LaunchKernelPacked",
             Request::LibCall { .. } => "LibCall",
             Request::MemsetD8Async { .. } => "MemsetD8Async",
             Request::MemcpyDtoDAsync { .. } => "MemcpyDtoDAsync",
@@ -3806,6 +4535,7 @@ fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -
     fn op_stream(req: &Request) -> Option<u64> {
         match req {
             Request::LaunchKernel { stream, .. }
+            | Request::LaunchKernelPacked { stream, .. }
             | Request::MemsetD8Async { stream, .. }
             | Request::MemcpyDtoDAsync { stream, .. }
             | Request::EventRecord { stream, .. }
@@ -3982,15 +4712,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     fn raw_stream(sess: &Session, stream: u64) -> CuResult<u64> {
         // Streams are raw host pointers on the wire (see StreamCreate below);
         // the table only translates ids minted by pre-raw-stream guests.
-        if stream == 0 {
-            Ok(0)
-        } else {
-            // Path 3 (M3a pattern): translate a clone's inherited golden stream
-            // to its own recreated stream; identity otherwise.
-            Ok(xlat_stream(
-                sess.streams.get(&stream).copied().unwrap_or(stream),
-            ))
-        }
+        // The translation is normally identity, including for stream 0. Auto
+        // graph capture temporarily redirects all streams to one private root.
+        Ok(xlat_stream(
+            sess.streams.get(&stream).copied().unwrap_or(stream),
+        ))
     }
     // Modules and functions are raw host handles on the wire (like streams):
     // the real CUmodule/CUfunction is context-scoped and every connection
@@ -4142,16 +4868,59 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Ok(Response::Count(physical))
             }
         }
+        Request::DeviceCanAccessPeer { device, peer } => b
+            .device_can_access_peer(dev(sess, device), dev(sess, peer))
+            .map(Response::Count),
+        Request::DeviceEnablePeerAccess { peer, flags } => {
+            if flags != 0 {
+                return Err(CUDA_ERROR_INVALID_VALUE);
+            }
+            if sess.current_context == 0 {
+                return Err(201); // CUDA_ERROR_INVALID_CONTEXT
+            }
+            let peer = dev(sess, peer);
+            let peer_ctx = ensure_primary_context(sess, b, peer)?;
+            b.ctx_enable_peer_access(peer_ctx, flags)?;
+            sess.peer_contexts.insert(peer, peer_ctx);
+            Ok(Response::Ok)
+        }
+        Request::DeviceDisablePeerAccess { peer } => {
+            let peer = dev(sess, peer);
+            let peer_ctx = sess
+                .peer_contexts
+                .remove(&peer)
+                .or_else(|| sess.primary_contexts.get(&peer).copied())
+                .ok_or(CUDA_ERROR_INVALID_VALUE)?;
+            b.ctx_disable_peer_access(peer_ctx)?;
+            Ok(Response::Ok)
+        }
         Request::CtxCreate { device } => {
-            let raw = b.ctx_create(dev(sess, device))?;
+            let device = dev(sess, device);
+            let raw = b.ctx_create(device)?;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
+            sess.context_devices.insert(raw, device);
+            sess.current_context = raw;
             Ok(Response::Handle(id))
         }
         Request::CtxDestroy { ctx } => {
             let raw = raw(&sess.contexts, ctx)?;
             b.ctx_destroy(raw)?;
             sess.contexts.remove(&ctx);
+            sess.context_devices.remove(&raw);
+            if sess.current_context == raw {
+                sess.current_context = 0;
+            }
+            Ok(Response::Ok)
+        }
+        Request::CtxSetCurrent { ctx } => {
+            let raw_ctx = if ctx == 0 {
+                0
+            } else {
+                raw(&sess.contexts, ctx)?
+            };
+            b.ctx_set_current(raw_ctx)?;
+            sess.current_context = raw_ctx;
             Ok(Response::Ok)
         }
         Request::CtxGetStreamPriorityRange => b
@@ -4159,8 +4928,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|(least, greatest)| Response::Pair(least as i64 as u64, greatest as i64 as u64)),
         Request::PrimaryCtxRetain { device } => {
             let device = dev(sess, device);
-            let raw = b.primary_ctx_retain(device)?;
-            sess.primary_retains += 1;
+            let raw = retain_primary_context(sess, b, device)?;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
             // Copy-on-fork (isolation mode): now that the primary context is
@@ -4353,7 +5121,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::PrimaryCtxRelease { device } => {
             let device = dev(sess, device);
-            sess.primary_retains = sess.primary_retains.saturating_sub(1);
+            if let Some(count) = sess.primary_retains.get_mut(&device) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    sess.primary_retains.remove(&device);
+                    if let Some(ctx) = sess.primary_contexts.remove(&device) {
+                        sess.context_devices.remove(&ctx);
+                    }
+                }
+            }
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
         Request::ModuleLoadData { image } => {
@@ -4441,6 +5217,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
+        Request::HostGetDevicePointer { source, address } => b
+            .host_get_device_pointer(source, address)
+            .map(Response::Handle),
         Request::FuncGetAttribute { function, attrib } => {
             let raw_fn = raw_fn_h(sess, b, function);
             b.func_get_attribute(raw_fn, attrib).map(Response::Count)
@@ -4621,11 +5400,140 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             dptr,
             bytes,
             stream,
-        } => b
-            .memcpy_dtoh(dptr, bytes, raw_stream(sess, stream)?)
-            .map(Response::Data),
+        } => {
+            let raw = raw_stream(sess, stream)?;
+            let data = b.memcpy_dtoh(dptr, bytes, raw)?;
+            complete_auto_graph_measurements(sess, Some(raw));
+            Ok(Response::Data(data))
+        }
         Request::MemcpyDtoD { dst, src, bytes } => {
             b.memcpy_dtod(dst, src, bytes).map(|_| Response::Ok)
+        }
+        Request::MemcpyPeerAsync {
+            dst,
+            dst_device,
+            src,
+            src_device,
+            bytes,
+            stream,
+        } => {
+            let dst_device = dev(sess, dst_device);
+            let src_device = dev(sess, src_device);
+            let dst_ctx = ensure_primary_context(sess, b, dst_device)?;
+            let src_ctx = ensure_primary_context(sess, b, src_device)?;
+            let raw_stream = raw_stream(sess, stream)?;
+            b.memcpy_peer_async(dst, dst_ctx, src, src_ctx, bytes, raw_stream)?;
+            Ok(Response::Ok)
+        }
+        Request::IpcGetMemHandle { dptr } => {
+            let Some(&bytes) = sess.owned_dptrs.get(&dptr) else {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            };
+            if sess.current_context == 0 {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            }
+            let device = sess
+                .context_devices
+                .get(&sess.current_context)
+                .copied()
+                .ok_or(CUDA_ERROR_INVALID_CONTEXT)?;
+            let handle = b.ipc_get_mem_handle(dptr)?;
+            let token = publish_ipc_handle(IpcExport::Memory {
+                dptr,
+                handle,
+                bytes,
+                context: sess.current_context,
+                device,
+            })?;
+            sess.ipc_exports.push(token);
+            Ok(Response::Data(token.to_vec()))
+        }
+        Request::IpcOpenMemHandle { handle, flags } => {
+            if flags & !1 != 0 || sess.current_context == 0 {
+                return Err(CUDA_ERROR_INVALID_VALUE);
+            }
+            let IpcExport::Memory {
+                dptr: producer_dptr,
+                handle,
+                bytes,
+                context,
+                device,
+            } = resolve_ipc_handle(&handle)?
+            else {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            };
+            let current_device = sess
+                .context_devices
+                .get(&sess.current_context)
+                .copied()
+                .ok_or(CUDA_ERROR_INVALID_CONTEXT)?;
+            let (dptr, needs_close) = if sess.current_context == context {
+                (producer_dptr, false)
+            } else {
+                match b.ipc_open_mem_handle(handle, flags) {
+                    Ok(imported) => (imported, true),
+                    // All sessions live in one daemon process, while CUDA IPC
+                    // rejects importing a handle into its exporting process.
+                    // UVA peer access is the in-process equivalent and keeps
+                    // the producer allocation at the same address.
+                    Err(201) if current_device != device => {
+                        match b.ctx_enable_peer_access(context, 0) {
+                            Ok(()) | Err(704) => {}
+                            Err(code) => return Err(code),
+                        }
+                        (producer_dptr, false)
+                    }
+                    Err(code) => return Err(code),
+                }
+            };
+            sess.ipc_opened_mem.insert(dptr, (bytes, needs_close));
+            Ok(Response::Dptr(dptr))
+        }
+        Request::IpcCloseMemHandle { dptr } => {
+            let Some((_, needs_close)) = sess.ipc_opened_mem.remove(&dptr) else {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            };
+            if needs_close {
+                b.ipc_close_mem_handle(dptr)?;
+            }
+            Ok(Response::Ok)
+        }
+        Request::IpcGetEventHandle { event } => {
+            let event = raw_event(sess, event)?;
+            if !sess.owned_events.contains(&event) {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            }
+            let handle = b.ipc_get_event_handle(event)?;
+            let token = publish_ipc_handle(IpcExport::Event {
+                event,
+                handle,
+                context: sess.current_context,
+            })?;
+            sess.ipc_exports.push(token);
+            Ok(Response::Data(token.to_vec()))
+        }
+        Request::IpcOpenEventHandle { handle } => {
+            let IpcExport::Event {
+                event: producer_event,
+                handle,
+                context,
+            } = resolve_ipc_handle(&handle)?
+            else {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            };
+            let (event, needs_destroy) = if sess.current_context == context {
+                (producer_event, false)
+            } else {
+                match b.ipc_open_event_handle(handle) {
+                    Ok(imported) => (imported, true),
+                    Err(201) => (producer_event, false),
+                    Err(code) => return Err(code),
+                }
+            };
+            let id = sess.mint();
+            sess.events.insert(id, event);
+            sess.ipc_opened_events.insert(id, needs_destroy);
+            Ok(Response::Handle(id))
         }
         Request::MemsetD8 { dptr, value, bytes } => {
             b.memset_d8(dptr, value, bytes).map(|_| Response::Ok)
@@ -4647,7 +5555,24 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.launch_kernel(raw_fn, grid, block, shared_bytes, raw_str, &params)
                 .map(|_| Response::Ok)
         }
-        Request::CtxSynchronize => b.ctx_synchronize().map(|_| Response::Ok),
+        Request::LaunchKernelPacked {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            stream,
+            args,
+        } => {
+            let raw_fn = raw_fn_h(sess, b, function);
+            let raw_str = raw_stream(sess, stream)?;
+            b.launch_kernel_packed(raw_fn, grid, block, shared_bytes, raw_str, &args)
+                .map(|_| Response::Ok)
+        }
+        Request::CtxSynchronize => {
+            b.ctx_synchronize()?;
+            complete_auto_graph_measurements(sess, None);
+            Ok(Response::Ok)
+        }
         // Streams hand back the RAW host pointer, not a session-minted id.
         // Streams are context-scoped and every connection retains the same
         // device primary context — but one guest process holds SEPARATE
@@ -4932,6 +5857,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.graph_exec_update(real_exec, real_graph)
                 .map(Response::Count)
         }
+        Request::AutoGraphSegment { ops } => {
+            execute_auto_graph_segment(sess, b, ops).map(|_| Response::Ok)
+        }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
             sess.graph_vhandles.lock().unwrap().remove(&graph_exec);
@@ -4991,7 +5919,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::StreamSynchronize { stream } => {
             let raw = raw_stream(sess, stream)?;
-            b.stream_synchronize(raw).map(|_| Response::Ok)
+            b.stream_synchronize(raw)?;
+            complete_auto_graph_measurements(sess, Some(raw));
+            Ok(Response::Ok)
         }
         Request::StreamQuery { stream } => {
             let raw = raw_stream(sess, stream)?;
@@ -5059,6 +5989,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Data(encoded))
         }
         Request::EventDestroy { event } => {
+            if let Some(needs_destroy) = sess.ipc_opened_events.remove(&event) {
+                let raw = sess
+                    .events
+                    .remove(&event)
+                    .ok_or(CUDA_ERROR_INVALID_HANDLE)?;
+                if needs_destroy {
+                    b.event_destroy(raw)?;
+                }
+                return Ok(Response::Ok);
+            }
             let raw = raw_event(sess, event)?;
             if worker_handle_take(&WORKER_EVENTS, raw) {
                 b.event_destroy(raw)?;
@@ -5225,6 +6165,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         .owned_dptrs
                         .iter()
                         .any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .ipc_opened_mem
+                        .iter()
+                        .any(|(&b0, &(sz, _))| p >= b0 && p < b0.saturating_add(sz))
                     || sess
                         .vmm_ranges
                         .lock()
@@ -5611,6 +6555,9 @@ impl Backend for CpuBackend {
         Ok(self.handle())
     }
     fn ctx_destroy(&mut self, _ctx: u64) -> CuResult<()> {
+        Ok(())
+    }
+    fn ctx_set_current(&mut self, _ctx: u64) -> CuResult<()> {
         Ok(())
     }
     fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)> {
@@ -6421,6 +7368,91 @@ mod tests {
             .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
             .collect();
         assert_eq!(c, vec![11., 22., 33., 44.]);
+    }
+
+    #[test]
+    fn auto_graph_signature_ignores_dynamic_parameters_not_shape() {
+        let launch = |pointer: u64, scalar: u32, block_x: u32| Request::LaunchKernel {
+            function: 0x1234,
+            grid: [8, 1, 1],
+            block: [block_x, 1, 1],
+            shared_bytes: 0,
+            stream: pointer + 0x100,
+            params: vec![
+                pointer.to_le_bytes().to_vec(),
+                scalar.to_le_bytes().to_vec(),
+            ],
+        };
+        let a = vec![
+            launch(0x1000, 7, 32),
+            Request::EventRecord {
+                event: 9,
+                stream: 0x1100,
+            },
+        ];
+        let b = vec![
+            launch(0x9000, 11, 32),
+            Request::EventRecord {
+                event: 77,
+                stream: 0x9100,
+            },
+        ];
+        let changed_shape = vec![launch(0x9000, 11, 64), b[1].clone()];
+        assert_eq!(auto_graph_signature(&a), auto_graph_signature(&b));
+        assert_ne!(
+            auto_graph_signature(&a),
+            auto_graph_signature(&changed_shape)
+        );
+    }
+
+    #[test]
+    fn auto_graph_capture_failure_falls_back_to_eager() {
+        let mut sess = Session::default();
+        let mut backend = CpuBackend::default();
+        let first = match dispatch(&mut sess, &mut backend, Request::MemAlloc { bytes: 8 }).1 {
+            Response::Dptr(dptr) => dptr,
+            other => panic!("unexpected allocation response: {other:?}"),
+        };
+        let second = match dispatch(&mut sess, &mut backend, Request::MemAlloc { bytes: 8 }).1 {
+            Response::Dptr(dptr) => dptr,
+            other => panic!("unexpected allocation response: {other:?}"),
+        };
+        let segment = |a, b| Request::AutoGraphSegment {
+            ops: vec![
+                encode_request(&Request::MemsetD8Async {
+                    dptr: first,
+                    value: a,
+                    bytes: 8,
+                    stream: 0,
+                }),
+                encode_request(&Request::MemsetD8Async {
+                    dptr: second,
+                    value: b,
+                    bytes: 8,
+                    stream: 0,
+                }),
+            ],
+        };
+        assert_eq!(dispatch(&mut sess, &mut backend, segment(3, 5)).0, 0);
+        assert_eq!(dispatch(&mut sess, &mut backend, segment(4, 6)).0, 0);
+        assert_eq!(dispatch(&mut sess, &mut backend, segment(5, 7)).0, 0);
+        assert_eq!(dispatch(&mut sess, &mut backend, segment(7, 9)).0, 0);
+        let read = |sess: &mut Session, backend: &mut CpuBackend, dptr| match dispatch(
+            sess,
+            backend,
+            Request::MemcpyDtoH {
+                dptr,
+                bytes: 8,
+                stream: 0,
+            },
+        )
+        .1
+        {
+            Response::Data(data) => data,
+            other => panic!("unexpected copy response: {other:?}"),
+        };
+        assert_eq!(read(&mut sess, &mut backend, first), vec![7; 8]);
+        assert_eq!(read(&mut sess, &mut backend, second), vec![9; 8]);
     }
 
     #[test]

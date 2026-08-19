@@ -141,14 +141,6 @@ pub extern "C" fn cuCtxDetach() -> c_int {
     unsupported(stringify!(cuCtxDetach))
 }
 #[no_mangle]
-pub extern "C" fn cuCtxDisablePeerAccess() -> c_int {
-    unsupported(stringify!(cuCtxDisablePeerAccess))
-}
-#[no_mangle]
-pub extern "C" fn cuCtxEnablePeerAccess() -> c_int {
-    unsupported(stringify!(cuCtxEnablePeerAccess))
-}
-#[no_mangle]
 pub extern "C" fn cuCtxFromGreenCtx() -> c_int {
     unsupported(stringify!(cuCtxFromGreenCtx))
 }
@@ -227,10 +219,6 @@ pub extern "C" fn cuDestroyExternalMemory() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuDestroyExternalSemaphore() -> c_int {
     unsupported(stringify!(cuDestroyExternalSemaphore))
-}
-#[no_mangle]
-pub extern "C" fn cuDeviceCanAccessPeer() -> c_int {
-    unsupported(stringify!(cuDeviceCanAccessPeer))
 }
 #[no_mangle]
 pub extern "C" fn cuDeviceGetDevResource() -> c_int {
@@ -949,30 +937,6 @@ pub extern "C" fn cuImportExternalSemaphore() -> c_int {
     unsupported(stringify!(cuImportExternalSemaphore))
 }
 #[no_mangle]
-pub extern "C" fn cuIpcCloseMemHandle() -> c_int {
-    unsupported(stringify!(cuIpcCloseMemHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcGetEventHandle() -> c_int {
-    unsupported(stringify!(cuIpcGetEventHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcGetMemHandle() -> c_int {
-    unsupported(stringify!(cuIpcGetMemHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcOpenEventHandle() -> c_int {
-    unsupported(stringify!(cuIpcOpenEventHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcOpenMemHandle() -> c_int {
-    unsupported(stringify!(cuIpcOpenMemHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcOpenMemHandle_v2() -> c_int {
-    unsupported(stringify!(cuIpcOpenMemHandle_v2))
-}
-#[no_mangle]
 pub extern "C" fn cuKernelGetLibrary() -> c_int {
     unsupported(stringify!(cuKernelGetLibrary))
 }
@@ -1431,22 +1395,6 @@ pub extern "C" fn cuMemcpyHtoDAsync_v2_ptsz() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuMemcpyHtoD_v2_ptds() -> c_int {
     unsupported(stringify!(cuMemcpyHtoD_v2_ptds))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeer() -> c_int {
-    unsupported(stringify!(cuMemcpyPeer))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeerAsync() -> c_int {
-    unsupported(stringify!(cuMemcpyPeerAsync))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeerAsync_ptsz() -> c_int {
-    unsupported(stringify!(cuMemcpyPeerAsync_ptsz))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeer_ptds() -> c_int {
-    unsupported(stringify!(cuMemcpyPeer_ptds))
 }
 #[no_mangle]
 pub extern "C" fn cuMemcpy_ptds() -> c_int {

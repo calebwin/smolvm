@@ -77,6 +77,12 @@ pub struct CUmemAccessDesc {
     flags: c_int,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct CUipcHandle {
+    reserved: [u8; 64],
+}
+
 /// The CUDA version this shim reports for its own API surface.
 /// CUDA version the driver shim ADVERTISES. Must not overpromise: a real cu12
 /// cuBLASLt that hears "13020" requests 13.x entry points through
@@ -224,6 +230,7 @@ struct ShimState {
     /// Primary-context handle per device (retain is refcounted host-side; the
     /// app-visible handle stays stable per device as the real driver's does).
     primary_ctx: HashMap<i32, u64>,
+    context_devices: HashMap<u64, i32>,
     /// Process-global "current context" stack (bottom = cuCtxSetCurrent slot).
     ctx_stack: Vec<u64>,
     /// Captured graph handle -> exact node count returned by EndCapture.
@@ -266,8 +273,28 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
             // without this a driver-API alloc/launch on the reconnected session
             // faults with INVALID_CONTEXT. The app's own handle stays valid in
             // the shared daemon context; we only need the host thread bound.
-            if !st.primary_ctx.is_empty() {
-                let _ = client.primary_ctx_retain(0);
+            let mut replacements = HashMap::new();
+            for (&device, &old_context) in &st.primary_ctx {
+                if let Ok(new_context) = client.primary_ctx_retain(device) {
+                    replacements.insert(old_context, (device, new_context));
+                }
+            }
+            for context in &mut st.ctx_stack {
+                if let Some((_, replacement)) = replacements.get(context) {
+                    *context = *replacement;
+                }
+            }
+            st.primary_ctx.clear();
+            st.context_devices
+                .retain(|context, _| !replacements.contains_key(context));
+            for (_, (device, context)) in replacements {
+                st.primary_ctx.insert(device, context);
+                st.context_devices.insert(context, device);
+            }
+            if let Some(&current) = st.ctx_stack.last() {
+                if st.context_devices.contains_key(&current) {
+                    let _ = client.ctx_set_current(current);
+                }
             }
             st.client = client;
             st.conn_token = token;
@@ -296,6 +323,7 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
         client,
         param_sizes: HashMap::new(),
         primary_ctx: HashMap::new(),
+        context_devices: HashMap::new(),
         ctx_stack: Vec::new(),
         graph_node_counts: HashMap::new(),
         conn_pid: std::process::id() as i32,
@@ -395,6 +423,31 @@ fn fence_runtime() {
     if p != 0 {
         let f: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(p) };
         f();
+    }
+}
+
+fn translate_runtime_host_pointers(bytes: &mut [u8]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+    let mut pointer = HOOK.load(Ordering::Relaxed);
+    if pointer == 0 {
+        pointer = unsafe {
+            dlsym(
+                std::ptr::null_mut(),
+                c"smolvm_cudart_translate_host_pointers".as_ptr(),
+            )
+        } as usize;
+        if pointer != 0 {
+            HOOK.store(pointer, Ordering::Relaxed);
+        }
+    }
+    if pointer != 0 {
+        let translate: extern "C" fn(*mut u8, usize) -> usize =
+            unsafe { std::mem::transmute(pointer) };
+        translate(bytes.as_mut_ptr(), bytes.len());
     }
 }
 
@@ -890,7 +943,21 @@ pub extern "C" fn cuDriverGetVersion(version: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cuDeviceGetCount(count: *mut c_int) -> c_int {
-    ret(with_state(|s| s.client.device_get_count()).and_then(|v| unsafe { out(count, v) }))
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static DEVICE_COUNT: AtomicI32 = AtomicI32::new(-1);
+    if count.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let cached = DEVICE_COUNT.load(Ordering::Relaxed);
+    if cached >= 0 {
+        return ret(unsafe { out(count, cached) });
+    }
+    ret(
+        with_state(|s| s.client.device_get_count()).and_then(|value| {
+            DEVICE_COUNT.store(value, Ordering::Relaxed);
+            unsafe { out(count, value) }
+        }),
+    )
 }
 
 #[no_mangle]
@@ -1025,11 +1092,27 @@ pub extern "C" fn cuDeviceGetByPCIBusId(device: *mut c_int, pci_bus_id: *const c
     )
 }
 
+#[no_mangle]
+pub extern "C" fn cuDeviceCanAccessPeer(
+    can_access: *mut c_int,
+    device: c_int,
+    peer: c_int,
+) -> c_int {
+    match with_state(|state| state.client.device_can_access_peer(device, peer)) {
+        Ok(value) => ret(unsafe { out(can_access, value) }),
+        Err(error) => error,
+    }
+}
+
 // ---- contexts -------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn cuCtxCreate_v2(pctx: *mut *mut c_void, _flags: c_uint, device: c_int) -> c_int {
-    match with_state(|s| s.client.ctx_create(device)) {
+    match with_state(|s| {
+        let context = s.client.ctx_create(device)?;
+        s.context_devices.insert(context, device);
+        Ok(context)
+    }) {
         Ok(h) => {
             let r = ret(unsafe { out(pctx, h as *mut c_void) });
             if r == CUDA_SUCCESS {
@@ -1049,7 +1132,11 @@ pub extern "C" fn cuCtxCreate_v2(pctx: *mut *mut c_void, _flags: c_uint, device:
 #[no_mangle]
 pub extern "C" fn cuCtxDestroy_v2(ctx: *mut c_void) -> c_int {
     let h = ctx as u64;
-    let r = ret(with_state(|s| s.client.ctx_destroy(h)));
+    let r = ret(with_state(|s| {
+        s.client.ctx_destroy(h)?;
+        s.context_devices.remove(&h);
+        Ok(())
+    }));
     if r == CUDA_SUCCESS {
         if let Ok(mut g) = STATE.lock() {
             if let Some(s) = g.as_mut() {
@@ -1062,19 +1149,21 @@ pub extern "C" fn cuCtxDestroy_v2(ctx: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cuCtxSetCurrent(ctx: *mut c_void) -> c_int {
-    let mut g = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return CUDA_ERROR_UNKNOWN,
-    };
-    if let Err(e) = ensure_connected(&mut g) {
-        return e;
-    }
-    let s = g.as_mut().expect("connected");
-    s.ctx_stack.pop();
-    if !ctx.is_null() {
-        s.ctx_stack.push(ctx as u64);
-    }
-    CUDA_SUCCESS
+    ret(with_state(|s| {
+        let context = ctx as u64;
+        if s.ctx_stack.last().copied().unwrap_or(0) == context {
+            return Ok(());
+        }
+        if context != 0 && !s.context_devices.contains_key(&context) {
+            return Err(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT));
+        }
+        s.client.ctx_set_current(context)?;
+        s.ctx_stack.pop();
+        if context != 0 {
+            s.ctx_stack.push(context);
+        }
+        Ok(())
+    }))
 }
 
 #[no_mangle]
@@ -1109,48 +1198,82 @@ pub extern "C" fn cuCtxPushCurrent_v2(ctx: *mut c_void) -> c_int {
     if ctx.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let mut g = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return CUDA_ERROR_UNKNOWN,
-    };
-    if let Err(e) = ensure_connected(&mut g) {
-        return e;
-    }
-    g.as_mut().expect("connected").ctx_stack.push(ctx as u64);
-    CUDA_SUCCESS
+    ret(with_state(|s| {
+        let context = ctx as u64;
+        s.client.ctx_set_current(context)?;
+        s.ctx_stack.push(context);
+        Ok(())
+    }))
 }
 
 #[no_mangle]
 pub extern "C" fn cuCtxPopCurrent_v2(pctx: *mut *mut c_void) -> c_int {
-    let mut g = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return CUDA_ERROR_UNKNOWN,
-    };
-    if let Err(e) = ensure_connected(&mut g) {
-        return e;
-    }
-    match g.as_mut().expect("connected").ctx_stack.pop() {
-        Some(h) => {
+    match with_state(|s| {
+        let popped = s
+            .ctx_stack
+            .pop()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))?;
+        let current = s.ctx_stack.last().copied().unwrap_or(0);
+        s.client.ctx_set_current(current)?;
+        Ok(popped)
+    }) {
+        Ok(popped) => {
             if !pctx.is_null() {
-                unsafe { *pctx = h as *mut c_void };
+                unsafe { *pctx = popped as *mut c_void };
             }
             CUDA_SUCCESS
         }
-        None => CUDA_ERROR_INVALID_CONTEXT,
+        Err(error) => error,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cuCtxGetDevice(device: *mut c_int) -> c_int {
-    // Single-device model: the current context always belongs to device 0.
-    let mut g = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return CUDA_ERROR_UNKNOWN,
-    };
-    if let Err(e) = ensure_connected(&mut g) {
-        return e;
+    match with_state(|s| {
+        let context = s
+            .ctx_stack
+            .last()
+            .copied()
+            .or_else(|| s.primary_ctx.values().next().copied())
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))?;
+        s.context_devices
+            .get(&context)
+            .copied()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))
+    }) {
+        Ok(ordinal) => ret(unsafe { out(device, ordinal) }),
+        Err(error) => error,
     }
-    ret(unsafe { out(device, 0) })
+}
+
+#[no_mangle]
+pub extern "C" fn cuCtxEnablePeerAccess(peer_ctx: *mut c_void, flags: c_uint) -> c_int {
+    if peer_ctx.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    ret(with_state(|state| {
+        let peer = state
+            .context_devices
+            .get(&(peer_ctx as u64))
+            .copied()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))?;
+        state.client.device_enable_peer_access(peer, flags)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuCtxDisablePeerAccess(peer_ctx: *mut c_void) -> c_int {
+    if peer_ctx.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    ret(with_state(|state| {
+        let peer = state
+            .context_devices
+            .get(&(peer_ctx as u64))
+            .copied()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))?;
+        state.client.device_disable_peer_access(peer)
+    }))
 }
 
 #[no_mangle]
@@ -1206,6 +1329,7 @@ pub extern "C" fn cuDevicePrimaryCtxRetain(pctx: *mut *mut c_void, device: c_int
         }
         let h = s.client.primary_ctx_retain(device)?;
         s.primary_ctx.insert(device, h);
+        s.context_devices.insert(h, device);
         Ok(h)
     });
     match r {
@@ -2735,6 +2859,169 @@ pub extern "C" fn cuMemcpyDtoD_v2(dst: u64, src: u64, bytes: usize) -> c_int {
     ret(with_state(|s| s.client.memcpy_dtod(dst, src, bytes as u64)))
 }
 
+fn memcpy_peer(
+    dst: u64,
+    dst_ctx: *mut c_void,
+    src: u64,
+    src_ctx: *mut c_void,
+    bytes: usize,
+    stream: *mut c_void,
+    synchronize: bool,
+) -> c_int {
+    if (dst == 0 || src == 0 || dst_ctx.is_null() || src_ctx.is_null()) && bytes != 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    ret(with_state(|state| {
+        let dst_device = state
+            .context_devices
+            .get(&(dst_ctx as u64))
+            .copied()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))?;
+        let src_device = state
+            .context_devices
+            .get(&(src_ctx as u64))
+            .copied()
+            .ok_or(CudaRpcError::Cuda(CUDA_ERROR_INVALID_CONTEXT))?;
+        state.client.memcpy_peer_async(
+            dst,
+            dst_device,
+            src,
+            src_device,
+            bytes as u64,
+            stream as u64,
+        )?;
+        if synchronize {
+            state.client.ctx_synchronize()?;
+        }
+        Ok(())
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemcpyPeer(
+    dst: u64,
+    dst_ctx: *mut c_void,
+    src: u64,
+    src_ctx: *mut c_void,
+    bytes: usize,
+) -> c_int {
+    memcpy_peer(
+        dst,
+        dst_ctx,
+        src,
+        src_ctx,
+        bytes,
+        std::ptr::null_mut(),
+        true,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemcpyPeer_ptds(
+    dst: u64,
+    dst_ctx: *mut c_void,
+    src: u64,
+    src_ctx: *mut c_void,
+    bytes: usize,
+) -> c_int {
+    cuMemcpyPeer(dst, dst_ctx, src, src_ctx, bytes)
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemcpyPeerAsync(
+    dst: u64,
+    dst_ctx: *mut c_void,
+    src: u64,
+    src_ctx: *mut c_void,
+    bytes: usize,
+    stream: *mut c_void,
+) -> c_int {
+    memcpy_peer(dst, dst_ctx, src, src_ctx, bytes, stream, false)
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemcpyPeerAsync_ptsz(
+    dst: u64,
+    dst_ctx: *mut c_void,
+    src: u64,
+    src_ctx: *mut c_void,
+    bytes: usize,
+    stream: *mut c_void,
+) -> c_int {
+    cuMemcpyPeerAsync(dst, dst_ctx, src, src_ctx, bytes, stream)
+}
+
+#[no_mangle]
+pub extern "C" fn cuIpcGetMemHandle(handle: *mut CUipcHandle, dptr: u64) -> c_int {
+    if handle.is_null() || dptr == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|state| state.client.ipc_get_mem_handle(dptr)) {
+        Ok(bytes) => {
+            unsafe { (*handle).reserved.copy_from_slice(&bytes) };
+            CUDA_SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuIpcOpenMemHandle(dptr: *mut u64, handle: CUipcHandle, flags: c_uint) -> c_int {
+    if dptr.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|state| {
+        state
+            .client
+            .ipc_open_mem_handle(handle.reserved.to_vec(), flags)
+    }) {
+        Ok(pointer) => ret(unsafe { out(dptr, pointer) }),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuIpcOpenMemHandle_v2(
+    dptr: *mut u64,
+    handle: CUipcHandle,
+    flags: c_uint,
+) -> c_int {
+    cuIpcOpenMemHandle(dptr, handle, flags)
+}
+
+#[no_mangle]
+pub extern "C" fn cuIpcCloseMemHandle(dptr: u64) -> c_int {
+    if dptr == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    ret(with_state(|state| state.client.ipc_close_mem_handle(dptr)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuIpcGetEventHandle(handle: *mut CUipcHandle, event: *mut c_void) -> c_int {
+    if handle.is_null() || event.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|state| state.client.ipc_get_event_handle(event as u64)) {
+        Ok(bytes) => {
+            unsafe { (*handle).reserved.copy_from_slice(&bytes) };
+            CUDA_SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuIpcOpenEventHandle(event: *mut *mut c_void, handle: CUipcHandle) -> c_int {
+    if event.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|state| state.client.ipc_open_event_handle(handle.reserved.to_vec())) {
+        Ok(raw) => ret(unsafe { out(event, raw as *mut c_void) }),
+        Err(code) => code,
+    }
+}
+
 fn pointer_is_device(pointer: u64) -> Result<bool, c_int> {
     let out = cuda_driver_lib_call(2, pointer.to_le_bytes().to_vec())?;
     Ok(out.first().copied() == Some(2))
@@ -3045,6 +3332,64 @@ pub extern "C" fn cuLaunchKernel(
     extra: *mut *mut c_void,
 ) -> c_int {
     let fh = func as u64;
+    if !extra.is_null() {
+        if !kernel_params.is_null() {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        const CU_LAUNCH_PARAM_END: usize = 0;
+        const CU_LAUNCH_PARAM_BUFFER_POINTER: usize = 1;
+        const CU_LAUNCH_PARAM_BUFFER_SIZE: usize = 2;
+        const MAX_PACKED_ARGS: usize = 16 * 1024 * 1024;
+        const MAX_EXTRA_ENTRIES: usize = 32;
+        let mut buffer = std::ptr::null::<u8>();
+        let mut size = None;
+        let mut index = 0usize;
+        let mut terminated = false;
+        while index < MAX_EXTRA_ENTRIES {
+            let key = unsafe { *extra.add(index) } as usize;
+            if key == CU_LAUNCH_PARAM_END {
+                terminated = true;
+                break;
+            }
+            if index + 1 >= MAX_EXTRA_ENTRIES {
+                break;
+            }
+            let value = unsafe { *extra.add(index + 1) };
+            match key {
+                CU_LAUNCH_PARAM_BUFFER_POINTER => buffer = value.cast_const().cast::<u8>(),
+                CU_LAUNCH_PARAM_BUFFER_SIZE => {
+                    if value.is_null() {
+                        return CUDA_ERROR_INVALID_VALUE;
+                    }
+                    size = Some(unsafe { *(value.cast_const().cast::<usize>()) });
+                }
+                _ => return CUDA_ERROR_INVALID_VALUE,
+            }
+            index += 2;
+        }
+        let Some(size) = size else {
+            return CUDA_ERROR_INVALID_VALUE;
+        };
+        if !terminated || size > MAX_PACKED_ARGS || (size != 0 && buffer.is_null()) {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        let mut args = if size == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(buffer, size) }.to_vec()
+        };
+        translate_runtime_host_pointers(&mut args);
+        return ret(with_state(|s| {
+            s.client.launch_kernel_packed(
+                fh,
+                [grid_x, grid_y, grid_z],
+                [block_x, block_y, block_z],
+                shared_bytes,
+                stream as u64,
+                &args,
+            )
+        }));
+    }
     // Argument sizes come from the host's view of the loaded module; fetch once
     // per function and cache.
     let sizes = match with_state(|s| {
@@ -3062,12 +3407,7 @@ pub extern "C" fn cuLaunchKernel(
         Vec::new()
     } else {
         if kernel_params.is_null() {
-            // The `extra` buffer-pointer convention is not implemented.
-            return if extra.is_null() {
-                CUDA_ERROR_INVALID_VALUE
-            } else {
-                CUDA_ERROR_NOT_SUPPORTED
-            };
+            return CUDA_ERROR_INVALID_VALUE;
         }
         let ptrs = unsafe { std::slice::from_raw_parts(kernel_params, sizes.len()) };
         sizes
@@ -3492,6 +3832,7 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuDeviceTotalMem" => cuDeviceTotalMem_v2,
         "cuDeviceGetAttribute" => cuDeviceGetAttribute,
         "cuDeviceGetUuid" => cuDeviceGetUuid,
+        "cuDeviceCanAccessPeer" => cuDeviceCanAccessPeer,
         "cuCtxCreate" => cuCtxCreate_v2,
         "cuCtxDestroy" => cuCtxDestroy_v2,
         "cuCtxSetCurrent" => cuCtxSetCurrent,
@@ -3499,7 +3840,16 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuCtxPushCurrent" => cuCtxPushCurrent_v2,
         "cuCtxPopCurrent" => cuCtxPopCurrent_v2,
         "cuCtxGetDevice" => cuCtxGetDevice,
+        "cuCtxEnablePeerAccess" => cuCtxEnablePeerAccess,
+        "cuCtxDisablePeerAccess" => cuCtxDisablePeerAccess,
         "cuCtxSynchronize" => cuCtxSynchronize,
+        "cuMemcpyPeer" => cuMemcpyPeer,
+        "cuMemcpyPeerAsync" => cuMemcpyPeerAsync,
+        "cuIpcGetMemHandle" => cuIpcGetMemHandle,
+        "cuIpcOpenMemHandle" => cuIpcOpenMemHandle,
+        "cuIpcCloseMemHandle" => cuIpcCloseMemHandle,
+        "cuIpcGetEventHandle" => cuIpcGetEventHandle,
+        "cuIpcOpenEventHandle" => cuIpcOpenEventHandle,
         "cuDevicePrimaryCtxRetain" => cuDevicePrimaryCtxRetain,
         "cuDevicePrimaryCtxRelease" => cuDevicePrimaryCtxRelease_v2,
         "cuDevicePrimaryCtxSetFlags" => cuDevicePrimaryCtxSetFlags_v2,

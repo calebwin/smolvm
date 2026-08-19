@@ -51,11 +51,15 @@ pub enum Op {
     DeviceGetUuid = 0x07,
     DeviceGetPciBusId = 0x08,
     DeviceGetByPciBusId = 0x09,
+    DeviceCanAccessPeer = 0x0A,
+    DeviceEnablePeerAccess = 0x0B,
+    DeviceDisablePeerAccess = 0x0C,
     CtxCreate = 0x10,
     CtxDestroy = 0x11,
     PrimaryCtxRetain = 0x12,
     PrimaryCtxRelease = 0x13,
     CtxGetStreamPriorityRange = 0x14,
+    CtxSetCurrent = 0x15,
     ModuleLoadData = 0x20,
     ModuleGetFunction = 0x21,
     ModuleUnload = 0x22,
@@ -84,6 +88,14 @@ pub enum Op {
     DeviceGetDefaultMemPool = 0x42,
     DeviceGetMemPool = 0x43,
     DeviceSetMemPool = 0x44,
+    MemcpyPeerAsync = 0x45,
+    IpcGetMemHandle = 0x46,
+    IpcOpenMemHandle = 0x47,
+    IpcCloseMemHandle = 0x48,
+    IpcGetEventHandle = 0x49,
+    IpcOpenEventHandle = 0x4A,
+    LaunchKernelPacked = 0x4B,
+    HostGetDevicePointer = 0x4C,
     CtxSynchronize = 0x50,
     StreamCreate = 0x60,
     StreamDestroy = 0x61,
@@ -117,6 +129,10 @@ pub enum Op {
     GraphGetNodes = 0xC9,
     ThreadExchangeCaptureMode = 0xCA,
     GraphExecUpdate = 0xCB,
+    /// A fence-delimited sequence of asynchronous CUDA operations. The host
+    /// executes it eagerly until the shape repeats, then captures and updates
+    /// a cached graph while retaining eager fallback for unsupported segments.
+    AutoGraphSegment = 0xCC,
     // nvcomp (forward-to-host-lib): batched Deflate decompression. Device-pointer
     // args are real host device addresses, forwarded by value.
     NvcompDeflateTempSize = 0x80,
@@ -184,11 +200,15 @@ impl Op {
             0x07 => Op::DeviceGetUuid,
             0x08 => Op::DeviceGetPciBusId,
             0x09 => Op::DeviceGetByPciBusId,
+            0x0A => Op::DeviceCanAccessPeer,
+            0x0B => Op::DeviceEnablePeerAccess,
+            0x0C => Op::DeviceDisablePeerAccess,
             0x10 => Op::CtxCreate,
             0x11 => Op::CtxDestroy,
             0x12 => Op::PrimaryCtxRetain,
             0x13 => Op::PrimaryCtxRelease,
             0x14 => Op::CtxGetStreamPriorityRange,
+            0x15 => Op::CtxSetCurrent,
             0x20 => Op::ModuleLoadData,
             0x21 => Op::ModuleGetFunction,
             0x22 => Op::ModuleUnload,
@@ -217,6 +237,14 @@ impl Op {
             0x42 => Op::DeviceGetDefaultMemPool,
             0x43 => Op::DeviceGetMemPool,
             0x44 => Op::DeviceSetMemPool,
+            0x45 => Op::MemcpyPeerAsync,
+            0x46 => Op::IpcGetMemHandle,
+            0x47 => Op::IpcOpenMemHandle,
+            0x48 => Op::IpcCloseMemHandle,
+            0x49 => Op::IpcGetEventHandle,
+            0x4A => Op::IpcOpenEventHandle,
+            0x4B => Op::LaunchKernelPacked,
+            0x4C => Op::HostGetDevicePointer,
             0x50 => Op::CtxSynchronize,
             0xC0 => Op::StreamBeginCapture,
             0xC1 => Op::StreamEndCapture,
@@ -230,6 +258,7 @@ impl Op {
             0xC9 => Op::GraphGetNodes,
             0xCA => Op::ThreadExchangeCaptureMode,
             0xCB => Op::GraphExecUpdate,
+            0xCC => Op::AutoGraphSegment,
             0x60 => Op::StreamCreate,
             0x61 => Op::StreamDestroy,
             0x62 => Op::StreamSynchronize,
@@ -305,6 +334,17 @@ pub enum Request {
     DeviceGetByPciBusId {
         pci_bus_id: String,
     },
+    DeviceCanAccessPeer {
+        device: i32,
+        peer: i32,
+    },
+    DeviceEnablePeerAccess {
+        peer: i32,
+        flags: u32,
+    },
+    DeviceDisablePeerAccess {
+        peer: i32,
+    },
     CtxCreate {
         device: i32,
     },
@@ -318,6 +358,9 @@ pub enum Request {
         device: i32,
     },
     CtxGetStreamPriorityRange,
+    CtxSetCurrent {
+        ctx: u64,
+    },
     ModuleLoadData {
         image: Vec<u8>,
     },
@@ -446,6 +489,30 @@ pub enum Request {
         device: i32,
         pool: u64,
     },
+    MemcpyPeerAsync {
+        dst: u64,
+        dst_device: i32,
+        src: u64,
+        src_device: i32,
+        bytes: u64,
+        stream: u64,
+    },
+    IpcGetMemHandle {
+        dptr: u64,
+    },
+    IpcOpenMemHandle {
+        handle: Vec<u8>,
+        flags: u32,
+    },
+    IpcCloseMemHandle {
+        dptr: u64,
+    },
+    IpcGetEventHandle {
+        event: u64,
+    },
+    IpcOpenEventHandle {
+        handle: Vec<u8>,
+    },
     /// Launch `function` with the given geometry. `params` is one byte-blob per
     /// kernel argument, in order — the host rebuilds the `void*[]` the Driver
     /// API expects by pointing at local copies of each blob. `stream` is an
@@ -457,6 +524,22 @@ pub enum Request {
         shared_bytes: u32,
         stream: u64,
         params: Vec<Vec<u8>>,
+    },
+    /// Launch using CUDA's packed `CU_LAUNCH_PARAM_BUFFER_POINTER` ABI. This
+    /// preserves compiler-selected argument padding without reconstructing it
+    /// from incomplete per-parameter metadata.
+    LaunchKernelPacked {
+        function: u64,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        stream: u64,
+        args: Vec<u8>,
+    },
+    HostGetDevicePointer {
+        /// 0 = shared-region byte offset, 1 = guest physical address.
+        source: u8,
+        address: u64,
     },
     CtxSynchronize,
     StreamBeginCapture {
@@ -482,6 +565,11 @@ pub enum Request {
     GraphExecUpdate {
         graph_exec: u64,
         graph: u64,
+    },
+    /// Encoded, individually valid requests from one asynchronous segment.
+    /// Nesting is rejected by the host and the aggregate is wire-size bounded.
+    AutoGraphSegment {
+        ops: Vec<Vec<u8>>,
     },
     GraphExecDestroy {
         graph_exec: u64,
@@ -923,6 +1011,20 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::DeviceGetByPciBusId as u8);
             w_str(&mut b, pci_bus_id);
         }
+        Request::DeviceCanAccessPeer { device, peer } => {
+            w_u8(&mut b, Op::DeviceCanAccessPeer as u8);
+            w_i32(&mut b, *device);
+            w_i32(&mut b, *peer);
+        }
+        Request::DeviceEnablePeerAccess { peer, flags } => {
+            w_u8(&mut b, Op::DeviceEnablePeerAccess as u8);
+            w_i32(&mut b, *peer);
+            w_u32(&mut b, *flags);
+        }
+        Request::DeviceDisablePeerAccess { peer } => {
+            w_u8(&mut b, Op::DeviceDisablePeerAccess as u8);
+            w_i32(&mut b, *peer);
+        }
         Request::CtxCreate { device } => {
             w_u8(&mut b, Op::CtxCreate as u8);
             w_i32(&mut b, *device);
@@ -941,6 +1043,10 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         }
         Request::CtxGetStreamPriorityRange => {
             w_u8(&mut b, Op::CtxGetStreamPriorityRange as u8);
+        }
+        Request::CtxSetCurrent { ctx } => {
+            w_u8(&mut b, Op::CtxSetCurrent as u8);
+            w_u64(&mut b, *ctx);
         }
         Request::ModuleLoadData { image } => {
             w_u8(&mut b, Op::ModuleLoadData as u8);
@@ -1076,6 +1182,43 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_i32(&mut b, *device);
             w_u64(&mut b, *pool);
         }
+        Request::MemcpyPeerAsync {
+            dst,
+            dst_device,
+            src,
+            src_device,
+            bytes,
+            stream,
+        } => {
+            w_u8(&mut b, Op::MemcpyPeerAsync as u8);
+            w_u64(&mut b, *dst);
+            w_i32(&mut b, *dst_device);
+            w_u64(&mut b, *src);
+            w_i32(&mut b, *src_device);
+            w_u64(&mut b, *bytes);
+            w_u64(&mut b, *stream);
+        }
+        Request::IpcGetMemHandle { dptr } => {
+            w_u8(&mut b, Op::IpcGetMemHandle as u8);
+            w_u64(&mut b, *dptr);
+        }
+        Request::IpcOpenMemHandle { handle, flags } => {
+            w_u8(&mut b, Op::IpcOpenMemHandle as u8);
+            w_bytes(&mut b, handle);
+            w_u32(&mut b, *flags);
+        }
+        Request::IpcCloseMemHandle { dptr } => {
+            w_u8(&mut b, Op::IpcCloseMemHandle as u8);
+            w_u64(&mut b, *dptr);
+        }
+        Request::IpcGetEventHandle { event } => {
+            w_u8(&mut b, Op::IpcGetEventHandle as u8);
+            w_u64(&mut b, *event);
+        }
+        Request::IpcOpenEventHandle { handle } => {
+            w_u8(&mut b, Op::IpcOpenEventHandle as u8);
+            w_bytes(&mut b, handle);
+        }
         Request::MemcpyHtoD { dptr, stream, data } => {
             w_u8(&mut b, Op::MemcpyHtoD as u8);
             w_u64(&mut b, *dptr);
@@ -1128,6 +1271,31 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
                 w_bytes(&mut b, p);
             }
         }
+        Request::LaunchKernelPacked {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            stream,
+            args,
+        } => {
+            w_u8(&mut b, Op::LaunchKernelPacked as u8);
+            w_u64(&mut b, *function);
+            for v in grid {
+                w_u32(&mut b, *v);
+            }
+            for v in block {
+                w_u32(&mut b, *v);
+            }
+            w_u32(&mut b, *shared_bytes);
+            w_u64(&mut b, *stream);
+            w_bytes(&mut b, args);
+        }
+        Request::HostGetDevicePointer { source, address } => {
+            w_u8(&mut b, Op::HostGetDevicePointer as u8);
+            w_u8(&mut b, *source);
+            w_u64(&mut b, *address);
+        }
         Request::CtxSynchronize => w_u8(&mut b, Op::CtxSynchronize as u8),
         Request::StreamBeginCapture { stream, mode } => {
             w_u8(&mut b, Op::StreamBeginCapture as u8);
@@ -1153,6 +1321,13 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::GraphExecUpdate as u8);
             w_u64(&mut b, *graph_exec);
             w_u64(&mut b, *graph);
+        }
+        Request::AutoGraphSegment { ops } => {
+            w_u8(&mut b, Op::AutoGraphSegment as u8);
+            w_u32(&mut b, ops.len() as u32);
+            for op in ops {
+                w_bytes(&mut b, op);
+            }
         }
         Request::GraphExecDestroy { graph_exec } => {
             w_u8(&mut b, Op::GraphExecDestroy as u8);
@@ -1524,11 +1699,21 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::DeviceGetByPciBusId => Request::DeviceGetByPciBusId {
             pci_bus_id: c.string()?,
         },
+        Op::DeviceCanAccessPeer => Request::DeviceCanAccessPeer {
+            device: c.i32()?,
+            peer: c.i32()?,
+        },
+        Op::DeviceEnablePeerAccess => Request::DeviceEnablePeerAccess {
+            peer: c.i32()?,
+            flags: c.u32()?,
+        },
+        Op::DeviceDisablePeerAccess => Request::DeviceDisablePeerAccess { peer: c.i32()? },
         Op::CtxCreate => Request::CtxCreate { device: c.i32()? },
         Op::CtxDestroy => Request::CtxDestroy { ctx: c.u64()? },
         Op::PrimaryCtxRetain => Request::PrimaryCtxRetain { device: c.i32()? },
         Op::PrimaryCtxRelease => Request::PrimaryCtxRelease { device: c.i32()? },
         Op::CtxGetStreamPriorityRange => Request::CtxGetStreamPriorityRange,
+        Op::CtxSetCurrent => Request::CtxSetCurrent { ctx: c.u64()? },
         Op::ModuleLoadData => Request::ModuleLoadData { image: c.bytes()? },
         Op::ModuleGetFunction => Request::ModuleGetFunction {
             module: c.u64()?,
@@ -1609,6 +1794,22 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             device: c.i32()?,
             pool: c.u64()?,
         },
+        Op::MemcpyPeerAsync => Request::MemcpyPeerAsync {
+            dst: c.u64()?,
+            dst_device: c.i32()?,
+            src: c.u64()?,
+            src_device: c.i32()?,
+            bytes: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::IpcGetMemHandle => Request::IpcGetMemHandle { dptr: c.u64()? },
+        Op::IpcOpenMemHandle => Request::IpcOpenMemHandle {
+            handle: c.bytes()?,
+            flags: c.u32()?,
+        },
+        Op::IpcCloseMemHandle => Request::IpcCloseMemHandle { dptr: c.u64()? },
+        Op::IpcGetEventHandle => Request::IpcGetEventHandle { event: c.u64()? },
+        Op::IpcOpenEventHandle => Request::IpcOpenEventHandle { handle: c.bytes()? },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
             dptr: c.u64()?,
             stream: c.u64()?,
@@ -1650,6 +1851,18 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
                 params,
             }
         }
+        Op::LaunchKernelPacked => Request::LaunchKernelPacked {
+            function: c.u64()?,
+            grid: [c.u32()?, c.u32()?, c.u32()?],
+            block: [c.u32()?, c.u32()?, c.u32()?],
+            shared_bytes: c.u32()?,
+            stream: c.u64()?,
+            args: c.bytes()?,
+        },
+        Op::HostGetDevicePointer => Request::HostGetDevicePointer {
+            source: c.u8()?,
+            address: c.u64()?,
+        },
         Op::CtxSynchronize => Request::CtxSynchronize,
         Op::StreamBeginCapture => Request::StreamBeginCapture {
             stream: c.u64()?,
@@ -1671,6 +1884,20 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             graph_exec: c.u64()?,
             graph: c.u64()?,
         },
+        Op::AutoGraphSegment => {
+            let count = c.u32()? as usize;
+            if count == 0 || count > 512 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid auto-graph segment length",
+                ));
+            }
+            let mut ops = Vec::with_capacity(count);
+            for _ in 0..count {
+                ops.push(c.bytes()?);
+            }
+            Request::AutoGraphSegment { ops }
+        }
         Op::GraphExecDestroy => Request::GraphExecDestroy {
             graph_exec: c.u64()?,
         },
@@ -1911,6 +2138,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::DeviceGetByPciBusId
         | Op::DriverGetVersion
         | Op::DeviceGetAttribute
+        | Op::DeviceCanAccessPeer
         | Op::ThreadExchangeCaptureMode
         | Op::StreamQuery
         | Op::EventQuery
@@ -1923,21 +2151,26 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::PrimaryCtxRetain
         | Op::MemPoolCreate
         | Op::DeviceGetDefaultMemPool
-        | Op::DeviceGetMemPool => Response::Handle(c.u64()?),
+        | Op::DeviceGetMemPool
+        | Op::HostGetDevicePointer => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
-        Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
+        Op::StreamCreate | Op::EventCreate | Op::IpcOpenEventHandle => Response::Handle(c.u64()?),
         Op::EventCreateBatch => Response::Data(c.bytes()?),
         Op::StreamEndCapture => Response::Pair(c.u64()?, c.u64()?),
         Op::CtxGetStreamPriorityRange => Response::Pair(c.u64()?, c.u64()?),
         Op::GraphInstantiate => Response::Handle(c.u64()?),
         Op::GraphGetNodes => Response::Bytes(c.u64()?),
         Op::StreamCaptureInfo => Response::Pair(c.u64()?, c.u64()?),
-        Op::MemAlloc | Op::MemAllocFromPoolAsync | Op::MemAllocAsync => Response::Dptr(c.u64()?),
+        Op::MemAlloc | Op::MemAllocFromPoolAsync | Op::MemAllocAsync | Op::IpcOpenMemHandle => {
+            Response::Dptr(c.u64()?)
+        }
         Op::MemPoolGetAttribute | Op::MemPoolGetAccess => Response::Bytes(c.u64()?),
         Op::MemcpyDtoH
         | Op::DeviceGetUuid
         | Op::FuncGetParamInfo
         | Op::ModuleGetGlobal
+        | Op::IpcGetMemHandle
+        | Op::IpcGetEventHandle
         | Op::PublishTensorBundle => Response::Data(c.bytes()?),
         Op::MemGetInfo => Response::Pair(c.u64()?, c.u64()?),
         // nvcomp calls carry their own nvcompStatus in the body (transport
@@ -1949,12 +2182,16 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
         Op::StreamBeginCapture
         | Op::GraphLaunch
+        | Op::AutoGraphSegment
         | Op::GraphExecDestroy
         | Op::GraphDestroy
         | Op::MemsetD8Async
         | Op::MemcpyDtoDAsync
         | Op::CtxDestroy
+        | Op::CtxSetCurrent
         | Op::PrimaryCtxRelease
+        | Op::DeviceEnablePeerAccess
+        | Op::DeviceDisablePeerAccess
         | Op::ModuleUnload
         | Op::FuncSetAttribute
         | Op::MemFree
@@ -1966,8 +2203,11 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::DeviceSetMemPool
         | Op::MemcpyHtoD
         | Op::MemcpyDtoD
+        | Op::MemcpyPeerAsync
+        | Op::IpcCloseMemHandle
         | Op::MemsetD8
         | Op::LaunchKernel
+        | Op::LaunchKernelPacked
         | Op::CtxSynchronize
         | Op::StreamDestroy
         | Op::StreamSynchronize
@@ -2068,6 +2308,20 @@ mod tests {
             stream: 23,
         });
         roundtrip(Request::DeviceGetDefaultMemPool { device: 0 });
+        roundtrip(Request::AutoGraphSegment {
+            ops: vec![
+                encode_request(&Request::MemsetD8Async {
+                    dptr: 0x1000,
+                    value: 7,
+                    bytes: 64,
+                    stream: 3,
+                }),
+                encode_request(&Request::EventRecord {
+                    event: 9,
+                    stream: 3,
+                }),
+            ],
+        });
         roundtrip(Request::MemcpyHtoD {
             dptr: 0x7f00_0000,
             stream: 0x7001,
@@ -2089,6 +2343,18 @@ mod tests {
                 0x2000u64.to_le_bytes().to_vec(),
                 1024u32.to_le_bytes().to_vec(),
             ],
+        });
+        roundtrip(Request::LaunchKernelPacked {
+            function: 9,
+            grid: [2, 3, 4],
+            block: [32, 2, 1],
+            shared_bytes: 128,
+            stream: 7,
+            args: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+        });
+        roundtrip(Request::HostGetDevicePointer {
+            source: 1,
+            address: 0x1234_5000,
         });
         roundtrip(Request::CtxSynchronize);
     }
@@ -2148,8 +2414,12 @@ mod tests {
         roundtrip(Request::DeviceGetByPciBusId {
             pci_bus_id: "0000:65:00.0".to_string(),
         });
+        roundtrip(Request::DeviceCanAccessPeer { device: 1, peer: 0 });
+        roundtrip(Request::DeviceEnablePeerAccess { peer: 0, flags: 0 });
+        roundtrip(Request::DeviceDisablePeerAccess { peer: 0 });
         roundtrip(Request::PrimaryCtxRetain { device: 0 });
         roundtrip(Request::PrimaryCtxRelease { device: 0 });
+        roundtrip(Request::CtxSetCurrent { ctx: 17 });
         roundtrip(Request::CtxGetStreamPriorityRange);
         roundtrip(Request::ModuleUnload { module: 7 });
         roundtrip(Request::ModuleGetGlobal {
@@ -2166,6 +2436,24 @@ mod tests {
             dst: 0x2000,
             src: 0x1000,
             bytes: 64,
+        });
+        roundtrip(Request::MemcpyPeerAsync {
+            dst: 0x3000,
+            dst_device: 1,
+            src: 0x1000,
+            src_device: 0,
+            bytes: 64,
+            stream: 9,
+        });
+        roundtrip(Request::IpcGetMemHandle { dptr: 0x1000 });
+        roundtrip(Request::IpcOpenMemHandle {
+            handle: vec![7; 64],
+            flags: 1,
+        });
+        roundtrip(Request::IpcCloseMemHandle { dptr: 0x3000 });
+        roundtrip(Request::IpcGetEventHandle { event: 5 });
+        roundtrip(Request::IpcOpenEventHandle {
+            handle: vec![9; 64],
         });
         roundtrip(Request::MemsetD8 {
             dptr: 0x1000,
