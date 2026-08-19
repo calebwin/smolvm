@@ -46,6 +46,7 @@ const CUDA_ERROR_INITIALIZATION: c_int = 3;
 const CUDA_ERROR_INVALID_SYMBOL: c_int = 13;
 const CUDA_ERROR_INVALID_DEVICE_POINTER: c_int = 17;
 const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
+const CUDA_ERROR_ILLEGAL_STATE: c_int = 401;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
@@ -232,13 +233,19 @@ struct ShimState {
     /// interior to a cudaMalloc'd block — `cudaPointerGetAttributes` on one
     /// must still report Device or torch's `getDeviceFromPtr` throws.
     dev_allocs: std::collections::BTreeMap<u64, u64>,
-    /// Active CUDA graph capture, `(root_stream_handle, capture_id)`. Kept
-    /// guest-side so the root-stream hot queries (`cudaStreamIsCapturing`,
-    /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
-    /// answer locally instead of round-tripping. A non-root stream may have
-    /// joined the same capture through an event edge; those queries must ask
-    /// the host driver because only it owns the multi-stream capture DAG.
-    capture: Option<(u64, u64)>,
+    /// Active CUDA graph captures keyed by root stream. Multiple relaxed-mode
+    /// captures may coexist in one process. Root-stream queries stay local;
+    /// side streams use the host capture ID to find the matching local record.
+    captures: HashMap<u64, CaptureRecord>,
+    /// Virtual captured graph handle → exact node count returned alongside the
+    /// synchronous EndCapture response. This makes GraphGetNodes a local,
+    /// truthful query rather than one extra RTT per graph.
+    graph_node_counts: HashMap<u64, usize>,
+    /// Same-flag raw events provisioned in one host round trip. Frameworks
+    /// create/destroy events at very high frequency; keeping a small local
+    /// handle reserve removes synchronous creation RTTs without changing event
+    /// ordering, query, or destruction semantics.
+    event_spares: HashMap<u32, Vec<u64>>,
     /// PID that opened `client`. If the process forks (or a snapshotted VM is
     /// restored as a clone), the inherited socket fd + ring mapping belong to
     /// the parent and are dead here; a mismatch triggers a transparent
@@ -260,6 +267,12 @@ struct ShimState {
     /// first post-fork call), so `with_client_retrying` forces an unconditional
     /// reconnect on its retry instead of trusting the peek.
     force_reconnect: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureRecord {
+    local_id: u64,
+    host_id: Option<u64>,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -304,6 +317,10 @@ fn map_err(e: CudaRpcError) -> c_int {
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
             801 => CUDA_ERROR_NOT_SUPPORTED,
+            // Driver and Runtime capture failures intentionally use the same
+            // numeric range. Preserve them so frameworks can distinguish an
+            // invalidated capture from a transport or unknown device failure.
+            900..=910 => code,
             other => {
                 if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
                     eprintln!("[map-err] unmapped driver code {other}");
@@ -823,7 +840,9 @@ fn with_client<T>(
                 symbols: HashMap::new(),
                 host_allocs: HashMap::new(),
                 dev_allocs: std::collections::BTreeMap::new(),
-                capture: None,
+                captures: HashMap::new(),
+                graph_node_counts: HashMap::new(),
+                event_spares: HashMap::new(),
                 conn_pid: pid,
                 conn_token: token,
                 conn_fd: fd,
@@ -871,7 +890,10 @@ fn with_client<T>(
                 st.conn_pid = pid;
                 st.conn_fd = fd;
                 st.force_reconnect = false;
-                st.capture = None; // any in-flight capture belonged to the parent
+                st.captures.clear(); // in-flight captures belonged to the parent
+                                     // The old session owns and reclaims unused provisioned events;
+                                     // none of its raw handles may be issued after reconnect/fork.
+                st.event_spares.clear();
             }
         }
     }
@@ -2254,19 +2276,39 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
 
 // ---- events (forward to host) -----------------------------------------------
 
+const EVENT_CREATE_BATCH_SIZE: u32 = 64;
+
+fn event_create_cached(event: *mut *mut c_void, flags: c_uint) -> c_int {
+    if event.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|st| {
+            if let Some(handle) = st.event_spares.get_mut(&flags).and_then(Vec::pop) {
+                return Ok(handle);
+            }
+
+            let mut handles = st
+                .client
+                .event_create_batch(flags, EVENT_CREATE_BATCH_SIZE)
+                .map_err(map_err)?;
+            let handle = handles.pop().ok_or(CUDA_ERROR_UNKNOWN)?;
+            st.event_spares.entry(flags).or_default().extend(handles);
+            Ok(handle)
+        }) {
+            Ok(handle) => unsafe { out(event, handle as *mut c_void) },
+            Err(code) => code,
+        },
+    )
+}
+
 #[no_mangle]
 pub extern "C" fn cudaEventCreate(event: *mut *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.event_create(0)) {
-        Ok(h) => unsafe { out(event, h as *mut c_void) },
-        Err(e) => e,
-    })
+    event_create_cached(event, 0)
 }
 #[no_mangle]
 pub extern "C" fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_uint) -> c_int {
-    set_last(match with_client(|c| c.event_create(flags)) {
-        Ok(h) => unsafe { out(event, h as *mut c_void) },
-        Err(e) => e,
-    })
+    event_create_cached(event, flags)
 }
 #[no_mangle]
 pub extern "C" fn cudaEventDestroy(event: *mut c_void) -> c_int {
@@ -2382,58 +2424,97 @@ const CAPTURE_NONE: c_int = 0;
 /// cudaStreamCaptureStatusActive.
 const CAPTURE_ACTIVE: c_int = 1;
 
-/// Resolve capture information while preserving the root-stream zero-RTT path.
-/// CUDA owns side-stream participation: an event recorded on the capturing
-/// stream and waited by another stream adds that stream to the capture DAG, so
-/// local root-only bookkeeping cannot answer a side-stream query correctly.
-fn resolve_capture_info<E>(
-    capture: Option<(u64, u64)>,
-    stream: u64,
-    query_host: impl FnOnce(u64) -> Result<(u64, u64), E>,
-) -> Result<(c_int, u64), E> {
-    match capture {
-        None => Ok((CAPTURE_NONE, 0)),
-        Some((root, local_id)) if root == stream => Ok((CAPTURE_ACTIVE, local_id)),
-        Some((_, local_id)) => {
-            let (status, _) = query_host(stream)?;
-            let status = status as c_int;
-            // The host and guest mint capture IDs independently. Frameworks
-            // require every stream in one capture to report the same ID, so
-            // expose the local root ID for participating side streams.
-            Ok((
-                status,
-                if status == CAPTURE_ACTIVE {
-                    local_id
-                } else {
-                    0
-                },
-            ))
-        }
+fn local_capture_info(captures: &HashMap<u64, CaptureRecord>, stream: u64) -> Option<(c_int, u64)> {
+    if let Some(record) = captures.get(&stream) {
+        Some((CAPTURE_ACTIVE, record.local_id))
+    } else if captures.is_empty() {
+        Some((CAPTURE_NONE, 0))
+    } else {
+        None
     }
 }
 
 fn capture_info_for_stream(s: &mut ShimState, stream: u64) -> Result<(c_int, u64), c_int> {
-    resolve_capture_info(s.capture, stream, |side| {
-        s.client.stream_capture_info(side).map_err(map_err)
-    })
+    if let Some(info) = local_capture_info(&s.captures, stream) {
+        return Ok(info);
+    }
+
+    // CUDA owns side-stream participation: event edges can join a non-root
+    // stream to one of several active captures. Ask the host which capture it
+    // joined, then translate the host's ID to the process-local ID frameworks
+    // use to correlate allocator state.
+    let (status, side_host_id) = s.client.stream_capture_info(stream).map_err(map_err)?;
+    if status as c_int != CAPTURE_ACTIVE {
+        return Ok((status as c_int, 0));
+    }
+    if let Some(record) = s
+        .captures
+        .values()
+        .find(|record| record.host_id == Some(side_host_id))
+    {
+        return Ok((CAPTURE_ACTIVE, record.local_id));
+    }
+
+    // BeginCapture is pipelined, so host IDs are populated lazily only when a
+    // side-stream query needs them. This keeps the common root-only path at
+    // zero RTT while correctly disambiguating concurrent capture DAGs.
+    let unresolved: Vec<u64> = s
+        .captures
+        .iter()
+        .filter_map(|(&root, record)| record.host_id.is_none().then_some(root))
+        .collect();
+    for root in unresolved {
+        let (root_status, root_host_id) = s.client.stream_capture_info(root).map_err(map_err)?;
+        if root_status as c_int == CAPTURE_ACTIVE {
+            if let Some(record) = s.captures.get_mut(&root) {
+                record.host_id = Some(root_host_id);
+                if root_host_id == side_host_id {
+                    return Ok((CAPTURE_ACTIVE, record.local_id));
+                }
+            }
+        }
+    }
+
+    // A capture started outside this runtime shim can still be reported by the
+    // host. Its host ID is already stable, so expose it rather than claiming the
+    // stream is inactive or attaching it to the wrong local capture.
+    Ok((CAPTURE_ACTIVE, side_host_id))
 }
 
 #[no_mangle]
 pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
     set_last(
         match with_state(|s| {
+            let stream = stream as u64;
+            if s.captures.contains_key(&stream) {
+                return Err(CUDA_ERROR_ILLEGAL_STATE);
+            }
             // Fire-and-forget: the host starts capture when this drains, and
             // the (also-deferred) launches record in order. The capture id is
             // torch-visible only (its allocator correlates via the local
             // GetCaptureInfo queries; the host tracks capture by stream), so
-            // mint it locally. Both save a host round-trip per captured graph,
-            // which dominates coldstart over a network (~1400 graphs).
-            s.client
-                .stream_begin_capture_deferred(stream as u64, mode)
-                .map_err(map_err)?;
+            // mint it locally. This saves a host round-trip per captured graph;
+            // EndCapture remains synchronous because it reports invalidation.
+            if s.captures.is_empty() {
+                s.client
+                    .stream_begin_capture_deferred(stream, mode)
+                    .map_err(map_err)?;
+            } else {
+                // Concurrent captures are uncommon and need host validation;
+                // keep only the first/root-only capture on the zero-RTT path.
+                s.client
+                    .stream_begin_capture(stream, mode)
+                    .map_err(map_err)?;
+            }
             static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            s.capture = Some((stream as u64, id));
+            s.captures.insert(
+                stream,
+                CaptureRecord {
+                    local_id: id,
+                    host_id: None,
+                },
+            );
             Ok(())
         }) {
             Ok(()) => CUDA_SUCCESS,
@@ -2447,21 +2528,25 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
     if graph.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
+    unsafe { *graph = std::ptr::null_mut() };
     set_last(
         match with_state(|s| {
-            // Mint a virtual graph handle; the host maps it to the real
-            // captured graph when this deferred end drains.
+            // Mint a virtual graph handle; the host maps it to the real graph.
+            // EndCapture is a validation boundary: it must synchronously report
+            // an invalidated capture and leave `graph` null, matching libcudart.
             let vh = alloc_vhandle();
-            s.client
-                .stream_end_capture_deferred(stream as u64, vh)
+            let node_count = s
+                .client
+                .stream_end_capture(stream as u64, vh)
                 .map_err(map_err)?;
-            s.capture = None;
+            s.captures.remove(&(stream as u64));
+            s.graph_node_counts.insert(vh, node_count as usize);
             Ok(vh)
         }) {
             Ok(g) => unsafe { out(graph, g as *mut c_void) },
             Err(e) => {
                 let _ = with_state(|s| {
-                    s.capture = None;
+                    s.captures.remove(&(stream as u64));
                     Ok(())
                 });
                 e
@@ -2539,10 +2624,10 @@ pub extern "C" fn cudaGraphInstantiateWithFlags(
     }
     set_last(
         match with_client(|c| {
-            // Mint a virtual exec handle; host maps it when this deferred
-            // instantiate drains (graph is itself a virtual graph handle).
+            // Mint a virtual exec handle; the host maps it after validating the
+            // graph. Instantiation errors are synchronous in libcudart.
             let exec_vh = alloc_vhandle();
-            c.graph_instantiate_deferred(graph as u64, exec_vh)?;
+            c.graph_instantiate(graph as u64, exec_vh)?;
             Ok(exec_vh)
         }) {
             Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
@@ -2566,25 +2651,27 @@ pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) 
 /// empty captures. Filling a caller-provided node array is not supported.
 #[no_mangle]
 pub extern "C" fn cudaGraphGetNodes(
-    _graph: *mut c_void,
+    graph: *mut c_void,
     nodes: *mut *mut c_void,
     num_nodes: *mut usize,
 ) -> c_int {
     if num_nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    // The real node list is never requested (nodes != NULL is rejected below);
-    // torch calls this only with nodes = NULL to check for an EMPTY graph and
-    // warn. A captured decode graph is never empty, so answer the count query
-    // locally with a non-zero value instead of a host round-trip — fetching
-    // the true count cost one RTT per captured graph (~1400), dominating
-    // coldstart over a network. (This can only suppress a cosmetic empty-graph
-    // warning, never cause wrong behavior — unlike the fake-data stubs that
-    // were replaced with real values.)
     if !nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    set_last(unsafe { out(num_nodes, 1usize) })
+    set_last(
+        match with_state(|s| {
+            s.graph_node_counts
+                .get(&(graph as u64))
+                .copied()
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)
+        }) {
+            Ok(count) => unsafe { out(num_nodes, count) },
+            Err(error) => error,
+        },
+    )
 }
 
 #[no_mangle]
@@ -2599,10 +2686,15 @@ pub extern "C" fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaGraphDestroy(graph: *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.graph_destroy(graph as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    set_last(
+        match with_state(|s| {
+            s.graph_node_counts.remove(&(graph as u64));
+            s.client.graph_destroy(graph as u64).map_err(map_err)
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 /// Manual graph-build APIs. Conda `libtorch_cuda.so` version-requires these at
@@ -5198,40 +5290,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_info_uses_host_only_for_side_streams() {
-        let mut host_queries = Vec::new();
-        let inactive = resolve_capture_info(None, 22, |stream| {
-            host_queries.push(stream);
-            Ok::<_, ()>((CAPTURE_ACTIVE as u64, 900))
-        })
-        .unwrap();
-        assert_eq!(inactive, (CAPTURE_NONE, 0));
-        assert!(host_queries.is_empty());
-
-        let root = resolve_capture_info(Some((11, 77)), 11, |stream| {
-            host_queries.push(stream);
-            Ok::<_, ()>((CAPTURE_NONE as u64, 0))
-        })
-        .unwrap();
-        assert_eq!(root, (CAPTURE_ACTIVE, 77));
-        assert!(host_queries.is_empty());
-
-        let side = resolve_capture_info(Some((11, 77)), 22, |stream| {
-            host_queries.push(stream);
-            Ok::<_, ()>((CAPTURE_ACTIVE as u64, 900))
-        })
-        .unwrap();
-        assert_eq!(side, (CAPTURE_ACTIVE, 77));
-        assert_eq!(host_queries, [22]);
+    fn capture_info_stays_local_for_independent_roots() {
+        let mut captures = HashMap::new();
+        assert_eq!(local_capture_info(&captures, 22), Some((CAPTURE_NONE, 0)));
+        captures.insert(
+            11,
+            CaptureRecord {
+                local_id: 77,
+                host_id: None,
+            },
+        );
+        captures.insert(
+            22,
+            CaptureRecord {
+                local_id: 88,
+                host_id: None,
+            },
+        );
+        assert_eq!(
+            local_capture_info(&captures, 11),
+            Some((CAPTURE_ACTIVE, 77))
+        );
+        assert_eq!(
+            local_capture_info(&captures, 22),
+            Some((CAPTURE_ACTIVE, 88))
+        );
     }
 
     #[test]
     fn unrelated_side_stream_stays_outside_capture() {
-        let info = resolve_capture_info(Some((11, 77)), 22, |_| {
-            Ok::<_, ()>((CAPTURE_NONE as u64, 0))
-        })
-        .unwrap();
-        assert_eq!(info, (CAPTURE_NONE, 0));
+        let captures = HashMap::from([(
+            11,
+            CaptureRecord {
+                local_id: 77,
+                host_id: None,
+            },
+        )]);
+        assert_eq!(local_capture_info(&captures, 22), None);
+    }
+
+    #[test]
+    fn capture_errors_preserve_runtime_codes() {
+        for code in 900..=910 {
+            assert_eq!(map_err(CudaRpcError::Cuda(code)), code);
+        }
     }
 
     #[test]

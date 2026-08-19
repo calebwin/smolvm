@@ -185,10 +185,6 @@ pub extern "C" fn cuCtxGetSharedMemConfig() -> c_int {
     unsupported(stringify!(cuCtxGetSharedMemConfig))
 }
 #[no_mangle]
-pub extern "C" fn cuCtxGetStreamPriorityRange() -> c_int {
-    unsupported(stringify!(cuCtxGetStreamPriorityRange))
-}
-#[no_mangle]
 pub extern "C" fn cuCtxPopCurrent() -> c_int {
     unsupported(stringify!(cuCtxPopCurrent))
 }
@@ -2075,14 +2071,6 @@ pub extern "C" fn cuStreamGetPriority() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuStreamGetPriority_ptsz() -> c_int {
     unsupported(stringify!(cuStreamGetPriority_ptsz))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamIsCapturing() -> c_int {
-    unsupported(stringify!(cuStreamIsCapturing))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamIsCapturing_ptsz() -> c_int {
-    unsupported(stringify!(cuStreamIsCapturing_ptsz))
 }
 #[no_mangle]
 pub extern "C" fn cuStreamQuery_ptsz() -> c_int {

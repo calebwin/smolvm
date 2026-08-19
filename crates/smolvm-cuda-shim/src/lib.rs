@@ -404,9 +404,14 @@ fn with_state<T>(f: impl FnOnce(&mut ShimState) -> Result<T, CudaRpcError>) -> R
     };
     ensure_connected(&mut guard)?;
     let state = guard.as_mut().expect("connected");
-    f(state).map_err(|e| match e {
-        CudaRpcError::Cuda(code) => code as c_int,
-        CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => CUDA_ERROR_UNKNOWN,
+    f(state).map_err(|e| {
+        if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+            eprintln!("[driver-map-err] {e}");
+        }
+        match e {
+            CudaRpcError::Cuda(code) => code as c_int,
+            CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => CUDA_ERROR_UNKNOWN,
+        }
     })
 }
 
@@ -1146,6 +1151,46 @@ pub extern "C" fn cuCtxGetDevice(device: *mut c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn cuCtxSynchronize() -> c_int {
     ret(with_state(|s| s.client.ctx_synchronize()))
+}
+
+#[no_mangle]
+pub extern "C" fn cuCtxGetStreamPriorityRange(
+    least_priority: *mut c_int,
+    greatest_priority: *mut c_int,
+) -> c_int {
+    match with_state(|s| s.client.ctx_get_stream_priority_range()) {
+        Ok((least, greatest)) => {
+            // The native API permits either output pointer (or both) to be
+            // null; it still validates the current context and returns success.
+            if !least_priority.is_null() {
+                unsafe { least_priority.write(least) };
+            }
+            if !greatest_priority.is_null() {
+                unsafe { greatest_priority.write(greatest) };
+            }
+            CUDA_SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamIsCapturing(stream: *mut c_void, status: *mut c_int) -> c_int {
+    if status.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    match with_state(|s| s.client.stream_capture_info(stream as u64)) {
+        Ok((capture_status, _)) => {
+            unsafe { status.write(capture_status as c_int) };
+            CUDA_SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuStreamIsCapturing_ptsz(stream: *mut c_void, status: *mut c_int) -> c_int {
+    cuStreamIsCapturing(stream, status)
 }
 
 #[no_mangle]
@@ -3137,8 +3182,13 @@ pub extern "C" fn cuEventSynchronize(event: *mut c_void) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn cuEventQuery(_event: *mut c_void) -> c_int {
-    CUDA_SUCCESS
+pub extern "C" fn cuEventQuery(event: *mut c_void) -> c_int {
+    // Preserve both CUDA_SUCCESS and CUDA_ERROR_NOT_READY instead of claiming
+    // that every remoted event has already completed.
+    match with_state(|s| s.client.event_query(event as u64)) {
+        Ok(code) => code,
+        Err(error) => error,
+    }
 }
 
 #[no_mangle]

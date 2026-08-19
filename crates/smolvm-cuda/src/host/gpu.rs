@@ -103,6 +103,7 @@ pub struct GpuBackend {
     ctx_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_set_current: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_get_current: unsafe extern "C" fn(*mut *mut c_void) -> CuResultCode,
+    ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CuResultCode,
     primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
     primary_ctx_release: unsafe extern "C" fn(c_int) -> CuResultCode,
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
@@ -537,6 +538,7 @@ impl GpuBackend {
                 ctx_destroy: sym(&lib, b"cuCtxDestroy_v2\0")?,
                 ctx_set_current: sym(&lib, b"cuCtxSetCurrent\0")?,
                 ctx_get_current: sym(&lib, b"cuCtxGetCurrent\0")?,
+                ctx_get_stream_priority_range: sym(&lib, b"cuCtxGetStreamPriorityRange\0")?,
                 primary_ctx_retain: sym(&lib, b"cuDevicePrimaryCtxRetain\0")?,
                 primary_ctx_release: sym2(
                     &lib,
@@ -1215,6 +1217,17 @@ impl Backend for GpuBackend {
     }
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()> {
         unsafe { chk((self.ctx_destroy)(ctx as *mut c_void)) }
+    }
+    fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)> {
+        let mut least = 0;
+        let mut greatest = 0;
+        unsafe {
+            chk((self.ctx_get_stream_priority_range)(
+                &mut least,
+                &mut greatest,
+            ))?
+        };
+        Ok((least, greatest))
     }
     fn primary_ctx_retain(&mut self, device: i32) -> CuResult<u64> {
         let mut ctx: *mut c_void = std::ptr::null_mut();
