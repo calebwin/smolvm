@@ -2016,19 +2016,35 @@ impl Backend for GpuBackend {
     }
     fn host_get_device_pointer(&mut self, source: u8, address: u64) -> CuResult<u64> {
         let host = match source {
-            0 => crate::shm::get_or_create()
-                .and_then(|region| region.checked(address, 1))
-                .ok_or(CUDA_ERROR_INVALID_VALUE)?,
+            0 => {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::shm::get_or_create()
+                        .and_then(|region| region.checked(address, 1))
+                        .ok_or(CUDA_ERROR_INVALID_VALUE)?
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(CUDA_ERROR_NOT_SUPPORTED);
+                }
+            }
             1 => self.gpa_to_host(address, 1)?,
             _ => return Err(CUDA_ERROR_INVALID_VALUE),
         };
         if source == 0 && !self.shm_pin_tried {
-            self.shm_pin_tried = true;
-            let region = crate::shm::get_or_create().ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
-            let register = self.mem_host_register.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
-            let code = unsafe { register(region.base().cast(), region.len(), 3) };
-            if code != 0 && code != 712 {
-                return Err(code);
+            #[cfg(target_os = "linux")]
+            {
+                self.shm_pin_tried = true;
+                let region = crate::shm::get_or_create().ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+                let register = self.mem_host_register.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+                let code = unsafe { register(region.base().cast(), region.len(), 3) };
+                if code != 0 && code != 712 {
+                    return Err(code);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(CUDA_ERROR_NOT_SUPPORTED);
             }
         } else if source == 1 {
             self.ensure_guest_ram_pinned();
