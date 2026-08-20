@@ -3937,7 +3937,27 @@ fn is_capturable(req: &Request) -> bool {
 }
 
 fn auto_graph_capturable(req: &Request) -> bool {
-    is_capturable(req) && !matches!(req, Request::AutoGraphSegment { .. })
+    // Transparent segments deliberately stop at event records/waits. Those
+    // are safe in an application-coordinated explicit capture, but silently
+    // replaying a framework's synchronization events can violate NCCL/DDP's
+    // cross-process ordering even when CUDA accepts the graph itself.
+    matches!(
+        req,
+        Request::LaunchKernel { .. }
+            | Request::LaunchKernelPacked { .. }
+            | Request::LibCall { .. }
+            | Request::MemsetD8Async { .. }
+            | Request::MemcpyDtoDAsync { .. }
+    )
+}
+
+fn auto_graph_trace(phase: &str, signature: &[u8], ops: usize, status: i32) {
+    if std::env::var_os("SMOLVM_CUDA_AUTO_GRAPH_TRACE").is_some() {
+        eprintln!(
+            "[auto-graph] phase={phase} key={:#x} ops={ops} status={status}",
+            fnv64(signature)
+        );
+    }
 }
 
 fn normalized_id(map: &mut HashMap<u64, u32>, value: u64) -> u32 {
@@ -4259,6 +4279,16 @@ fn execute_auto_graph_segment(
                     b.graph_launch(exec, launch_stream),
                 )
             };
+            auto_graph_trace(
+                if entry.exact_disabled {
+                    "exact-disabled-eager"
+                } else {
+                    "exact-launch"
+                },
+                &signature,
+                reqs.len(),
+                result.as_ref().err().copied().unwrap_or(0),
+            );
             insert_auto_graph_entry(sess, b, signature, entry);
             return record_auto_graph_measurement(
                 sess,
@@ -4286,7 +4316,8 @@ fn execute_auto_graph_segment(
     let updating_existing = entry.exec.is_some();
     let graph = match capture_auto_graph(sess, b, &reqs) {
         Ok(graph) => graph,
-        Err(_) => {
+        Err(error) => {
+            auto_graph_trace("capture-failed", &signature, reqs.len(), error);
             entry.failures = entry.failures.saturating_add(1);
             let result = execute_auto_graph_eager(sess, b, &reqs);
             insert_auto_graph_entry(sess, b, signature, entry);
@@ -4301,6 +4332,7 @@ fn execute_auto_graph_segment(
         }
     };
     if b.graph_get_node_count(graph).unwrap_or(0) == 0 {
+        auto_graph_trace("capture-empty", &signature, reqs.len(), 0);
         let _ = b.graph_destroy(graph);
         entry.failures = 3;
         let result = execute_auto_graph_eager(sess, b, &reqs);
@@ -4367,6 +4399,16 @@ fn execute_auto_graph_segment(
     entry.last_ops = ops;
     entry.failures = 0;
     let result = b.graph_launch(exec, launch_stream);
+    auto_graph_trace(
+        if updating_existing {
+            "update-launch"
+        } else {
+            "capture-launch"
+        },
+        &signature,
+        reqs.len(),
+        result.as_ref().err().copied().unwrap_or(0),
+    );
     insert_auto_graph_entry(sess, b, signature, entry);
     // The first capture/instantiate is promotion overhead, not representative
     // replay cost. It remains unscored; subsequent exact/update executions are

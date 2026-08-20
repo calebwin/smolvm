@@ -273,8 +273,6 @@ fn auto_graph_eligible(req: &Request) -> bool {
             | Request::LibCall { .. }
             | Request::MemsetD8Async { .. }
             | Request::MemcpyDtoDAsync { .. }
-            | Request::EventRecord { .. }
-            | Request::StreamWaitEvent { .. }
     )
 }
 
@@ -870,10 +868,13 @@ impl<S: Read + Write> Client<S> {
         Ok(resp)
     }
 
-    /// Serve a bridged peer: append one pre-encoded request to this
-    /// connection's deferred pipeline, preserving arrival order. In strict
-    /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
-    /// failure status is collected as this connection's sticky error.
+    /// Serve a bridged Driver-API peer: append one pre-encoded request to this
+    /// connection's deferred pipeline, preserving arrival order. Driver work
+    /// is an auto-graph boundary: libraries such as NCCL launch through
+    /// libcuda and require collective, cross-process capture coordination that
+    /// a per-process transparent segment cannot provide. In strict mode
+    /// (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a failure
+    /// status is collected as this connection's sticky error.
     pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
         self.clean = false; // bridged driver-shim work dirties the pipeline
         if !self.defer_enabled {
@@ -886,7 +887,14 @@ impl<S: Read + Write> Client<S> {
             }
             return Ok(());
         }
-        self.enqueue_quiet(payload.to_vec())
+        self.flush_auto_segment()?;
+        if matches!(
+            crate::proto::decode_request(payload),
+            Ok(Request::StreamBeginCapture { .. })
+        ) {
+            self.explicit_capture_depth = self.explicit_capture_depth.saturating_add(1);
+        }
+        self.enqueue_quiet_direct(payload.to_vec())
     }
 
     /// Serve a bridged peer: one pre-encoded synchronous round-trip. Returns
@@ -2265,6 +2273,57 @@ mod tests {
             Request::AutoGraphSegment { ops } => assert_eq!(ops.len(), 2),
             other => panic!("expected auto graph segment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bridged_driver_work_is_an_auto_graph_boundary() {
+        let mut c: Client<std::io::Cursor<Vec<u8>>> = Client::new(std::io::Cursor::new(Vec::new()));
+        c.auto_graph = true;
+        c.launch_kernel(1, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.launch_kernel(2, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        let driver = encode_request(&Request::LaunchKernel {
+            function: 3,
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            shared_bytes: 0,
+            stream: 7,
+            params: Vec::new(),
+        });
+        c.raw_quiet(&driver).unwrap();
+
+        let (journal, _) = c.take_journal();
+        assert_eq!(journal.len(), 2);
+        assert!(matches!(
+            crate::proto::decode_request(&journal[0]),
+            Ok(Request::AutoGraphSegment { ref ops }) if ops.len() == 2
+        ));
+        assert!(matches!(
+            crate::proto::decode_request(&journal[1]),
+            Ok(Request::LaunchKernel { function: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn synchronization_events_are_auto_graph_boundaries() {
+        let mut c: Client<std::io::Cursor<Vec<u8>>> = Client::new(std::io::Cursor::new(Vec::new()));
+        c.auto_graph = true;
+        c.launch_kernel(1, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.launch_kernel(2, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.event_record(9, 7).unwrap();
+
+        let (journal, _) = c.take_journal();
+        assert_eq!(journal.len(), 2);
+        assert!(matches!(
+            crate::proto::decode_request(&journal[0]),
+            Ok(Request::AutoGraphSegment { ref ops }) if ops.len() == 2
+        ));
+        assert!(matches!(
+            crate::proto::decode_request(&journal[1]),
+            Ok(Request::EventRecord {
+                event: 9,
+                stream: 7
+            })
+        ));
     }
 
     #[test]
