@@ -795,6 +795,27 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
+/// `--no-proxy` so the one-time init pull reaches the registry through the same
+/// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
+/// direct in the bake and times out on a proxy-only network.
+fn bake_start_args<'a>(
+    tmp: &'a str,
+    proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut start = vec!["machine", "start", "--name", tmp];
+    if let Some(p) = proxy {
+        start.push("--proxy");
+        start.push(p);
+    }
+    if let Some(n) = no_proxy {
+        start.push("--no-proxy");
+        start.push(n);
+    }
+    start
+}
+
 /// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
 /// return its path. Runs the well-tested `machine create/start/stop` + `pack create
 /// --from-vm` flow as subprocesses of this same binary: create a temp machine from
@@ -806,6 +827,8 @@ fn ensure_init_layer(
     smolfile: Option<&Path>,
     rebuild: bool,
     digest: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> smolvm::Result<PathBuf> {
     // The bake here only ever receives a registry image: `ensure_init_layer` is
     // gated on `image_bakeable()` (local archives/dirs take the direct path),
@@ -920,7 +943,12 @@ fn ensure_init_layer(
 
         println!("  · pulling image and running init...");
         run_smolvm(&exe, &create)?;
-        run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
+        // The image pull happens at `start`; forward the run's proxy so the
+        // bake reaches the registry through a corporate/loopback proxy too —
+        // otherwise a Smolfile with `init` steps pulls direct and times out
+        // even when the outer run was given --proxy.
+        let start = bake_start_args(&tmp, proxy, no_proxy);
+        run_smolvm(&exe, &start)?;
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
         println!("  · snapshotting...");
         run_smolvm(
@@ -1234,6 +1262,8 @@ impl RunCmd {
                 self.smolfile.as_deref(),
                 self.rebuild_init_cache,
                 resolved_digest.as_deref(),
+                self.proxy_opts.proxy(),
+                self.proxy_opts.no_proxy(),
             )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
@@ -1981,6 +2011,41 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bake_start_forwards_proxy_when_set() {
+        // No proxy: plain start.
+        assert_eq!(
+            super::bake_start_args("t", None, None),
+            ["machine", "start", "--name", "t"]
+        );
+        // Proxy only.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://host.smolvm.internal:8118"), None),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://host.smolvm.internal:8118"
+            ]
+        );
+        // Proxy + no_proxy.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://p:3128"), Some("localhost,.internal")),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://p:3128",
+                "--no-proxy",
+                "localhost,.internal"
+            ]
+        );
+    }
+
     #[test]
     fn cp_mode_parses_common_octal_forms_and_rejects_garbage() {
         assert_eq!(super::parse_octal_mode("644").unwrap(), 0o644);
