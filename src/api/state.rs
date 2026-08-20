@@ -72,6 +72,15 @@ pub struct ApiState {
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
+    /// Latest node-wide CUDA inventory and telemetry from the controller's
+    /// existing NVML sampler. The timestamp prevents `/capacity` from
+    /// advertising stale GPUs if the sampling loop stops making progress.
+    cuda_devices: parking_lot::Mutex<
+        Option<(
+            std::time::Instant,
+            Vec<crate::api::admission::GpuDeviceSample>,
+        )>,
+    >,
     /// Advisory wake-up for the automatic fork-pool reconciler. Durable SQLite
     /// state remains authoritative; this only removes the polling delay after a
     /// pool mutation while the periodic pass remains the recovery fallback.
@@ -244,6 +253,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         })
@@ -262,6 +272,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         }
@@ -271,6 +282,28 @@ impl ApiState {
     /// the atomic lease claim path.
     pub fn admission(&self) -> &crate::api::admission::AdmissionRegistry {
         &self.admission
+    }
+
+    /// Publish the latest node-wide CUDA sample. `None` clears previously
+    /// advertised devices after an NVML failure instead of leaving schedulers
+    /// with stale capacity.
+    pub(crate) fn record_cuda_devices(
+        &self,
+        devices: Option<Vec<crate::api::admission::GpuDeviceSample>>,
+    ) {
+        *self.cuda_devices.lock() = devices.map(|devices| (std::time::Instant::now(), devices));
+    }
+
+    /// Return fresh CUDA telemetry for the node capacity endpoint. The pool
+    /// controller samples every second; five seconds leaves ample scheduling
+    /// jitter while failing closed if that controller stalls or exits.
+    pub(crate) fn cuda_devices(&self) -> Option<Vec<crate::api::admission::GpuDeviceSample>> {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+        self.cuda_devices
+            .lock()
+            .as_ref()
+            .filter(|(sampled_at, _)| sampled_at.elapsed() <= MAX_AGE)
+            .map(|(_, devices)| devices.clone())
     }
 
     /// Wake the automatic pool controller after durable pool state changes.
@@ -1558,6 +1591,8 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
             .collect(),
         ports: entry.ports.clone(),
         network: entry.network,
+        gpu: entry.resources.gpu.unwrap_or(false),
+        cuda: entry.resources.cuda.unwrap_or(false),
         network_backend: entry.resources.network_backend,
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
         allowed_hosts: entry.resources.allowed_hosts.clone(),
@@ -1600,6 +1635,25 @@ mod tests {
 
         assert!(notify.notified().now_or_never().is_some());
         assert!(notify.notified().now_or_never().is_none());
+    }
+
+    #[test]
+    fn stale_cuda_inventory_fails_closed() {
+        let (_dir, state) = temp_api_state();
+        state.record_cuda_devices(Some(vec![crate::api::admission::GpuDeviceSample {
+            device_ordinal: 0,
+            uuid: "GPU-test".into(),
+            name: "test".into(),
+            utilization_percent: 0.0,
+            used_memory_mib: 0,
+            free_memory_mib: 80_000,
+            total_memory_mib: 80_000,
+        }]));
+        assert_eq!(state.cuda_devices().unwrap().len(), 1);
+
+        state.cuda_devices.lock().as_mut().unwrap().0 =
+            std::time::Instant::now() - std::time::Duration::from_secs(6);
+        assert!(state.cuda_devices().is_none());
     }
 
     #[test]

@@ -304,11 +304,23 @@ impl ForkPoolController {
         pools: &[ForkPoolRecord],
         sample: bool,
     ) -> Result<(), String> {
-        let gpu = if sample {
-            self.nvml.as_mut().and_then(|nvml| nvml.sample())
+        let gpu_devices = if sample {
+            self.nvml.as_mut().and_then(|nvml| nvml.sample_devices())
         } else {
             None
         };
+        if sample {
+            // Keep node capability reporting on the existing one-second NVML
+            // sampling path. A failed sample clears the cache so the fleet
+            // scheduler fails closed instead of dispatching to stale capacity.
+            self.state.record_cuda_devices(gpu_devices.clone());
+        }
+        let gpu = gpu_devices.as_ref().map(|devices| {
+            devices
+                .iter()
+                .map(|device| (device.device_ordinal, device.admission_sample()))
+                .collect::<std::collections::HashMap<_, _>>()
+        });
         let host_cpu = if sample { self.host_cpu.sample() } else { None };
         let mut observations = Vec::with_capacity(pools.len());
         for pool in pools.iter().filter(|pool| !pool.deleting) {

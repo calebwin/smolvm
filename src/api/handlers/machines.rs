@@ -98,6 +98,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
             })
             .collect(),
         network: record.network,
+        gpu: record.gpu.unwrap_or(false),
+        cuda: record.cuda,
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
         allowed_hosts: record.dns_filter_hosts.clone(),
@@ -3217,7 +3219,7 @@ mod tests {
 
     #[test]
     fn test_record_to_info() {
-        let record = VmRecord::new(
+        let mut record = VmRecord::new(
             "test-vm".to_string(),
             2,
             1024,
@@ -3228,6 +3230,8 @@ mod tests {
             vec![(8080, 80), (3000, 3000)],
             false,
         );
+        record.gpu = Some(true);
+        record.cuda = true;
 
         let info = record_to_info("test-vm", &record);
 
@@ -3238,6 +3242,8 @@ mod tests {
         assert_eq!(info.mounts.len(), 2);
         assert_eq!(info.ports.len(), 2);
         assert!(!info.network);
+        assert!(info.gpu);
+        assert!(info.cuda);
         assert!(info.pid.is_none());
     }
 

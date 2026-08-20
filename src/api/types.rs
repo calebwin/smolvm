@@ -458,6 +458,32 @@ pub struct CapacityResponse {
     /// in-memory VM state) was wiped, so it can prune the now-stale pool records.
     #[serde(default)]
     pub boot_id: String,
+    /// CUDA devices currently visible to this runtime. Omitted when NVML is
+    /// unavailable, no CUDA device is visible, or the latest sample failed.
+    /// Device ordinals use the same CUDA-visible ordering as
+    /// `SMOLVM_CUDA_DEVICE` and fork-pool admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_devices: Option<Vec<CudaDeviceCapacity>>,
+}
+
+/// Live capacity and identity for one host CUDA device.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CudaDeviceCapacity {
+    /// CUDA-visible ordinal used to assign a machine or pool to this device.
+    pub ordinal: u32,
+    /// Stable NVIDIA GPU or MIG UUID.
+    pub uuid: String,
+    /// Device model reported by NVML.
+    pub name: String,
+    /// Current streaming-multiprocessor utilization percentage.
+    pub utilization_percent: f64,
+    /// Current device-memory usage in MiB.
+    pub memory_used_mib: u64,
+    /// Current free device memory in MiB.
+    pub memory_free_mib: u64,
+    /// Total device-memory capacity in MiB.
+    pub memory_total_mib: u64,
 }
 
 // ============================================================================
@@ -626,6 +652,10 @@ pub struct MachineInfo {
     pub ports: Vec<PortSpec>,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Whether Vulkan/graphics GPU acceleration is enabled for this machine.
+    pub gpu: bool,
+    /// Whether transparent CUDA remoting is enabled for this machine.
+    pub cuda: bool,
     /// Network backend the machine runs (`tsi` or `virtio-net`). Echoes back
     /// what `create` accepted; omitted when `create` left it unset (the
     /// launch then picks the contextual default — `virtio-net` under
