@@ -1262,8 +1262,8 @@ impl RunCmd {
                 self.smolfile.as_deref(),
                 self.rebuild_init_cache,
                 resolved_digest.as_deref(),
-                self.proxy_opts.proxy(),
-                self.proxy_opts.no_proxy(),
+                self.proxy_opts.proxy().as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
@@ -1572,8 +1572,8 @@ impl RunCmd {
                 &mut client,
                 img,
                 effective_platform.as_deref(),
-                self.proxy_opts.proxy(),
-                self.proxy_opts.no_proxy(),
+                self.proxy_opts.proxy().as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             ) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net => {
@@ -3533,13 +3533,17 @@ impl StartCmd {
             vm_common::ForkLaunch::default()
         };
         match vm_common::start_vm_named(
-            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+            &name,
+            proxy.as_deref(),
+            no_proxy.as_deref(),
+            /* from_snapshot */ false,
+            fork,
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default(proxy, no_proxy)
+                vm_common::start_vm_default(proxy.as_deref(), no_proxy.as_deref())
             }
             Err(e) => Err(e),
         }
