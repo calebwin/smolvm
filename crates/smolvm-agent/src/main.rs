@@ -100,6 +100,7 @@ mod storage;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
+mod vulkan;
 
 // ============================================================================
 // Configuration Constants
@@ -3532,6 +3533,7 @@ fn write_oci_bundle(
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -4493,6 +4495,7 @@ fn spawn_interactive_command(
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
