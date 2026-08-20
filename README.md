@@ -272,10 +272,6 @@ CUDA API Remoting
 
 CUDA remoting requires an NVIDIA GPU and a working NVIDIA driver on the host. It is not GPU passthrough: the guest receives neither the physical device nor an NVIDIA driver.
 
-Multi-node CUDA uses the standard distributed-process topology: each rank runs in a SmolVM and remotes CUDA to that node's local GPU backend, while NCCL connects ranks over the node network. A backend may expose multiple local GPUs, but one process currently connects to one backend host; a single process cannot enumerate GPUs attached to several remote hosts as if they were local devices.
-
-Fleet orchestrators can poll `GET /capacity` on each `smolvm serve` node. Its optional `cuda_devices` array reports the CUDA-visible ordinal, UUID, model, utilization, and live VRAM for every fresh NVML device sample; the field is omitted when CUDA telemetry is unavailable or stale. Machine API responses also report `cuda`, allowing a control plane to reconcile device assignments without inspecting workload configuration. Node allocation, distributed rank assignment, rendezvous addresses, and whole-job restart policy remain control-plane responsibilities; SmolVM owns the local CUDA backend, workload environment, health signal, and cleanup.
-
 Fork-heavy Linux hosts should use a kernel containing upstream KVM fix
 [`916b7f4`](https://github.com/torvalds/linux/commit/916b7f42b3b3b539a71c204a9b49fdc4ca92cd82).
 Affected kernels can intermittently report `ENOMEM` on the first `KVM_RUN` even
