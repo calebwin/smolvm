@@ -1996,7 +1996,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         return None;
                     }
                     Some(
-                        buf.chunks_exact(3)
+                        buf.as_chunks::<3>()
+                            .0
+                            .iter()
                             .map(|c| (c[0], c[1], c[2]))
                             .collect::<Vec<_>>(),
                     )

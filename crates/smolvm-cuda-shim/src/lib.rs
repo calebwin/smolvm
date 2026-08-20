@@ -1794,8 +1794,8 @@ mod mapped_host_memory {
         file.read_exact_at(&mut entries, (base / PAGE) as u64 * 8)
             .ok()?;
         let mut first = None;
-        for (index, entry) in entries.chunks_exact(8).enumerate() {
-            let entry = u64::from_le_bytes(entry.try_into().unwrap());
+        for (index, entry) in entries.as_chunks::<8>().0.iter().enumerate() {
+            let entry = u64::from_le_bytes(*entry);
             if entry & (1 << 63) == 0 {
                 return None;
             }

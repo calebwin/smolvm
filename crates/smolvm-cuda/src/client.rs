@@ -1449,8 +1449,10 @@ impl<S: Read + Write> Client<S> {
             Op::FuncGetParamInfo,
         )? {
             Response::Data(d) if d.len() % 4 == 0 => Ok(d
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()),
             _ => Err(CudaRpcError::Protocol("expected u32-array Data")),
         }
@@ -1552,8 +1554,10 @@ impl<S: Read + Write> Client<S> {
             Op::EventCreateBatch,
         )? {
             Response::Data(bytes) if bytes.len() == count as usize * 8 => Ok(bytes
-                .chunks_exact(8)
-                .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| u64::from_le_bytes(*chunk))
                 .collect()),
             Response::Data(_) => Err(CudaRpcError::Protocol("invalid event batch length")),
             _ => Err(CudaRpcError::Protocol("expected Data")),

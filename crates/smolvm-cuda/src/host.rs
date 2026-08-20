@@ -4333,8 +4333,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     let (mut found, mut sample) = (0u64, Vec::new());
                     for (cptr, size) in copies {
                         if let Ok(bytes) = b.memcpy_dtoh(cptr, size, 0) {
-                            for ch in bytes.chunks_exact(8) {
-                                let v = u64::from_ne_bytes(ch.try_into().unwrap());
+                            for ch in bytes.as_chunks::<8>().0 {
+                                let v = u64::from_ne_bytes(*ch);
                                 if ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                                     found += 1;
                                     if sample.len() < 6 {

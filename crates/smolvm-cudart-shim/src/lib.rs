@@ -5173,8 +5173,8 @@ fn bn_memo_key(func: u16, args: &[u8]) -> Option<Vec<u8>> {
     let mut key = Vec::with_capacity(args.len() * 4);
     key.extend_from_slice(&func.to_le_bytes());
     key.extend_from_slice(&args[..16]);
-    for chunk in args[16..].chunks_exact(8) {
-        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in args[16..].as_chunks::<8>().0 {
+        let h = u64::from_le_bytes(*chunk);
         if h == 0 {
             key.push(0);
             continue;
