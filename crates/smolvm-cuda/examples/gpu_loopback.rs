@@ -98,8 +98,10 @@ fn main() {
 
     let out = cu.memcpy_dtoh(dc, bytes, 0).expect("d2h");
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
     for i in 0..n {
         let expect = a[i] + b[i]; // i + 3i = 4i
@@ -172,8 +174,10 @@ fn main() {
         .expect("synchronize updated graph");
     let updated = cu.memcpy_dtoh(dc, bytes, stream).expect("updated d2h");
     let updated: Vec<f32> = updated
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
     for (i, &value) in updated.iter().enumerate() {
         let expect = (2 * i) as f32;
