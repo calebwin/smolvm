@@ -231,8 +231,8 @@ fn main() {
         let auto = cu
             .memcpy_dtoh(dd, bytes, stream)
             .expect("auto graph output");
-        for (i, value) in auto.chunks_exact(4).enumerate() {
-            let value = f32::from_le_bytes(value.try_into().unwrap());
+        for (i, value) in auto.as_chunks::<4>().0.iter().enumerate() {
+            let value = f32::from_le_bytes(*value);
             let expect = (7 * i) as f32;
             if (value - expect).abs() > 1e-2 {
                 eprintln!("gpu_loopback: auto graph mismatch at {i}: got {value} want {expect}");
