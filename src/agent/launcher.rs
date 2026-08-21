@@ -480,10 +480,14 @@ impl LaunchFeatures {
             return Ok(self);
         }
 
-        if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
+        let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
+        if !marker_present || !smolvm_pack::extract::cached_layers_usable(layers_cache_dir) {
             // Fallback: layers not yet extracted into this machine's own dir
-            // (pre-this-layout machine, or an interrupted create). Extract from
-            // the source bundle, which must still be present in that case.
+            // (pre-this-layout machine, or an interrupted create), OR the
+            // extraction marker survived while the layer files themselves were
+            // deleted (cache cleaners take the large files and leave the tiny
+            // marker). Extract from the source bundle, which must still be
+            // present in that case; force past the marker when it lies.
             let sidecar = Path::new(sidecar_path);
             if !sidecar.exists() {
                 return Err(Error::agent(
@@ -496,10 +500,22 @@ impl LaunchFeatures {
                     ),
                 ));
             }
+            if marker_present {
+                tracing::info!(
+                    cache = %layers_cache_dir.display(),
+                    "layer cache marked extracted but unusable; re-extracting from the source bundle"
+                );
+            }
             let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(sidecar, layers_cache_dir, &footer, false, false)
-                .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(
+                sidecar,
+                layers_cache_dir,
+                &footer,
+                marker_present,
+                false,
+            )
+            .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         }
 
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)

@@ -118,7 +118,13 @@ pub fn collect_from_vm_assets(
     let mut image_env: Vec<String> = Vec::new();
 
     if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
+        export_flattened_from_artifact_sourced(
+            collector,
+            vm_name,
+            &vm_dir,
+            staging_dir,
+            vm.source_smolmachine.as_deref(),
+        )?;
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
         // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
@@ -403,17 +409,37 @@ fn export_flattened_from_artifact_sourced(
     vm_name: &str,
     vm_dir: &Path,
     _staging_dir: &Path,
+    source_smolmachine: Option<&str>,
 ) -> crate::Result<()> {
     let cache_dir = machine_layers_cache_dir(vm_name);
-    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
-    let layer_ids = ordered_cached_layer_ids(&pack_content_dir).ok_or_else(|| {
+    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
+    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+    // Self-heal a missing or damaged layer cache from the machine's source
+    // artifact (a cache cleaner can delete the layer files while leaving the
+    // extraction marker, in which case a start does NOT re-extract either —
+    // the old "start the machine once" advice was a dead end there). Only the
+    // per-machine cache is healed here; a shared-store entry heals at boot.
+    if layer_ids.is_none() && pack_content_dir == cache_dir {
+        if let Some(sidecar) = source_smolmachine.map(Path::new).filter(|s| s.exists()) {
+            eprintln!("Imported layer cache is missing; re-extracting from the source artifact...");
+            let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+                .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, true, false)
+                .map_err(|e| Error::agent("re-extract source artifact", e.to_string()))?;
+            layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+        }
+    }
+    let layer_ids = layer_ids.ok_or_else(|| {
         Error::agent(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}). Start the machine once to \
-                 re-extract it, then re-run the export.",
-                pack_content_dir.display()
+                 imported layer cache is missing ({}) and could not be rebuilt: \
+                 the source artifact ({}) is not available. Restore the source \
+                 .smolmachine at that path, or start the machine once to \
+                 re-extract, then re-run the export.",
+                pack_content_dir.display(),
+                source_smolmachine.unwrap_or("unknown path"),
             ),
         )
     })?;

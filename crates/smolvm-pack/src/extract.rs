@@ -758,6 +758,35 @@ pub fn is_extracted(cache_dir: &Path) -> bool {
     cache_dir.join(EXTRACTION_MARKER).exists()
 }
 
+/// Whether an extraction's `layers/` cache is structurally usable: every id in
+/// its `layer-order` index resolves to a layer dir or staged tar, or (with no
+/// index) at least one layer entry exists. The extraction MARKER only proves an
+/// extraction once finished — a cache cleaner that deletes the large layer
+/// files but leaves the tiny marker produces a cache that passes `is_extracted`
+/// yet can neither boot nor export, and the marker then blocks the re-extract
+/// that would repair it. Callers that need the layers should require BOTH.
+pub fn cached_layers_usable(cache_dir: &Path) -> bool {
+    let layers_dir = cache_dir.join("layers");
+    let has_form =
+        |id: &str| layers_dir.join(id).is_dir() || layers_dir.join(format!("{id}.tar")).is_file();
+    if let Ok(contents) = fs::read_to_string(layers_dir.join("layer-order")) {
+        let ids: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect();
+        return !ids.is_empty() && ids.iter().all(|id| has_form(id));
+    }
+    fs::read_dir(&layers_dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let path = e.path();
+                path.is_dir() || path.extension().is_some_and(|x| x == "tar")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Maximum total size of the pack extraction cache before LRU eviction kicks in.
 /// Override with `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes); default 5 GiB.
 pub fn pack_cache_max_bytes() -> u64 {
@@ -2500,6 +2529,27 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_layers_usable_requires_the_layers_not_just_the_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path();
+        // Marker alone (a cache cleaner deleted the layer files): unusable.
+        fs::write(cache.join(EXTRACTION_MARKER), "").unwrap();
+        assert!(!cached_layers_usable(cache));
+        // Order file whose ids all resolve (dir or staged tar): usable.
+        let layers = cache.join("layers");
+        fs::create_dir_all(layers.join("aaa")).unwrap();
+        fs::write(layers.join("bbb.tar"), "x").unwrap();
+        fs::write(layers.join("layer-order"), "aaa\nbbb\n").unwrap();
+        assert!(cached_layers_usable(cache));
+        // An id in the order with no backing form: unusable again.
+        fs::write(layers.join("layer-order"), "aaa\nbbb\nccc\n").unwrap();
+        assert!(!cached_layers_usable(cache));
+        // No order file, at least one layer entry: usable (legacy caches).
+        fs::remove_file(layers.join("layer-order")).unwrap();
+        assert!(cached_layers_usable(cache));
+    }
 
     #[test]
     fn shared_artifact_digest_rejects_a_different_artifact_for_the_same_store() {
