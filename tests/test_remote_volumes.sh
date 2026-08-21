@@ -16,7 +16,7 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3' got '$2')"; 
 
 CREDS="--env AWS_ACCESS_KEY_ID=smoltest --env AWS_SECRET_ACCESS_KEY=smoltest123 --env AWS_ENDPOINT_URL=http://100.96.0.1:9000"
 RCLONE_REMOTE=':s3,provider=Minio,access_key_id=smoltest,secret_access_key=smoltest123,endpoint="http://100.96.0.1:9000"'
-NAMES="rv-minio rv-ver rv-rw rv-ro rv-notools rv-badremote rv-sf rv-api"
+NAMES="rv-minio rv-ver rv-rw rv-ro rv-notools rv-badremote rv-sf rv-api rv-svc"
 cleanup() { for n in $NAMES; do $S machine delete --name "$n" --force >/dev/null 2>&1; done; }
 cleanup
 
@@ -144,6 +144,19 @@ else
   kill "$SERVE_PID" 2>/dev/null
   rm -f "$RVSOCK"
 fi
+
+# ---- 11. service image keeps its own entrypoint AND still mounts -----------
+# No `--` command: the image's ENTRYPOINT/CMD is resolved inside the guest and
+# must still run. The agent wraps the mount AROUND that resolved command
+# (`sh -c '<mounts> && exec "$@"' sh <argv>`); a host-side wrap only saw the
+# empty request command and would replace nginx with a bare mount stub.
+$S machine create --name rv-svc --image nginx:alpine --net --net-backend virtio-net $CREDS \
+  --init "apk add -q rclone fuse3" -v "s3://rv-bucket:/mnt/svc" >/dev/null 2>&1
+$S machine start --name rv-svc >/dev/null 2>&1
+GOT=$($S machine exec --name rv-svc -- sh -c 'pgrep -x nginx >/dev/null 2>&1 && echo up' 2>/dev/null)
+check "service entrypoint runs under a remote volume" "$GOT" "up"
+$S machine exec --name rv-svc -- sh -c 'echo svc-1 > /mnt/svc/svc.txt && sync && sleep 5' >/dev/null 2>&1
+check "service-image mount write visible out-of-band" "$(oob svc.txt)" "svc-1"
 
 cleanup
 echo ""
