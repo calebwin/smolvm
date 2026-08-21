@@ -86,7 +86,16 @@ check "8MB sha256 integrity out-of-band" "$H2" "$H1"
 $S machine create --name rv-ro --image alpine:latest --net --net-backend virtio-net $CREDS \
   --init "apk add -q rclone fuse3" -v "s3://rv-bucket:/mnt/q:ro" -- sleep infinity >/dev/null 2>&1
 $S machine start --name rv-ro >/dev/null 2>&1
-OUT=$($S machine exec --name rv-ro -- sh -c 'echo x > /mnt/q/no.txt 2>&1 || true' 2>/dev/null)
+# Assert only once the ro rclone mount is actually live in the container ns —
+# before that a write lands in the overlay dir and would falsely "succeed".
+OUT=""
+n=0; while [ $n -lt 12 ]; do
+  if $S machine exec --name rv-ro -- sh -c 'grep -q " /mnt/q " /proc/mounts' 2>/dev/null; then
+    OUT=$($S machine exec --name rv-ro -- sh -c 'echo x > /mnt/q/no.txt 2>&1 || true' 2>/dev/null)
+    break
+  fi
+  n=$((n+1)); sleep 1
+done
 echo "$OUT" | grep -qi "read-only" && ok "ro mount rejects writes" || bad "ro mount rejects writes"
 
 # ---- 8. fork of a remote-volume golden is refused cleanly -----------------
@@ -164,9 +173,14 @@ fi
 $S machine create --name rv-svc --image nginx:alpine --net --net-backend virtio-net $CREDS \
   --init "apk add -q rclone fuse3" -v "s3://rv-bucket:/mnt/svc" >/dev/null 2>&1
 $S machine start --name rv-svc >/dev/null 2>&1
-# The wrap execs into the image entrypoint, so nginx becomes PID 1 — check
-# /proc/1/comm rather than pgrep (absent/limited in nginx:alpine's busybox).
-GOT=$($S machine exec --name rv-svc -- sh -c '[ "$(cat /proc/1/comm)" = nginx ] && echo up' 2>/dev/null)
+# The wrap execs into the image entrypoint, so nginx becomes PID 1 after a brief
+# sh -> docker-entrypoint.sh -> exec nginx transition — poll /proc/1/comm rather
+# than probe once (and it sidesteps busybox pgrep quirks).
+GOT=
+n=0; while [ $n -lt 15 ]; do
+  [ "$($S machine exec --name rv-svc -- sh -c 'cat /proc/1/comm' 2>/dev/null)" = nginx ] && { GOT=up; break; }
+  n=$((n+1)); sleep 1
+done
 check "service entrypoint runs under a remote volume" "$GOT" "up"
 $S machine exec --name rv-svc -- sh -c 'echo svc-1 > /mnt/svc/svc.txt && sync && sleep 5' >/dev/null 2>&1
 check "service-image mount write visible out-of-band" "$(oob svc.txt)" "svc-1"
