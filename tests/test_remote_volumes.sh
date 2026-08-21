@@ -31,7 +31,18 @@ done
 $S machine create --name rv-ver --image alpine:latest --net --net-backend virtio-net >/dev/null 2>&1
 $S machine start --name rv-ver >/dev/null 2>&1
 $S machine exec --name rv-ver -- sh -c "apk add -q rclone >/dev/null 2>&1; rclone mkdir '$RCLONE_REMOTE:rv-bucket' 2>/dev/null" >/dev/null 2>&1
-oob() { $S machine exec --name rv-ver -- sh -c "rclone cat '$RCLONE_REMOTE:rv-bucket/$1' 2>/dev/null"; }
+# Read an object back OUT-OF-BAND, polling up to ~20s: rclone's vfs cache
+# uploads writes asynchronously, so a fixed post-write sleep races the flush
+# under load. Poll until the object lands (or give up and return what we have).
+oob() {
+  _v=""
+  i=0; while [ $i -lt 20 ]; do
+    _v=$($S machine exec --name rv-ver -- sh -c "rclone cat '$RCLONE_REMOTE:rv-bucket/$1' 2>/dev/null")
+    [ -n "$_v" ] && break
+    i=$((i+1)); sleep 1
+  done
+  echo "$_v"
+}
 
 # ---- 1. parse rejections happen at create, with hints ---------------------
 OUT=$($S machine create --name rv-x --image alpine:latest --net -v "s3://b:relative" -- sleep infinity 2>&1)
@@ -153,7 +164,9 @@ fi
 $S machine create --name rv-svc --image nginx:alpine --net --net-backend virtio-net $CREDS \
   --init "apk add -q rclone fuse3" -v "s3://rv-bucket:/mnt/svc" >/dev/null 2>&1
 $S machine start --name rv-svc >/dev/null 2>&1
-GOT=$($S machine exec --name rv-svc -- sh -c 'pgrep -x nginx >/dev/null 2>&1 && echo up' 2>/dev/null)
+# The wrap execs into the image entrypoint, so nginx becomes PID 1 — check
+# /proc/1/comm rather than pgrep (absent/limited in nginx:alpine's busybox).
+GOT=$($S machine exec --name rv-svc -- sh -c '[ "$(cat /proc/1/comm)" = nginx ] && echo up' 2>/dev/null)
 check "service entrypoint runs under a remote volume" "$GOT" "up"
 $S machine exec --name rv-svc -- sh -c 'echo svc-1 > /mnt/svc/svc.txt && sync && sleep 5' >/dev/null 2>&1
 check "service-image mount write visible out-of-band" "$(oob svc.txt)" "svc-1"
