@@ -2016,6 +2016,24 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // A Stdin/Resize frame at the TOP level is a stray leftover from a
+        // just-ended interactive session: that session's async FrameWriter can
+        // flush a still-queued EOF-stdin or resize frame during teardown, after
+        // the session's own request/response already completed. It has no
+        // interactive session to apply to (interactive Run/VmExec/PodStart
+        // consume their own stdin/resize internally), and it is fire-and-forget
+        // — the host never awaits a response to it. Drop it silently; replying
+        // with an error here instead desynchronizes the stream, because the host
+        // reads that error as the response to its NEXT request (e.g. a detached
+        // workload launch during a remote-volume start), failing it spuriously.
+        if matches!(
+            &request,
+            AgentRequest::Stdin { .. } | AgentRequest::Resize { .. }
+        ) {
+            debug!("ignoring stray stdin/resize outside an interactive session");
+            continue;
+        }
+
         // Check if this is an interactive run request
         if let AgentRequest::Run {
             interactive: true, ..
