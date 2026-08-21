@@ -851,6 +851,21 @@ const ARCHIVE_CONFIG_FILE: &str = "config.json";
 /// Marker written once a flatten completes, so restarts reuse it.
 const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
 
+/// Scratch space for archive staging, on the storage disk. The guest's `/tmp`
+/// is a tmpfs sized from VM RAM, so multi-GiB scratch — crane's stdin spool,
+/// the decompressed copy of a compressed archive — must land on the machine's
+/// disk instead: a 10 GB `docker save` archive would otherwise fill `/tmp`
+/// while `/storage` sits idle (#955). Falls back to the default temp dir when
+/// the storage disk is absent (host-side unit tests).
+fn archive_scratch_dir() -> PathBuf {
+    let dir = Path::new(STORAGE_ROOT).join("tmp");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        dir
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
 /// flatten it once into a rootfs on the storage disk and return that directory
 /// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
@@ -951,7 +966,7 @@ where
     // streaming decompressor into a subprocess's stdin. The guest ships no zstd
     // tool, so decompression is done in-process.
     let mut reader = decompress_layer_reader(file)?;
-    let mut tmp = tempfile::NamedTempFile::new()
+    let mut tmp = tempfile::NamedTempFile::new_in(archive_scratch_dir())
         .map_err(|e| StorageError::new(format!("failed to create temp file: {e}")))?;
     copy_with_progress(
         &mut reader,
@@ -1137,6 +1152,10 @@ where
     let mut crane = Command::new("crane");
     crane
         .args(["export", "-", "-"])
+        // crane spools the stdin tarball to a temp file before flattening it;
+        // point that at the storage disk so an archive bigger than the RAM-sized
+        // /tmp tmpfs doesn't fail with a full filesystem (#955).
+        .env("TMPDIR", archive_scratch_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Capture (don't discard) crane's stderr so a failure reports the REAL
