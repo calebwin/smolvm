@@ -3086,31 +3086,31 @@ pub fn run_command(
         let workdir_str = workdir.unwrap_or("/");
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
-        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
-        spec.add_gpu_devices_if_available();
 
-        // Add virtiofs bind mounts to OCI spec
-        for (tag, container_path, read_only) in mounts {
-            let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
-            spec.add_bind_mount(
-                &virtiofs_mount.to_string_lossy(),
-                container_path,
-                *read_only,
-            );
-        }
-
-        add_workspace_fallback(&mut spec, mounts);
-        add_storage_fallback(&mut spec, mounts, unprivileged);
-
-        // Forward SSH agent into the container if enabled at boot.
-        crate::ssh_agent::inject_into_container(&mut spec);
-        crate::publish_socket::inject_into_container(&mut spec);
-        crate::forkpoint::inject_into_container(&mut spec);
-        crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
-
-        // Write config.json to bundle
-        spec.write_to(&bundle_path)
-            .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+        // Build an OCI spec for `cmd` sharing this overlay's rootfs, virtiofs
+        // mounts, workspace/storage fallbacks, and the same injections. Used for
+        // both the one-shot exec spec and the keep-alive spec so a container the
+        // execs join has the identical mount view as the exec itself.
+        let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
+            let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
+            spec.add_gpu_devices_if_available();
+            for (tag, container_path, read_only) in mounts {
+                let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+                spec.add_bind_mount(
+                    &virtiofs_mount.to_string_lossy(),
+                    container_path,
+                    *read_only,
+                );
+            }
+            add_workspace_fallback(&mut spec, mounts);
+            add_storage_fallback(&mut spec, mounts, unprivileged);
+            // Forward SSH agent + published sockets + forkpoint if enabled at boot.
+            crate::ssh_agent::inject_into_container(&mut spec);
+            crate::publish_socket::inject_into_container(&mut spec);
+            crate::forkpoint::inject_into_container(&mut spec);
+            crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
+            spec
+        };
 
         // If a main workload container is running for this overlay, join it
         // via crun exec instead of creating a fresh isolated container.
@@ -3120,10 +3120,41 @@ pub fn run_command(
             return result;
         }
 
-        // Generate unique container ID for this execution
-        let container_id = generate_container_id();
+        // Persistent overlay with no keep-alive container. This is the fork-clone
+        // path: the clone's restored keep-alive was reaped as stale during the
+        // remount above, and without re-establishing one every exec would pay a
+        // fresh container (~seconds) instead of a `crun exec` join (~ms).
+        // Establish a keep-alive (PID 1 = `tail -f /dev/null`) sharing this
+        // overlay's mounts, persist its id so subsequent execs join it, then
+        // exec the command INTO it.
+        if let Some(overlay_id) = persistent_overlay_id {
+            let keepalive = [
+                "tail".to_string(),
+                "-f".to_string(),
+                "/dev/null".to_string(),
+            ];
+            match establish_keepalive_container(
+                &build_spec(&keepalive, env),
+                &bundle_path,
+                overlay_id,
+            ) {
+                Ok(cid) => {
+                    let result =
+                        run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+                    let _ = mounted_paths;
+                    return result;
+                }
+                Err(e) => {
+                    warn!(error = %e, "keep-alive main container setup failed; running in a fresh container")
+                }
+            }
+        }
 
-        // Run with crun
+        // Ephemeral overlay (or keep-alive setup failed): one-shot fresh container.
+        let spec = build_spec(command, env);
+        spec.write_to(&bundle_path)
+            .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+        let container_id = generate_container_id();
         let result = run_with_crun(
             &bundle_path,
             &container_id,
@@ -3508,6 +3539,65 @@ fn detach_mount(path: &Path) {
 ///
 /// This uses `crun run` which creates, starts, waits, and deletes the container
 /// in a single operation. Stdout and stderr are captured.
+/// Establish a long-lived keep-alive main container for a persistent overlay so
+/// that this and every subsequent exec joins it via `crun exec` (~ms) instead of
+/// launching a fresh container (~seconds). `spec` is the keep-alive OCI spec
+/// (PID 1 = `tail -f /dev/null`) already carrying this overlay's rootfs, mounts,
+/// and injections; it is written into `bundle_dir`. Returns the new container id,
+/// persisted under `persistent-<overlay_id>` so `resolve_main_container` finds it.
+///
+/// This mirrors `crate::ensure_main_container` (the machine-start / interactive
+/// path) for the fork-clone case: a clone's restored keep-alive is reaped as
+/// stale on the first exec's remount, and without re-establishing one here every
+/// clone exec would one-shot a fresh container.
+fn establish_keepalive_container(
+    spec: &OciSpec,
+    bundle_dir: &Path,
+    overlay_id: &str,
+) -> Result<String> {
+    spec.write_to(bundle_dir)
+        .map_err(|e| StorageError::new(format!("failed to write keep-alive OCI spec: {}", e)))?;
+
+    let container_id = generate_container_id();
+
+    let create = CrunCommand::create(bundle_dir, &container_id)
+        .output()
+        .map_err(|e| StorageError::new(format!("keep-alive crun create failed: {}", e)))?;
+    if !create.status.success() {
+        return Err(StorageError::new(format!(
+            "keep-alive crun create failed: {}",
+            String::from_utf8_lossy(&create.stderr).trim()
+        )));
+    }
+
+    let start = CrunCommand::start(&container_id)
+        .output()
+        .map_err(|e| StorageError::new(format!("keep-alive crun start failed: {}", e)))?;
+    if !start.status.success() {
+        let _ = CrunCommand::delete(&container_id, true).output();
+        return Err(StorageError::new(format!(
+            "keep-alive crun start failed: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        )));
+    }
+
+    let workload_id = format!("persistent-{}", overlay_id);
+    if let Err(e) = std::fs::write(
+        paths::main_container_id_path(&workload_id),
+        container_id.as_bytes(),
+    ) {
+        let _ = CrunCommand::kill(&container_id, "SIGKILL").status();
+        let _ = CrunCommand::delete(&container_id, true).output();
+        return Err(StorageError::new(format!(
+            "failed to persist keep-alive container id: {}",
+            e
+        )));
+    }
+
+    info!(container_id = %container_id, overlay_id = %overlay_id, "established keep-alive main container for clone exec");
+    Ok(container_id)
+}
+
 /// Join a running container via `crun exec` (non-interactive).
 fn run_exec_in_container(
     container_id: &str,
