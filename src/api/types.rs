@@ -130,8 +130,13 @@ pub struct ResourceSpec {
 // ============================================================================
 
 /// Request to execute a command in a machine.
+///
+/// `deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a
+/// silent no-op. This matters for the safety fields (`timeoutSecs`, etc.) — a
+/// caller who writes `timeout_secs` must be told, not left running an untrusted
+/// command with no timeout because the field was quietly dropped.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["echo", "hello"]))]
@@ -282,8 +287,11 @@ pub struct WarmArtifactResponse {
 }
 
 /// Request to run a command in an image.
+///
+/// `deny_unknown_fields`: like `ExecRequest`, a mis-cased safety field
+/// (`timeout_secs` for `timeoutSecs`) is a 400, never a silent drop.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunRequest {
     /// Image to run in.
     #[schema(example = "python:3.12-alpine")]
@@ -1177,6 +1185,45 @@ pub struct ForkLeaseInfo {
     /// Activation failure, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod deny_unknown_field_tests {
+    use super::*;
+
+    /// The correct camelCase `timeoutSecs` deserializes and applies.
+    #[test]
+    fn exec_request_accepts_camelcase_timeout() {
+        let req: ExecRequest = serde_json::from_value(
+            serde_json::json!({"command": ["sleep", "30"], "timeoutSecs": 5}),
+        )
+        .expect("camelCase timeoutSecs should parse");
+        assert_eq!(req.timeout_secs, Some(5));
+    }
+
+    /// A mis-cased safety field is REJECTED, not silently dropped — otherwise an
+    /// untrusted command runs with no timeout because the caller wrote
+    /// `timeout_secs`. This is the regression this test guards.
+    #[test]
+    fn exec_request_rejects_snake_case_timeout() {
+        let err = serde_json::from_value::<ExecRequest>(
+            serde_json::json!({"command": ["sleep", "30"], "timeout_secs": 5}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timeout_secs"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Any unknown field is a hard error, not ignored.
+    #[test]
+    fn run_request_rejects_unknown_field() {
+        assert!(serde_json::from_value::<RunRequest>(
+            serde_json::json!({"image": "alpine", "command": ["true"], "bogus": 1})
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]

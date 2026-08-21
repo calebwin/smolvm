@@ -589,11 +589,15 @@ pub struct RunCmd {
     #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB", help_heading = "Resources")]
     pub mem: u32,
 
-    /// Storage disk size in GiB
+    /// Writable data disk size in GiB (default 20). Bounds how much a workload
+    /// can write: a disk-heavy or untrusted command fills this disk (ENOSPC),
+    /// never the host. This is the flag to lower when sandboxing untrusted code.
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub storage: Option<u64>,
 
-    /// Overlay disk size in GiB
+    /// Container rootfs overlay (copy-on-write upper layer) size in GiB. NOT the
+    /// writable-data cap — use --storage to bound how much a workload can write.
+    /// Rarely needs setting.
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
 
