@@ -57,20 +57,33 @@ pub fn launch_image_workload(
     exec_env: Vec<(String, String)>,
 ) -> crate::Result<bool> {
     let Some(ref image) = record.image else {
+        // Remote volumes mount inside a workload container, which a machine with
+        // no image never launches — honoring the volume is impossible. Fail
+        // loudly instead of silently dropping it.
+        if !record.remote_volumes.is_empty() {
+            return Err(crate::Error::agent(
+                "launch workload",
+                "remote volumes require an image-backed machine — there is no \
+                 workload container to mount into",
+            ));
+        }
         return Ok(false);
     };
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
     // Remote volumes mount inside the workload container (the one namespace
-    // exec/shell sessions join), so the workload command is wrapped with the
-    // mount script; see `crate::remote_volume::wrap_workload_command`.
-    if !record.remote_volumes.is_empty() {
-        command = crate::remote_volume::wrap_workload_command(
+    // exec/shell sessions join). Build the mount SCRIPT here but let the AGENT
+    // run it ahead of the image-resolved command — wrapping host-side would only
+    // see the empty request command and replace a service image's own entrypoint
+    // with a mount stub. See `crate::remote_volume::mount_script`.
+    let remote_volume_mount = if record.remote_volumes.is_empty() {
+        None
+    } else {
+        Some(crate::remote_volume::mount_script(
             &record.remote_volumes,
             &exec_env,
-            command,
-        )?;
-    }
+        )?)
+    };
     match client.run_container_detached(
         RunConfig::new(image, command)
             .with_env(exec_env)
@@ -80,7 +93,8 @@ pub fn launch_image_workload(
             .with_persistent_overlay(Some(persistent_overlay_owner(
                 machine_name,
                 record.golden.as_deref(),
-            ))),
+            )))
+            .with_remote_volume_mount(remote_volume_mount),
     ) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {

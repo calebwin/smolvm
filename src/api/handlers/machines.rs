@@ -1233,13 +1233,17 @@ pub async fn start_machine(
         env.extend(crate::secrets::expose_into_env(
             super::record_secret_refs_env(&entry)?,
         ));
-        // Remote volumes mount inside the workload container; every launch
-        // path must wrap the command or the mounts are silently absent.
-        if !record.remote_volumes.is_empty() {
-            command =
-                crate::remote_volume::wrap_workload_command(&record.remote_volumes, &env, command)
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        }
+        // Remote volumes mount inside the workload container; build the mount
+        // script here and let the agent run it ahead of the image-resolved
+        // command, so a service image's own entrypoint is preserved.
+        let remote_volume_mount = if record.remote_volumes.is_empty() {
+            None
+        } else {
+            Some(
+                crate::remote_volume::mount_script(&record.remote_volumes, &env)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            )
+        };
         let workdir = record.workdir.clone();
         let user = record.user.clone();
         let mounts_config = {
@@ -1308,7 +1312,8 @@ pub async fn start_machine(
                 .with_workdir(workdir)
                 .with_user(user)
                 .with_mounts(mounts_config)
-                .with_persistent_overlay(Some(overlay_id));
+                .with_persistent_overlay(Some(overlay_id))
+                .with_remote_volume_mount(remote_volume_mount);
             c.run_container_detached(config).map(|_| ())
         })
         .await;

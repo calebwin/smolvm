@@ -2336,6 +2336,10 @@ fn handle_request(
             persistent_overlay_id,
             stdin_data,
             background,
+            // Remote volumes only ride the detached workload launch
+            // (`run_container_detached`, `detached: true`); every synchronous or
+            // background Run sets this to None, so there is nothing to mount here.
+            remote_volume_mount: _,
         } => {
             if background {
                 handle_run_background(
@@ -3244,6 +3248,7 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id,
         unprivileged,
+        remote_volume_mount,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3256,6 +3261,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
+            remote_volume_mount,
             ..
         } => (
             image,
@@ -3268,6 +3274,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
+            remote_volume_mount,
         ),
         _ => {
             send_response(
@@ -3315,7 +3322,14 @@ fn handle_interactive_run(
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
     // interactive path can't drop the image's Env/WorkingDir/User either.
-    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user) {
+    let launch = match ResolvedLaunch::resolve(
+        &image,
+        command,
+        env,
+        workdir,
+        user,
+        remote_volume_mount.as_deref(),
+    ) {
         Ok(l) => l,
         Err(e) => {
             maybe_cleanup(&prepared.workload_id);
@@ -3416,6 +3430,7 @@ impl ResolvedLaunch {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         user: Option<String>,
+        remote_volume_mount: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
             format!("image not found: {image}").into()
@@ -3424,18 +3439,39 @@ impl ResolvedLaunch {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
             if resolved.is_empty() {
-                // The host's workload launcher matches on this exact phrase to
-                // downgrade a metadata-less image (e.g. a bare rootfs
-                // directory) to a bare-agent boot instead of failing the
-                // machine start — keep the wording stable.
-                return Err(format!(
-                    "no command given and image '{image}' defines no entrypoint or cmd"
-                )
-                .into());
+                if remote_volume_mount.is_some() {
+                    // Remote volumes mount inside the workload container, which
+                    // exec/shell join. An image with no entrypoint would
+                    // otherwise downgrade to a bare-agent boot with nowhere for
+                    // the mount to live — give it a keep-alive workload so the
+                    // FUSE mount persists and is reachable.
+                    vec!["sleep".to_string(), "infinity".to_string()]
+                } else {
+                    // The host's workload launcher matches on this exact phrase
+                    // to downgrade a metadata-less image (e.g. a bare rootfs
+                    // directory) to a bare-agent boot instead of failing the
+                    // machine start — keep the wording stable.
+                    return Err(format!(
+                        "no command given and image '{image}' defines no entrypoint or cmd"
+                    )
+                    .into());
+                }
+            } else {
+                resolved
             }
-            resolved
         } else {
             command
+        };
+        // Remote volumes: run the mount script, then exec the RESOLVED workload
+        // command in its place — so a service image's real entrypoint runs (not
+        // a mount stub) and exec/shell sessions joining this container's
+        // namespace see the mount. Wrapping *here*, after resolution, is what
+        // keeps the image's own entrypoint from being clobbered when the request
+        // gave no command (the bug when the wrap lived host-side, which only saw
+        // the empty request command).
+        let command = match remote_volume_mount {
+            Some(script) if !script.is_empty() => wrap_command_with_mount(script, command),
+            _ => command,
         };
         Ok(Self {
             command,
@@ -3444,6 +3480,21 @@ impl ResolvedLaunch {
             user: user.or(info.user),
         })
     }
+}
+
+/// Prepend a remote-volume mount script to a resolved workload command:
+/// `sh -c "<script> && exec \"$@\"" sh <cmd...>`. The mount runs in the workload
+/// container's mount namespace, then `exec` replaces the shell with the real
+/// command so PID-1 semantics and signal delivery are unchanged.
+fn wrap_command_with_mount(script: &str, command: Vec<String>) -> Vec<String> {
+    let mut argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("{script} && exec \"$@\""),
+        "sh".to_string(),
+    ];
+    argv.extend(command);
+    argv
 }
 
 /// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
@@ -3558,36 +3609,47 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, command, env, workdir, user, mounts, persistent_overlay_id, unprivileged) =
-        match request {
-            AgentRequest::Run {
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                persistent_overlay_id,
-                unprivileged,
-                ..
-            } => (
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                persistent_overlay_id,
-                unprivileged,
-            ),
-            _ => {
-                send_response(
-                    stream,
-                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-                )?;
-                return Ok(());
-            }
-        };
+    let (
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        persistent_overlay_id,
+        unprivileged,
+        remote_volume_mount,
+    ) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            unprivileged,
+            remote_volume_mount,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            unprivileged,
+            remote_volume_mount,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
 
     // An empty command is allowed here: it means "run the image's own
     // ENTRYPOINT/CMD". We resolve it from the image config below, after the
@@ -3643,7 +3705,14 @@ fn handle_run_detached(
     // (command, Env, WorkingDir, User) with the request layered on top.
     // `write_oci_bundle` requires a `ResolvedLaunch`, so the image config can't be
     // silently dropped here or on any other launch path.
-    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user) {
+    let launch = match ResolvedLaunch::resolve(
+        &image,
+        command,
+        env,
+        workdir,
+        user,
+        remote_volume_mount.as_deref(),
+    ) {
         Ok(l) => l,
         Err(e) => {
             send_response(
@@ -5343,6 +5412,9 @@ fn run_background_in_keepalive(
         env.to_vec(),
         workdir.map(str::to_string),
         user.map(str::to_string),
+        // Keep-alive/exec path: it JOINS the workload container that already
+        // holds the remote-volume mount, so no mount is established here.
+        None,
     )?;
 
     let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
@@ -5482,6 +5554,9 @@ fn run_in_keepalive_container(
         env.to_vec(),
         workdir.map(str::to_string),
         user.map(str::to_string),
+        // Keep-alive/exec path: it JOINS the workload container that already
+        // holds the remote-volume mount, so no mount is established here.
+        None,
     )?;
 
     // Reuse the running keep-alive container, or establish one now so this and
@@ -6472,6 +6547,29 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The mount script runs BEFORE the resolved workload command, and that
+    // command — an image's own ENTRYPOINT+CMD when the request gives none — must
+    // survive intact. Wrapping is `sh -c '<mounts> && exec "$@"' sh <argv...>`,
+    // so `$@` is the untouched argv and `exec` hands the container PID to it.
+    #[test]
+    fn wrap_command_with_mount_preserves_the_resolved_command() {
+        let wrapped = wrap_command_with_mount(
+            "rclone mount a && rclone mount b",
+            vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon off;".to_string(),
+            ],
+        );
+        assert_eq!(&wrapped[..2], &["/bin/sh".to_string(), "-c".to_string()]);
+        assert_eq!(
+            wrapped[2],
+            "rclone mount a && rclone mount b && exec \"$@\""
+        );
+        // `sh` is $0; the workload argv follows verbatim as $1.. — not replaced.
+        assert_eq!(&wrapped[3..], &["sh", "nginx", "-g", "daemon off;"]);
+    }
 
     #[cfg(target_os = "linux")]
     fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {

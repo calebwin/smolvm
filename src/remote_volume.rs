@@ -286,28 +286,13 @@ pub fn verify_command(volumes: &[RemoteVolume]) -> Option<String> {
 /// container exists for exec sessions to join. Machines whose image CMD exits
 /// immediately (an interactive shell, say) should be created with a
 /// long-lived command such as `-- sleep infinity`.
-pub fn wrap_workload_command(
-    volumes: &[RemoteVolume],
-    env: &[(String, String)],
-    command: Vec<String>,
-) -> crate::Result<Vec<String>> {
-    let script = mount_commands(volumes, env)?.join(" && ");
-    Ok(if command.is_empty() {
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            format!("{script} && exec sleep infinity"),
-        ]
-    } else {
-        let mut argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            format!("{script} && exec \"$@\""),
-            "sh".to_string(),
-        ];
-        argv.extend(command);
-        argv
-    })
+/// Build the remote-volume mount script — the `&&`-joined mount commands — that
+/// the agent runs inside the workload container, ahead of the image-resolved
+/// workload command. The agent (not the host) does the wrapping, so a service
+/// image's own ENTRYPOINT still runs rather than being replaced by a mount stub,
+/// and an image with no command falls back to a keep-alive holder there.
+pub fn mount_script(volumes: &[RemoteVolume], env: &[(String, String)]) -> crate::Result<String> {
+    Ok(mount_commands(volumes, env)?.join(" && "))
 }
 
 #[cfg(test)]
@@ -408,20 +393,23 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_preserves_the_workload_argv_and_holds_commandless_machines() {
+    fn mount_script_is_the_joined_mount_commands_not_a_wrapper() {
+        // The host builds only the mount SCRIPT; the agent wraps it ahead of the
+        // image-resolved command (so a service image's entrypoint is preserved).
         let vols = split(&["s3://bucket:/mnt/d:ro"]).1;
-        let wrapped = wrap_workload_command(
-            &vols,
-            &[],
-            vec!["nginx".into(), "-g".into(), "daemon off;".into()],
-        )
-        .unwrap();
-        assert_eq!(&wrapped[..2], &["/bin/sh".to_string(), "-c".to_string()]);
-        assert!(wrapped[2].ends_with("&& exec \"$@\""));
-        assert_eq!(&wrapped[3..], &["sh", "nginx", "-g", "daemon off;"]);
-
-        let holder = wrap_workload_command(&vols, &[], vec![]).unwrap();
-        assert!(holder[2].ends_with("&& exec sleep infinity"));
+        let script = mount_script(&vols, &[]).unwrap();
+        assert!(
+            script.contains("rclone"),
+            "script mounts via rclone: {script}"
+        );
+        assert!(
+            script.contains("/mnt/d"),
+            "script targets the guest path: {script}"
+        );
+        assert!(
+            !script.contains("exec \"$@\"") && !script.contains("sleep infinity"),
+            "wrapping is the agent's job now, not the host's: {script}"
+        );
     }
 
     #[test]

@@ -432,6 +432,13 @@ pub enum AgentRequest {
         /// Incompatible with `interactive` and `tty`.
         #[serde(default)]
         background: bool,
+        /// Remote-volume mount script to run inside the workload container
+        /// before its (image-resolved) command. Wrapping in the agent — after
+        /// the image ENTRYPOINT/CMD is resolved — is what lets a service image's
+        /// real entrypoint still run; a host-side wrap only saw the empty
+        /// request command and would replace the workload with a mount stub.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_volume_mount: Option<String>,
     },
 
     /// Send stdin data to a running interactive command.
