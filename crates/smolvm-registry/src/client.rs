@@ -9,7 +9,7 @@
 
 use crate::{OciIndex, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{
-    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LINK, LOCATION, WWW_AUTHENTICATE,
+    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LINK, LOCATION, RANGE, WWW_AUTHENTICATE,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -27,6 +27,32 @@ const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 /// [`RegistryClient::pull_blob_stream`], which streams to disk. 64 MiB is a
 /// generous ceiling that still bounds the in-memory buffer.
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long to wait for a connection to the registry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a response may go without delivering any bytes.
+///
+/// This is a gap-between-reads deadline, NOT a deadline on the whole transfer,
+/// which is the distinction that matters for a multi-hundred-megabyte layer: a
+/// slow-but-progressing download runs as long as it needs, while a registry that
+/// accepts the connection and then goes silent fails in seconds. A whole-request
+/// `timeout()` cannot be used here — it would abort large healthy pulls. Without
+/// either one, a half-open connection parks the caller forever: the request task
+/// never wakes, and enough of them turn a node into one that accepts creates and
+/// completes none.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The shared HTTP client for every registry request, with the deadlines above.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        // A builder failure here means no TLS backend; the default client at
+        // least keeps the caller working (timeouts are the thing lost).
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// Buffer a response body into memory, refusing to read more than `cap` bytes.
 ///
@@ -102,7 +128,7 @@ impl RegistryClient {
     /// Create a new client for the given registry base URL.
     pub fn new(base_url: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http_client(),
             base_url,
             auth_token: None,
             identity_token: None,
@@ -487,7 +513,58 @@ impl RegistryClient {
         self.resolve_location(loc)
     }
 
-    /// Download a blob as a byte stream.
+    /// Download a blob as a byte stream, optionally resuming at `offset`.
+    ///
+    /// Returns the stream and the byte offset the body actually begins at: the
+    /// requested `offset` when the registry honored the range (206), or 0 when it
+    /// ignored the header and restarted the whole blob (200). A caller resuming a
+    /// partial file MUST truncate it when 0 comes back, or it would concatenate a
+    /// second copy onto the first and fail the digest check.
+    ///
+    /// Resuming matters for large layers: without it, a transfer that breaks near
+    /// the end restarts from byte zero, so a registry dropping connections at a
+    /// consistent point means the download never converges no matter how many
+    /// times it is retried.
+    ///
+    /// Returns the stream after verifying the response status. The caller is
+    /// responsible for digest verification (hash while writing to disk).
+    pub async fn pull_blob_stream_from(
+        &self,
+        repo: &str,
+        digest: &str,
+        offset: u64,
+    ) -> Result<(
+        impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>,
+        u64,
+    )> {
+        validate_digest(digest)?;
+        let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
+        let mut req = self.request(reqwest::Method::GET, &url);
+        if offset > 0 {
+            req = req.header(RANGE, format!("bytes={offset}-"));
+        }
+        let resp = self.send_replayable(req).await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(digest.to_string()));
+        }
+
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let resumed_at = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            offset
+        } else {
+            0
+        };
+        Ok((resp.bytes_stream(), resumed_at))
+    }
+
+    /// Download a blob as a byte stream from the beginning.
     ///
     /// Returns the stream after verifying the response status. The caller is
     /// responsible for digest verification (hash while writing to disk).

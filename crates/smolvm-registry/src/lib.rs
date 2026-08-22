@@ -161,6 +161,13 @@ pub enum RegistryError {
     #[error("blob not found: {0}")]
     BlobNotFound(String),
 
+    #[error("blob download stalled after {received} of {total} bytes: {digest}")]
+    DownloadStalled {
+        digest: String,
+        received: u64,
+        total: u64,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
