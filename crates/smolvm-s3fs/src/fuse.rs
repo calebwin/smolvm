@@ -69,6 +69,12 @@ pub struct Attr {
 }
 
 impl Attr {
+    /// Serialise into the kernel's `fuse_attr` layout.
+    ///
+    /// Only a mounted session replies to the kernel, and that is Linux-only, so
+    /// off Linux the sole caller is the layout test — without this gate the
+    /// method reads as dead code and fails a `-D warnings` build there.
+    #[cfg(any(target_os = "linux", test))]
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.ino.to_ne_bytes());
         out.extend_from_slice(&self.size.to_ne_bytes());
