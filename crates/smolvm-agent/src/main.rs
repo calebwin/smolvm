@@ -3939,6 +3939,24 @@ pub fn crun_container_pid(container_id: &str) -> Option<u32> {
         container_id,
         std::path::Path::new(paths::CRUN_ROOT_DIR),
         std::path::Path::new("/proc"),
+        true,
+    )
+}
+
+/// PID of a container that has been created but not yet started.
+///
+/// [`crun_container_pid`] deliberately reports nothing until `crun start`
+/// releases the container, because its callers are asking "can I exec into
+/// this?". Mounting happens in exactly that window: after `create` the
+/// namespaces exist and PID 1 is parked on `exec.fifo`, which is precisely when
+/// a volume must be mounted so the workload's first instruction already sees it.
+#[cfg(target_os = "linux")]
+pub fn crun_created_container_pid(container_id: &str) -> Option<u32> {
+    crun_container_pid_at(
+        container_id,
+        std::path::Path::new(paths::CRUN_ROOT_DIR),
+        std::path::Path::new("/proc"),
+        false,
     )
 }
 
@@ -3947,6 +3965,7 @@ fn crun_container_pid_at(
     container_id: &str,
     state_root: &std::path::Path,
     proc_root: &std::path::Path,
+    require_running: bool,
 ) -> Option<u32> {
     if !valid_crun_container_id(container_id) {
         return None;
@@ -3957,7 +3976,7 @@ fn crun_container_pid_at(
     // crun leaves exec.fifo present until `crun start` releases a created
     // container. The old `crun state` path reported that state as `created`,
     // not `running`; preserve that distinction without entering crun.
-    if state_dir.join("exec.fifo").exists() {
+    if require_running && state_dir.join("exec.fifo").exists() {
         return None;
     }
 

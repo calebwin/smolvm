@@ -155,8 +155,9 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Called between `crun create` and `crun start`, so the workload's first
 /// instruction already sees the data.
+#[cfg(target_os = "linux")]
 pub fn mount_all(container_id: &str, specs: &[MountSpec]) -> Result<(), String> {
-    let pid = crate::crun_container_pid(container_id)
+    let pid = crate::crun_created_container_pid(container_id)
         .ok_or_else(|| format!("container {container_id} has no pid"))?;
 
     for spec in specs {
@@ -192,6 +193,7 @@ pub fn mount_all(container_id: &str, specs: &[MountSpec]) -> Result<(), String> 
 /// Read from the container's own `mountinfo` rather than the agent's: the mount
 /// is deliberately invisible from outside that namespace, so checking the
 /// agent's view would always report failure.
+#[cfg(target_os = "linux")]
 fn mount_is_present(pid: u32, mountpoint: &str) -> bool {
     let Ok(mounts) = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
         return false;
