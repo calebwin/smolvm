@@ -5622,10 +5622,29 @@ fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
 /// lets a process this command backgrounds (a `dockerd`, a dev server, a k3d
 /// cluster) survive into later execs for the machine's lifetime. Returns the
 /// captured result; the caller falls back to a fresh container on error.
+/// Deletes a container when dropped, or does nothing when there is none.
+///
+/// An ephemeral `run` establishes its own container so a remote volume can be
+/// mounted between create and start. Nothing will ever rejoin that container,
+/// so it has to go when the run returns — including on the error paths, which
+/// is why this is a guard rather than a call at the end.
+#[cfg(target_os = "linux")]
+struct EphemeralContainer(Option<String>);
+
+#[cfg(target_os = "linux")]
+impl Drop for EphemeralContainer {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            let _ = crun::CrunCommand::kill(&id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&id, true).output();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn run_in_keepalive_container(
-    overlay_id: &str,
+    overlay_id: Option<&str>,
     image: &str,
     command: &[String],
     env: &[(String, String)],
@@ -5655,22 +5674,35 @@ fn run_in_keepalive_container(
     // every later exec join the same container (PID 1 = smolvm's child reaper).
     // Also carry the container's rootfs so the user can be resolved against its
     // /etc/passwd below.
-    let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
-        Some(c) => (c, storage::persistent_overlay_rootfs(overlay_id)),
-        None => {
-            let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
+    // An ephemeral run has no overlay to key a container by, so there is never
+    // one to rejoin: it establishes its own and tears it down when it returns.
+    let reusable = overlay_id.and_then(|id| resolve_main_container(Some(id)));
+    let (cid, rootfs, ephemeral) = match (reusable, overlay_id) {
+        (Some(c), Some(id)) => (c, storage::persistent_overlay_rootfs(id), false),
+        _ => {
+            let prepared = match overlay_id {
+                Some(id) => storage::prepare_for_run_persistent(image, id)?,
+                None => storage::prepare_for_run(image)?,
+            };
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
             let cid = ensure_main_container(
                 &prepared.rootfs_path,
-                Some(overlay_id),
+                overlay_id,
                 mounts,
                 unprivileged,
                 &launch,
                 s3_volumes,
             )?;
-            (cid, std::path::PathBuf::from(&prepared.rootfs_path))
+            (
+                cid,
+                std::path::PathBuf::from(&prepared.rootfs_path),
+                overlay_id.is_none(),
+            )
         }
     };
+    // A container established for an ephemeral run must not outlive it, or a
+    // long-lived VM accumulates one per `run`. Dropped on every exit path.
+    let _reaper = EphemeralContainer(ephemeral.then(|| cid.clone()));
 
     // The workload runs via `crun exec --user`, which requires a NUMERIC uid[:gid]
     // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
@@ -5803,9 +5835,13 @@ fn handle_run(
     // if the keep-alive can't be established, so exec never breaks outright.
     #[cfg(target_os = "linux")]
     {
-        if let Some(overlay_id) = persistent_overlay_id {
+        // A remote volume can only be mounted into a container established in
+        // two steps, which is what the keep-alive runner does — so route there
+        // even without an overlay rather than falling through to the
+        // single-step path, which would run with the volume silently missing.
+        if persistent_overlay_id.is_some() || !s3_volumes.is_empty() {
             match run_in_keepalive_container(
-                overlay_id,
+                persistent_overlay_id,
                 image,
                 command,
                 env,
