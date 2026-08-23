@@ -23,6 +23,13 @@ use smolvm_s3fs::{s3, sigv4, MountOptions};
 
 const HELPER_ARG: &str = "s3-mount";
 
+/// Absolute path to this binary in the guest rootfs.
+///
+/// A fixed path rather than `current_exe()`: the agent pivot_roots during boot,
+/// after which `/proc/self/exe` names a path that no longer resolves — the same
+/// reason [`crate::nsfile`] and [`crate::forkpoint`] hard-code it.
+const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+
 /// The helper speaks the protocol's own volume type: one definition means the
 /// wire format and the mount helper cannot drift apart.
 pub type MountSpec = smolvm_protocol::S3Volume;
@@ -210,9 +217,8 @@ fn mount_is_present(pid: u32, mountpoint: &str) -> bool {
 /// Returns the child so the caller can supervise it; the mount lives exactly as
 /// long as this process does.
 pub fn spawn(pid: u32, spec: &MountSpec) -> Result<std::process::Child, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let json = serde_json::to_string(spec).map_err(|e| format!("encode spec: {e}"))?;
-    std::process::Command::new(exe)
+    std::process::Command::new(AGENT_BINARY)
         .arg(HELPER_ARG)
         .arg(pid.to_string())
         .arg(json)
