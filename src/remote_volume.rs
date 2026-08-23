@@ -1,26 +1,19 @@
-//! Remote volumes: mount object stores and network filesystems into a
-//! machine with the same `-v SOURCE:GUEST[:ro]` flag as directory mounts.
+//! Remote volumes: mount S3-compatible object storage into a machine with the
+//! same `-v SOURCE:GUEST[:ro]` flag as directory mounts.
 //!
-//! Two source forms are recognized; everything else stays a host directory
-//! mount handled by `HostMount`:
+//! `s3://bucket[/prefix]` mounts a bucket. Credentials come from the machine's
+//! `--env` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, optional
+//! `AWS_ENDPOINT_URL` for R2/MinIO and `AWS_REGION`); without them the bucket is
+//! read anonymously, which covers public datasets. Anything else stays a host
+//! directory mount handled by `HostMount`.
 //!
-//! - `s3://bucket[/prefix]` — sugar for an S3 mount. Credentials come from
-//!   the machine's `--env` (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,
-//!   optional `AWS_ENDPOINT_URL` for R2/MinIO); without credentials the
-//!   bucket is accessed anonymously, which covers public datasets.
-//! - `:backend,opt=value,...:path` — a raw rclone connection string passed
-//!   through verbatim, so every rclone-supported filesystem (sftp, gcs,
-//!   azure, webdav, http, b2, ...) works without smolvm knowing about it.
-//!
-//! The mounts run inside the machine's workload container, whose command is
-//! wrapped with the mount script on every start: the guest kernel ships
-//! FUSE, machine containers have the capabilities to `mknod /dev/fuse`, and
-//! `exec`/`shell` sessions join the workload container's namespaces — so the
-//! workload container is the one place a mount is visible everywhere and
-//! lives exactly as long as the workload. The image must provide `rclone`
-//! and `fusermount3` (installable via `--init` on first boot, which runs
-//! before the workload launches).
-
+//! The mount is performed by the agent itself, natively: it enters the workload
+//! container's mount namespace and speaks FUSE and the S3 API directly. Nothing
+//! is required of the image — no rclone, no fuse3, no `fusermount3` — so a
+//! bucket can be mounted into a distroless or scratch image that could not
+//! install a helper at all. Mounting happens between container create and start,
+//! so the workload's first instruction already sees its data and its command is
+//! never rewritten.
 use serde::{Deserialize, Serialize};
 
 /// One remote volume attached to a machine, stored on its record verbatim so
@@ -171,128 +164,55 @@ fn raw_remote_has_path_colon(source: &str) -> bool {
 }
 
 impl RemoteVolume {
-    /// The rclone remote for this volume. Raw connection strings pass
-    /// through; `s3://` sugar expands using the machine env: credentials in
-    /// the env switch rclone to env-based auth (the mount command runs with
-    /// the machine env applied), and `AWS_ENDPOINT_URL` points the S3 API at
-    /// R2/MinIO/other S3-compatible stores.
-    fn rclone_remote(&self, env: &[(String, String)]) -> crate::Result<String> {
-        let Some(bucket) = self.source.strip_prefix("s3://") else {
-            return Ok(self.source.clone());
-        };
-        let has = |key: &str| env.iter().any(|(k, _)| k == key);
-        let mut opts = String::from(":s3,provider=AWS");
-        if has("AWS_ACCESS_KEY_ID") {
-            opts.push_str(",env_auth=true");
+    /// Bucket name and key prefix parsed out of the `s3://bucket/prefix` source.
+    fn bucket_and_prefix(&self) -> (String, String) {
+        let rest = self.source.strip_prefix("s3://").unwrap_or(&self.source);
+        match rest.trim_matches('/').split_once('/') {
+            Some((bucket, prefix)) => (bucket.to_string(), prefix.trim_matches('/').to_string()),
+            None => (rest.trim_matches('/').to_string(), String::new()),
         }
-        if let Some((_, url)) = env.iter().find(|(k, _)| k == "AWS_ENDPOINT_URL") {
-            if url.contains('"') || url.contains('\'') {
-                return Err(crate::Error::config(
-                    "remote volume",
-                    "AWS_ENDPOINT_URL must not contain quotes",
-                ));
-            }
-            opts.push_str(&format!(",endpoint=\"{url}\""));
-            // Streaming single-part uploads to a plain-http endpoint fail in
-            // rclone's aws-sdk-v2 backend (a signed payload needs a seekable
-            // body; https avoids it via UNSIGNED-PAYLOAD). Local MinIO-style
-            // endpoints are exactly the http case, so force multipart there.
-            if url.starts_with("http://") {
-                opts.push_str(",upload_cutoff=0");
-            }
-        }
-        Ok(format!("{opts}:{}", bucket.trim_matches('/')))
     }
 
-    /// The shell command that mounts this volume, run through the `--init`
-    /// exec machinery on every machine start.
-    pub fn mount_command(&self, env: &[(String, String)]) -> crate::Result<String> {
-        let remote = self.rclone_remote(env)?;
-        let mode = if self.read_only {
-            " --read-only"
-        } else {
-            " --vfs-cache-mode writes"
+    /// Build the structured mount request the agent performs natively.
+    ///
+    /// Credentials and endpoint are read from the machine's env, matching what
+    /// every AWS SDK does, so an existing workload's configuration carries over
+    /// unchanged. A bucket with no credentials is mounted anonymously rather
+    /// than failing — that is exactly how public datasets are consumed.
+    pub fn to_s3_volume(&self, env: &[(String, String)]) -> smolvm_protocol::S3Volume {
+        let get = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .filter(|v| !v.is_empty())
         };
-        Ok(format!(
-            "command -v rclone >/dev/null 2>&1 && command -v fusermount3 >/dev/null 2>&1 || \
-             {{ echo \"remote volume {target} needs rclone and fuse3 in the image \
-             (alpine: apk add rclone fuse3 | debian/ubuntu: apt-get install -y rclone fuse3)\" >&2; exit 1; }}; \
-             [ -e /dev/fuse ] || mknod /dev/fuse c 10 229; \
-             mkdir -p '{target}' && rclone mount '{remote}' '{target}' --daemon{mode}",
-            target = self.target,
-        ))
+        let (bucket, prefix) = self.bucket_and_prefix();
+        let region = get("AWS_REGION")
+            .or_else(|| get("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let endpoint = get("AWS_ENDPOINT_URL")
+            .or_else(|| get("AWS_ENDPOINT"))
+            .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        smolvm_protocol::S3Volume {
+            endpoint,
+            region,
+            bucket,
+            prefix,
+            mountpoint: self.target.clone(),
+            read_only: self.read_only,
+            access_key_id: get("AWS_ACCESS_KEY_ID"),
+            secret_access_key: get("AWS_SECRET_ACCESS_KEY"),
+            session_token: get("AWS_SESSION_TOKEN"),
+        }
     }
 }
 
-/// Mount commands for every remote volume on a record, in declaration order.
-pub fn mount_commands(
+/// Build the mount requests for every remote volume on a machine.
+pub fn to_s3_volumes(
     volumes: &[RemoteVolume],
     env: &[(String, String)],
-) -> crate::Result<Vec<String>> {
-    volumes.iter().map(|v| v.mount_command(env)).collect()
-}
-
-/// A synchronous pre-launch check that the image can mount remote volumes at
-/// all. The mount itself runs inside the detached workload container, whose
-/// failures are not surfaced to the caller — so the most common failure
-/// (image without the tools) is caught here first, where it can fail the
-/// start with an actionable message.
-pub fn preflight_command(volumes: &[RemoteVolume]) -> Option<String> {
-    if volumes.is_empty() {
-        return None;
-    }
-    Some(
-        "command -v rclone >/dev/null 2>&1 && command -v fusermount3 >/dev/null 2>&1 || \
-         { echo \"remote volumes need rclone and fuse3 in the image \
-         (alpine: apk add rclone fuse3 | debian/ubuntu: apt-get install -y rclone fuse3; \
-         or install them with --init, which runs before the mounts)\" >&2; exit 1; }"
-            .to_string(),
-    )
-}
-
-/// A post-launch check that every remote volume actually mounted. Joins the
-/// workload container (like any exec) and polls /proc/mounts: if the mount
-/// script failed, the workload container is dead and the fresh exec container
-/// sees no mounts either way — so this fails the start instead of leaving a
-/// silently broken machine.
-pub fn verify_command(volumes: &[RemoteVolume]) -> Option<String> {
-    if volumes.is_empty() {
-        return None;
-    }
-    let checks: Vec<String> = volumes
-        .iter()
-        .map(|v| {
-            format!(
-                "awk -v m='{}' '$2==m' /proc/mounts | grep -q rclone",
-                v.target
-            )
-        })
-        .collect();
-    let all = checks.join(" && ");
-    Some(format!(
-        "t=0; while [ $t -lt 30 ]; do if {all}; then exit 0; fi; t=$((t+1)); sleep 0.5; done; \
-         echo \"remote volume(s) failed to mount — check the machine's agent-console.log for the rclone error\" >&2; exit 1"
-    ))
-}
-
-/// Wrap a machine's workload command so its container mounts the remote
-/// volumes before the workload runs.
-///
-/// A FUSE mount lives in the mount namespace of the container that created
-/// it, and `exec`/`shell` sessions join the workload container's namespaces —
-/// so the workload container is the one place a mount is visible everywhere
-/// and lives exactly as long as the machine's workload. A machine with no
-/// workload of its own gets a minimal holder (`sleep infinity`) so a live
-/// container exists for exec sessions to join. Machines whose image CMD exits
-/// immediately (an interactive shell, say) should be created with a
-/// long-lived command such as `-- sleep infinity`.
-/// Build the remote-volume mount script — the `&&`-joined mount commands — that
-/// the agent runs inside the workload container, ahead of the image-resolved
-/// workload command. The agent (not the host) does the wrapping, so a service
-/// image's own ENTRYPOINT still runs rather than being replaced by a mount stub,
-/// and an image with no command falls back to a keep-alive holder there.
-pub fn mount_script(volumes: &[RemoteVolume], env: &[(String, String)]) -> crate::Result<String> {
-    Ok(mount_commands(volumes, env)?.join(" && "))
+) -> Vec<smolvm_protocol::S3Volume> {
+    volumes.iter().map(|v| v.to_s3_volume(env)).collect()
 }
 
 #[cfg(test)]
@@ -302,15 +222,6 @@ mod tests {
     fn split(specs: &[&str]) -> (Vec<String>, Vec<RemoteVolume>) {
         let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
         split_specs(&specs).unwrap()
-    }
-
-    #[test]
-    fn host_specs_pass_through_untouched() {
-        // Plain dirs, relative dirs, and Windows drive-letter paths all stay
-        // on the HostMount path exactly as written.
-        let (host, remote) = split(&["/data:/data:ro", "C:\\data:/data", "./x:/y"]);
-        assert_eq!(host.len(), 3);
-        assert!(remote.is_empty());
     }
 
     #[test]
@@ -328,88 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_rclone_strings_keep_their_internal_colons() {
-        // The connection string itself contains ':' and ','; the right-anchored
-        // parse peels the guest path off the end.
-        let (_, remote) = split(&[":sftp,host=example.com,user=me:/srv/files:/mnt/sftp"]);
-        assert_eq!(
-            remote[0].source,
-            ":sftp,host=example.com,user=me:/srv/files"
-        );
-        assert_eq!(remote[0].target, "/mnt/sftp");
-        assert!(!remote[0].read_only);
-    }
-
-    #[test]
-    fn s3_translation_is_anonymous_without_credentials() {
-        let v = &split(&["s3://bucket/p:/d"]).1[0];
-        assert_eq!(v.rclone_remote(&[]).unwrap(), ":s3,provider=AWS:bucket/p");
-    }
-
-    #[test]
-    fn s3_translation_uses_env_auth_and_endpoint_when_present() {
-        let v = &split(&["s3://bucket:/d"]).1[0];
-        let env = vec![
-            ("AWS_ACCESS_KEY_ID".to_string(), "k".to_string()),
-            (
-                "AWS_ENDPOINT_URL".to_string(),
-                "https://acc.r2.cloudflarestorage.com".to_string(),
-            ),
-        ];
-        assert_eq!(
-            v.rclone_remote(&env).unwrap(),
-            ":s3,provider=AWS,env_auth=true,endpoint=\"https://acc.r2.cloudflarestorage.com\":bucket"
-        );
-        // http endpoints additionally force multipart uploads — streaming
-        // single-part PUTs to plain http fail in rclone's aws-sdk-v2 backend.
-        let http_env = vec![(
-            "AWS_ENDPOINT_URL".to_string(),
-            "http://100.96.0.1:9000".to_string(),
-        )];
-        assert_eq!(
-            v.rclone_remote(&http_env).unwrap(),
-            ":s3,provider=AWS,endpoint=\"http://100.96.0.1:9000\",upload_cutoff=0:bucket"
-        );
-    }
-
-    #[test]
     fn rejects_relative_guest_path_and_quotes_and_empty_bucket() {
         assert!(split_specs(&["s3://b:data".to_string()]).is_err());
         assert!(split_specs(&["s3://b:/it's:ro".to_string()]).is_err());
         assert!(split_specs(&["s3://:/d".to_string()]).is_err());
         assert!(split_specs(&["s3://b:/d".to_string(), "s3://c:/d".to_string()]).is_err());
-    }
-
-    #[test]
-    fn raw_remote_must_keep_its_path_colon() {
-        // Missing ':path' (the trailing colon was eaten as the guest separator)
-        // is rejected with the '::' hint...
-        let err = split_specs(&[":http,url=\"https://host\":/mnt/d".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("::"));
-        // ...and the double-colon empty-path form parses with the colon intact.
-        let (_, remote) = split(&[":http,url=\"https://host\"::/mnt/d:ro"]);
-        assert_eq!(remote[0].source, ":http,url=\"https://host\":");
-        assert_eq!(remote[0].target, "/mnt/d");
-    }
-
-    #[test]
-    fn mount_script_is_the_joined_mount_commands_not_a_wrapper() {
-        // The host builds only the mount SCRIPT; the agent wraps it ahead of the
-        // image-resolved command (so a service image's entrypoint is preserved).
-        let vols = split(&["s3://bucket:/mnt/d:ro"]).1;
-        let script = mount_script(&vols, &[]).unwrap();
-        assert!(
-            script.contains("rclone"),
-            "script mounts via rclone: {script}"
-        );
-        assert!(
-            script.contains("/mnt/d"),
-            "script targets the guest path: {script}"
-        );
-        assert!(
-            !script.contains("exec \"$@\"") && !script.contains("sleep infinity"),
-            "wrapping is the agent's job now, not the host's: {script}"
-        );
     }
 
     #[test]
@@ -428,19 +262,86 @@ mod tests {
         assert!(is_remote_source("s3://b"));
         assert!(is_remote_source(":http,url=\"https://h\":"));
     }
+}
+
+#[cfg(test)]
+mod s3_spec_tests {
+    use super::*;
+
+    fn vol(source: &str) -> RemoteVolume {
+        RemoteVolume {
+            source: source.to_string(),
+            target: "/mnt/data".to_string(),
+            read_only: false,
+        }
+    }
 
     #[test]
-    fn mount_command_quotes_and_picks_mode() {
-        let v = &split(&["s3://bucket:/mnt/d:ro"]).1[0];
-        let cmd = v.mount_command(&[]).unwrap();
+    fn a_bucket_without_a_prefix_mounts_the_whole_bucket() {
+        let v = vol("s3://my-bucket").to_s3_volume(&[]);
+        assert_eq!(v.bucket, "my-bucket");
+        assert_eq!(v.prefix, "");
+        assert_eq!(v.mountpoint, "/mnt/data");
+    }
+
+    #[test]
+    fn a_prefix_selects_a_sub_tree_of_the_bucket() {
+        let v = vol("s3://my-bucket/nested/prefix").to_s3_volume(&[]);
+        assert_eq!(v.bucket, "my-bucket");
+        assert_eq!(v.prefix, "nested/prefix");
+    }
+
+    // A public dataset has no credentials; mounting anonymously is correct
+    // rather than an error.
+    #[test]
+    fn no_credentials_means_anonymous_access() {
+        let v = vol("s3://noaa-goes16").to_s3_volume(&[]);
+        assert!(v.access_key_id.is_none());
+        assert!(v.secret_access_key.is_none());
+        assert_eq!(v.endpoint, "https://s3.us-east-1.amazonaws.com");
+    }
+
+    // The env names match what every AWS SDK reads, so an existing workload's
+    // configuration carries over untouched.
+    #[test]
+    fn credentials_and_endpoint_come_from_the_machine_env() {
+        let env = vec![
+            ("AWS_ACCESS_KEY_ID".to_string(), "AKIA".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+            (
+                "AWS_ENDPOINT_URL".to_string(),
+                "http://minio:9000".to_string(),
+            ),
+            ("AWS_REGION".to_string(), "eu-west-1".to_string()),
+        ];
+        let v = vol("s3://b").to_s3_volume(&env);
+        assert_eq!(v.access_key_id.as_deref(), Some("AKIA"));
+        assert_eq!(v.secret_access_key.as_deref(), Some("secret"));
+        assert_eq!(v.endpoint, "http://minio:9000");
+        assert_eq!(v.region, "eu-west-1");
+    }
+
+    #[test]
+    fn the_region_shapes_the_default_aws_endpoint() {
+        let env = vec![("AWS_DEFAULT_REGION".to_string(), "ap-south-1".to_string())];
+        let v = vol("s3://b").to_s3_volume(&env);
+        assert_eq!(v.endpoint, "https://s3.ap-south-1.amazonaws.com");
+    }
+
+    #[test]
+    fn empty_env_values_are_treated_as_unset() {
+        let env = vec![("AWS_ACCESS_KEY_ID".to_string(), String::new())];
+        let v = vol("s3://b").to_s3_volume(&env);
         assert!(
-            cmd.contains("rclone mount ':s3,provider=AWS:bucket' '/mnt/d' --daemon --read-only")
+            v.access_key_id.is_none(),
+            "an empty key must not sign requests"
         );
-        assert!(cmd.contains("mknod /dev/fuse"));
-        let rw = &split(&["s3://bucket:/mnt/d"]).1[0];
-        assert!(rw
-            .mount_command(&[])
-            .unwrap()
-            .contains("--daemon --vfs-cache-mode writes"));
+    }
+
+    #[test]
+    fn read_only_carries_through_to_the_mount() {
+        let mut r = vol("s3://b");
+        r.read_only = true;
+        assert!(r.to_s3_volume(&[]).read_only);
     }
 }

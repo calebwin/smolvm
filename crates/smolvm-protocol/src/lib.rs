@@ -18,6 +18,38 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One S3-compatible bucket to mount inside the workload container.
+///
+/// Structured rather than a shell command: the agent mounts it natively, so
+/// nothing has to be installed in the image and no command is interpolated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct S3Volume {
+    /// Service endpoint, e.g. `https://s3.us-east-1.amazonaws.com` or a
+    /// self-hosted `http://minio:9000`.
+    pub endpoint: String,
+    /// Region used for request signing.
+    pub region: String,
+    /// Bucket to mount.
+    pub bucket: String,
+    /// Optional key prefix, so a mount can expose one sub-tree of a bucket.
+    #[serde(default)]
+    pub prefix: String,
+    /// Absolute path inside the container where the bucket appears.
+    pub mountpoint: String,
+    /// Mount read-only; the kernel then rejects writes before they reach us.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Access key. Absent (with the secret) means anonymous access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Secret key paired with `access_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    /// Session token, when temporary credentials are in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+}
+
 pub mod forkpoint;
 pub mod guest_env;
 pub mod image_ref;
@@ -432,13 +464,11 @@ pub enum AgentRequest {
         /// Incompatible with `interactive` and `tty`.
         #[serde(default)]
         background: bool,
-        /// Remote-volume mount script to run inside the workload container
-        /// before its (image-resolved) command. Wrapping in the agent — after
-        /// the image ENTRYPOINT/CMD is resolved — is what lets a service image's
-        /// real entrypoint still run; a host-side wrap only saw the empty
-        /// request command and would replace the workload with a mount stub.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        remote_volume_mount: Option<String>,
+        /// S3 volumes to mount into the workload container. The agent mounts
+        /// them between `crun create` and `crun start`, so the workload's first
+        /// instruction already sees them and its command is never rewritten.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        s3_volumes: Vec<S3Volume>,
     },
 
     /// Send stdin data to a running interactive command.

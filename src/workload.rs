@@ -71,19 +71,10 @@ pub fn launch_image_workload(
     };
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
-    // Remote volumes mount inside the workload container (the one namespace
-    // exec/shell sessions join). Build the mount SCRIPT here but let the AGENT
-    // run it ahead of the image-resolved command — wrapping host-side would only
-    // see the empty request command and replace a service image's own entrypoint
-    // with a mount stub. See `crate::remote_volume::mount_script`.
-    let remote_volume_mount = if record.remote_volumes.is_empty() {
-        None
-    } else {
-        Some(crate::remote_volume::mount_script(
-            &record.remote_volumes,
-            &exec_env,
-        )?)
-    };
+    // Remote volumes are mounted by the agent itself, natively, between the
+    // container's create and start — so the workload sees its data from its
+    // first instruction and its command is never rewritten.
+    let s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, &exec_env);
     match client.run_container_detached(
         RunConfig::new(image, command)
             .with_env(exec_env)
@@ -94,7 +85,7 @@ pub fn launch_image_workload(
                 machine_name,
                 record.golden.as_deref(),
             )))
-            .with_remote_volume_mount(remote_volume_mount),
+            .with_s3_volumes(s3_volumes),
     ) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {

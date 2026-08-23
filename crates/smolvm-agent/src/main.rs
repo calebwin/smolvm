@@ -2364,8 +2364,8 @@ fn handle_request(
             background,
             // Remote volumes only ride the detached workload launch
             // (`run_container_detached`, `detached: true`); every synchronous or
-            // background Run sets this to None, so there is nothing to mount here.
-            remote_volume_mount: _,
+            // background Run carries none, so there is nothing to mount here.
+            s3_volumes: _,
         } => {
             if background {
                 handle_run_background(
@@ -3287,7 +3287,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
-            remote_volume_mount,
+            s3_volumes,
             ..
         } => (
             image,
@@ -3300,7 +3300,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
-            remote_volume_mount,
+            s3_volumes,
         ),
         _ => {
             send_response(
@@ -3354,7 +3354,9 @@ fn handle_interactive_run(
         env,
         workdir,
         user,
-        remote_volume_mount.as_deref(),
+        // Interactive runs never carry volumes: they join an existing container
+        // (or are one-shot), and mounts ride the detached workload launch.
+        Vec::new(),
     ) {
         Ok(l) => l,
         Err(e) => {
@@ -3456,7 +3458,7 @@ impl ResolvedLaunch {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         user: Option<String>,
-        remote_volume_mount: Option<&str>,
+        s3_volumes: Vec<smolvm_protocol::S3Volume>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
             format!("image not found: {image}").into()
@@ -3465,7 +3467,7 @@ impl ResolvedLaunch {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
             if resolved.is_empty() {
-                if remote_volume_mount.is_some() {
+                if !s3_volumes.is_empty() {
                     // Remote volumes mount inside the workload container, which
                     // exec/shell join. An image with no entrypoint would
                     // otherwise downgrade to a bare-agent boot with nowhere for
@@ -3488,17 +3490,9 @@ impl ResolvedLaunch {
         } else {
             command
         };
-        // Remote volumes: run the mount script, then exec the RESOLVED workload
-        // command in its place — so a service image's real entrypoint runs (not
-        // a mount stub) and exec/shell sessions joining this container's
-        // namespace see the mount. Wrapping *here*, after resolution, is what
-        // keeps the image's own entrypoint from being clobbered when the request
-        // gave no command (the bug when the wrap lived host-side, which only saw
-        // the empty request command).
-        let command = match remote_volume_mount {
-            Some(script) if !script.is_empty() => wrap_command_with_mount(script, command),
-            _ => command,
-        };
+        // Nothing is wrapped around the workload any more: remote volumes are
+        // mounted natively between the container's create and start, so the
+        // image's own entrypoint runs exactly as written.
         Ok(Self {
             command,
             env: merge_image_env(info.env, env),
@@ -3506,21 +3500,6 @@ impl ResolvedLaunch {
             user: user.or(info.user),
         })
     }
-}
-
-/// Prepend a remote-volume mount script to a resolved workload command:
-/// `sh -c "<script> && exec \"$@\"" sh <cmd...>`. The mount runs in the workload
-/// container's mount namespace, then `exec` replaces the shell with the real
-/// command so PID-1 semantics and signal delivery are unchanged.
-fn wrap_command_with_mount(script: &str, command: Vec<String>) -> Vec<String> {
-    let mut argv = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        format!("{script} && exec \"$@\""),
-        "sh".to_string(),
-    ];
-    argv.extend(command);
-    argv
 }
 
 /// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
@@ -3655,7 +3634,7 @@ fn handle_run_detached(
             mounts,
             persistent_overlay_id,
             unprivileged,
-            remote_volume_mount,
+            s3_volumes,
             ..
         } => (
             image,
@@ -3666,7 +3645,7 @@ fn handle_run_detached(
             mounts,
             persistent_overlay_id,
             unprivileged,
-            remote_volume_mount,
+            s3_volumes,
         ),
         _ => {
             send_response(
@@ -3731,14 +3710,7 @@ fn handle_run_detached(
     // (command, Env, WorkingDir, User) with the request layered on top.
     // `write_oci_bundle` requires a `ResolvedLaunch`, so the image config can't be
     // silently dropped here or on any other launch path.
-    let launch = match ResolvedLaunch::resolve(
-        &image,
-        command,
-        env,
-        workdir,
-        user,
-        remote_volume_mount.as_deref(),
-    ) {
+    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes) {
         Ok(l) => l,
         Err(e) => {
             send_response(
@@ -3842,6 +3814,27 @@ fn handle_run_detached(
             send_response(
                 stream,
                 &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    }
+
+    // Mount S3 volumes BETWEEN create and start. The container's namespaces
+    // exist after `create` but its PID 1 has not run yet, so mounting here means
+    // the workload's very first instruction already sees the bucket — a workload
+    // that reads its data directory immediately cannot race the mount. It also
+    // means the workload command itself is never rewritten: the image's own
+    // entrypoint runs exactly as its author wrote it.
+    if !s3_mounts.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, &s3_mounts) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("mount remote volume: {e}"),
+                    error_codes::SPAWN_FAILED,
+                ),
             )?;
             return Ok(());
         }
@@ -6573,29 +6566,6 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The mount script runs BEFORE the resolved workload command, and that
-    // command — an image's own ENTRYPOINT+CMD when the request gives none — must
-    // survive intact. Wrapping is `sh -c '<mounts> && exec "$@"' sh <argv...>`,
-    // so `$@` is the untouched argv and `exec` hands the container PID to it.
-    #[test]
-    fn wrap_command_with_mount_preserves_the_resolved_command() {
-        let wrapped = wrap_command_with_mount(
-            "rclone mount a && rclone mount b",
-            vec![
-                "nginx".to_string(),
-                "-g".to_string(),
-                "daemon off;".to_string(),
-            ],
-        );
-        assert_eq!(&wrapped[..2], &["/bin/sh".to_string(), "-c".to_string()]);
-        assert_eq!(
-            wrapped[2],
-            "rclone mount a && rclone mount b && exec \"$@\""
-        );
-        // `sh` is $0; the workload argv follows verbatim as $1.. — not replaced.
-        assert_eq!(&wrapped[3..], &["sh", "nginx", "-g", "daemon off;"]);
-    }
 
     #[cfg(target_os = "linux")]
     fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {

@@ -161,6 +161,66 @@ fn enter_mount_namespace(_pid: u32) -> Result<(), String> {
     Err("mount namespaces are Linux-only".to_string())
 }
 
+/// How long to wait for a mount to appear before giving up.
+///
+/// A mount that never appears is a hard start failure: the workload would run
+/// against an empty directory and silently produce wrong results, which is far
+/// worse than refusing to start.
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Mount every volume into `container_id`'s namespace and wait until each is
+/// visible.
+///
+/// Called between `crun create` and `crun start`, so the workload's first
+/// instruction already sees the data.
+pub fn mount_all(container_id: &str, specs: &[MountSpec]) -> Result<(), String> {
+    let pid = crate::crun_container_pid(container_id)
+        .ok_or_else(|| format!("container {container_id} has no pid"))?;
+
+    for spec in specs {
+        // The helper runs for the life of the mount; it is intentionally not
+        // reaped here. It exits when the FUSE session ends (unmount or machine
+        // stop), and the container's teardown takes the namespace with it.
+        let child = spawn(pid, spec)?;
+        std::mem::forget(child);
+    }
+
+    let deadline = std::time::Instant::now() + MOUNT_TIMEOUT;
+    for spec in specs {
+        loop {
+            if mount_is_present(pid, &spec.mountpoint) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{} did not mount within {}s — check the endpoint, credentials and network",
+                    spec.mountpoint,
+                    MOUNT_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        tracing::info!(mountpoint = %spec.mountpoint, bucket = %spec.bucket, "s3 volume mounted");
+    }
+    Ok(())
+}
+
+/// Whether `mountpoint` is mounted inside the container's namespace.
+///
+/// Read from the container's own `mountinfo` rather than the agent's: the mount
+/// is deliberately invisible from outside that namespace, so checking the
+/// agent's view would always report failure.
+fn mount_is_present(pid: u32, mountpoint: &str) -> bool {
+    let Ok(mounts) = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")) else {
+        return false;
+    };
+    mounts.lines().any(|l| {
+        let mut fields = l.split(' ');
+        // mountinfo: id parent major:minor root MOUNTPOINT ...
+        fields.nth(4).map(|m| m == mountpoint).unwrap_or(false) && l.contains("fuse")
+    })
+}
+
 /// Spawn a mount helper for `spec` against the container at `pid`.
 ///
 /// Returns the child so the caller can supervise it; the mount lives exactly as

@@ -1403,14 +1403,7 @@ async fn relaunch_image_workload(
     // Remote volumes mount inside the workload container; build the mount script
     // here and let the agent run it ahead of the image-resolved command, so a
     // service image's own entrypoint is preserved rather than clobbered.
-    let remote_volume_mount = if record.remote_volumes.is_empty() {
-        None
-    } else {
-        Some(crate::remote_volume::mount_script(
-            &record.remote_volumes,
-            &env,
-        )?)
-    };
+    let s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, &env);
     let workdir = record.workdir.clone();
     let user = record.user.clone();
     let mounts_config = {
@@ -1440,7 +1433,7 @@ async fn relaunch_image_workload(
             .with_user(user)
             .with_mounts(mounts_config)
             .with_persistent_overlay(Some(overlay_id))
-            .with_remote_volume_mount(remote_volume_mount);
+            .with_s3_volumes(s3_volumes);
         c.run_container_detached(config).map(|_| ())
     })
     .await

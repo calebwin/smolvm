@@ -1585,33 +1585,9 @@ fn start_vm_named_with_db(
         // entirely when restoring from a snapshot — the forked container is
         // inherited as-is.
         let _ = img;
-        // The remote-volume mounts run inside the detached workload container,
-        // whose failures are invisible to this caller. Catch the common one
-        // (image without the tools) synchronously first, with the actionable
-        // message, instead of leaving a "running" machine with a dead workload.
-        if !from_snapshot {
-            if let Some(preflight) =
-                smolvm::remote_volume::preflight_command(&record.remote_volumes)
-            {
-                if let Err(e) = run_init_commands(
-                    &mut client,
-                    &[preflight],
-                    InitRunContext {
-                        image: record.image.as_deref(),
-                        image_info: None,
-                        env: &exec_env,
-                        workdir: record.workdir.as_deref(),
-                        record_mounts: &record.mounts,
-                        overlay_id: name,
-                    },
-                ) {
-                    if let Err(stop_err) = manager.stop() {
-                        tracing::warn!(error = %stop_err, "failed to stop machine after remote volume preflight failure");
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        // Remote volumes are mounted natively by the agent between the
+        // container's create and start, and a mount that never appears
+        // fails the start there — so no host-side preflight is needed.
         if !from_snapshot {
             if let Err(e) = smolvm::workload::launch_image_workload(
                 &mut client,
@@ -1628,29 +1604,6 @@ fn start_vm_named_with_db(
             tracing::info!(
                 "clone booted from snapshot: workload container inherited from fork, skipping relaunch"
             );
-        }
-        // Confirm every remote volume actually mounted (also covers a clone's
-        // restored mounts): a failed mount kills the detached workload
-        // silently, so without this the machine would report running while
-        // the volume is simply absent.
-        if let Some(verify) = smolvm::remote_volume::verify_command(&record.remote_volumes) {
-            if let Err(e) = run_init_commands(
-                &mut client,
-                &[verify],
-                InitRunContext {
-                    image: record.image.as_deref(),
-                    image_info: None,
-                    env: &exec_env,
-                    workdir: record.workdir.as_deref(),
-                    record_mounts: &record.mounts,
-                    overlay_id: name,
-                },
-            ) {
-                if let Err(stop_err) = manager.stop() {
-                    tracing::warn!(error = %stop_err, "failed to stop machine after remote volume verification failure");
-                }
-                return Err(e);
-            }
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {

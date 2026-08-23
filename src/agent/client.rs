@@ -455,7 +455,7 @@ pub struct RunConfig {
     /// Remote-volume mount script to run inside the workload container before
     /// its (image-resolved) command. Set by the workload launcher; the agent
     /// wraps the resolved command so the image's real entrypoint still runs.
-    pub remote_volume_mount: Option<String>,
+    pub s3_volumes: Vec<smolvm_protocol::S3Volume>,
 }
 
 impl RunConfig {
@@ -477,13 +477,13 @@ impl RunConfig {
             persistent_overlay_id: None,
             stdin: None,
             unprivileged: false,
-            remote_volume_mount: None,
+            s3_volumes: Vec::new(),
         }
     }
 
     /// Set the remote-volume mount script run inside the workload container.
-    pub fn with_remote_volume_mount(mut self, script: Option<String>) -> Self {
-        self.remote_volume_mount = script;
+    pub fn with_s3_volumes(mut self, volumes: Vec<smolvm_protocol::S3Volume>) -> Self {
+        self.s3_volumes = volumes;
         self
     }
 
@@ -1588,7 +1588,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
-            remote_volume_mount: None,
+            s3_volumes: Vec::new(),
         })?;
 
         expect_completed(resp, "run command")
@@ -1615,7 +1615,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
-            remote_volume_mount: None,
+            s3_volumes: Vec::new(),
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1659,7 +1659,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
-            remote_volume_mount: None,
+            s3_volumes: Vec::new(),
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1697,7 +1697,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
-                remote_volume_mount: None,
+                s3_volumes: Vec::new(),
             },
             tty,
             "run interactive",
@@ -1736,7 +1736,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
-            remote_volume_mount: config.remote_volume_mount,
+            s3_volumes: config.s3_volumes,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -1972,7 +1972,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
-                remote_volume_mount: None,
+                s3_volumes: Vec::new(),
             },
             input,
             on_output,
