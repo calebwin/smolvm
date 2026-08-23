@@ -243,6 +243,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_config(config)
             }
@@ -357,6 +358,21 @@ impl EmbeddedRuntime {
         handle.launch_image_workload(name, &record)
     }
 
+    /// The machine's remote volumes, resolved against its own recorded env.
+    ///
+    /// An exec is often what establishes the workload container — the machine's
+    /// command exited, or the image's own default was short-lived — and that
+    /// container is where the mount lives. Carrying the volumes on every exec
+    /// means the bucket is present in whichever container ends up serving the
+    /// session, instead of only when a long-running workload happens to survive.
+    fn s3_volumes_for(&self, name: &str) -> Result<Vec<smolvm_protocol::S3Volume>> {
+        let record = control::get_record(&self.db, name)?;
+        Ok(crate::remote_volume::to_s3_volumes(
+            &record.remote_volumes,
+            &record.env,
+        ))
+    }
+
     /// The machine's image, if it is an image (container-workload) machine.
     /// Streamed execs on such a machine must run inside its persistent container
     /// overlay so their writes survive — matching non-streaming exec.
@@ -405,6 +421,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_streaming_with(config, on_event)
             }

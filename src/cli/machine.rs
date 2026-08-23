@@ -2765,12 +2765,24 @@ impl ExecCmd {
             // Fork clones address the golden's inherited overlay; ordinary
             // machines use their own name.
             let overlay_owner = persistent_overlay_owner_for_record(&name, record.as_ref());
+            // An exec may be what establishes the workload container — the
+            // machine's command exited, or the image's own default was
+            // short-lived — and that container is where the mount lives. Carry
+            // the machine's volumes so the bucket is in whichever container
+            // serves this session, not only when a long-running workload
+            // happened to survive.
+            let exec_s3_volumes = record
+                .as_ref()
+                .map(|r| smolvm::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+                .unwrap_or_default();
             if self.detach {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env)
                     .with_workdir(defaults.workdir)
                     .with_user(defaults.user)
                     .with_mounts(mount_bindings)
+                    .with_s3_volumes(exec_s3_volumes.clone())
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner));
                 let pid = client.run_background(config)?;
                 println!("{pid}");
@@ -2784,6 +2796,7 @@ impl ExecCmd {
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let exit_code = client.run_interactive(config)?;
                 std::process::exit(exit_code);
@@ -2796,6 +2809,7 @@ impl ExecCmd {
                     .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_owner.clone()));
                 let mut printer = ExecEventPrinter::default();
                 client.run_streaming_with(config, |event| printer.handle(event))?;
@@ -2808,6 +2822,7 @@ impl ExecCmd {
                 .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
+                .with_s3_volumes(exec_s3_volumes.clone())
                 .with_persistent_overlay(Some(overlay_owner));
             let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
