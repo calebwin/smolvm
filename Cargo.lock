@@ -3094,6 +3094,7 @@ dependencies = [
  "serde_json",
  "smolvm-oci-layer",
  "smolvm-protocol",
+ "smolvm-s3fs",
  "tar",
  "tempfile",
  "tracing",

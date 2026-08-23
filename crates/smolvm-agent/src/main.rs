@@ -95,6 +95,7 @@ mod pty;
 mod publish_socket;
 mod retry;
 mod rosetta;
+mod s3mount;
 mod ssh_agent;
 mod storage;
 #[cfg(target_os = "linux")]
@@ -216,6 +217,13 @@ fn main() {
     // because `setns(CLONE_NEWMNT)` is refused for a multithreaded process.
     if nsfile::helper_requested() {
         std::process::exit(nsfile::run_helper());
+    }
+
+    // S3 volume mount helper. Same reason as above: it enters the workload
+    // container's mount namespace, and then stays alive serving the FUSE
+    // session for the life of the mount.
+    if s3mount::helper_requested() {
+        std::process::exit(s3mount::run_helper());
     }
 
     // Quick --version check (used by init script to detect rootfs updates)
