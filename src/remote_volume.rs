@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// without migrating persisted state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteVolume {
-    /// The user-supplied source (`s3://bucket/prefix` or `:backend,...:path`).
+    /// The user-supplied source (`s3://bucket[/prefix]`).
     pub source: String,
     /// Absolute guest mount point.
     pub target: String,
@@ -60,7 +60,7 @@ pub fn split_specs(specs: &[String]) -> crate::Result<(Vec<String>, Vec<RemoteVo
 
 /// Parse one `-v` spec; `Ok(None)` means "not a remote source" and the spec
 /// belongs to the host-directory path. Mirrors `HostMount`'s right-anchored
-/// parse so sources may contain colons (rclone connection strings do).
+/// parse so sources may contain colons (an S3 URL's scheme does).
 fn parse_spec(spec: &str) -> crate::Result<Option<RemoteVolume>> {
     let (rest, read_only) = match spec.rsplit_once(':') {
         Some((head, "ro")) => (head, true),
@@ -93,25 +93,23 @@ fn parse_spec(spec: &str) -> crate::Result<Option<RemoteVolume>> {
             format!("remote volume spec must not contain single quotes: '{spec}'"),
         ));
     }
-    if let Some(bucket) = source.strip_prefix("s3://") {
-        if bucket.trim_matches('/').is_empty() {
-            return Err(crate::Error::config(
-                "parse remote volume",
-                format!("s3 volume needs a bucket name: '{spec}'"),
-            ));
-        }
-    } else if !raw_remote_has_path_colon(source) {
-        // An rclone connection string is `:backend,opts:path` — the path colon
-        // is part of the remote. With an empty remote path the user must write
-        // it explicitly, which makes a double colon before the guest path:
-        // `:http,url="https://host"::/mnt/data`.
+    let Some(bucket) = source.strip_prefix("s3://") else {
+        // A leading colon is rclone's connection-string syntax. Mounting is now
+        // native S3, so such a spec cannot be honoured — and silently treating
+        // it as a bucket name would sign requests against a nonsense bucket.
+        // Reject it here, where the spec is still visible to name in the error.
         return Err(crate::Error::config(
             "parse remote volume",
             format!(
-                "rclone remote is missing its ':path' part in '{spec}' \
-                 (an empty remote path is written '::' before the guest path, \
-                 e.g. ':http,url=\"https://host\"::/mnt/data')"
+                "'{spec}' is an rclone remote, which is no longer supported; \
+                 use an S3 URL instead, e.g. 's3://bucket/prefix:/guest/path'"
             ),
+        ));
+    };
+    if bucket.trim_matches('/').is_empty() {
+        return Err(crate::Error::config(
+            "parse remote volume",
+            format!("s3 volume needs a bucket name: '{spec}'"),
         ));
     }
     Ok(Some(RemoteVolume {
@@ -146,21 +144,6 @@ pub fn from_parts(source: &str, target: &str, read_only: bool) -> crate::Result<
             format!("not a remote volume source: '{source}'"),
         )
     })
-}
-
-/// Whether a raw rclone connection string still has its remote-terminating
-/// `:path` colon. Colons inside double-quoted option values (URLs, mostly)
-/// don't count — rclone's own parser treats those as part of the value.
-fn raw_remote_has_path_colon(source: &str) -> bool {
-    let mut in_quotes = false;
-    for ch in source.chars().skip(1) {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ':' if !in_quotes => return true,
-            _ => {}
-        }
-    }
-    false
 }
 
 impl RemoteVolume {
@@ -246,13 +229,31 @@ mod tests {
         assert!(split_specs(&["s3://b:/d".to_string(), "s3://c:/d".to_string()]).is_err());
     }
 
+    // Mounting is native S3 now, so an rclone connection string cannot be
+    // honoured. It must be named as unsupported rather than parsed as a bucket,
+    // which would sign every request against a nonsense name.
+    #[test]
+    fn an_rclone_remote_is_rejected_by_name() {
+        let err = split_specs(&[":s3,provider=Minio,endpoint=\"http://h\":b:/mnt/d".to_string()])
+            .expect_err("an rclone remote must not parse as a bucket");
+        let msg = err.to_string();
+        assert!(msg.contains("rclone"), "{msg}");
+        assert!(msg.contains("s3://"), "{msg}");
+        // A remote with an empty path is still an rclone remote, not a host dir.
+        assert!(split_specs(&[":http,url=\"https://h\"::/mnt/d".to_string()]).is_err());
+        // Host directory mounts are untouched by the rejection.
+        let (host, remote) = split_specs(&["/data:/mnt/d".to_string()]).unwrap();
+        assert_eq!(host, vec!["/data:/mnt/d".to_string()]);
+        assert!(remote.is_empty());
+    }
+
     #[test]
     fn from_parts_matches_colon_parser() {
         let structured = from_parts("s3://bucket/pfx", "/mnt/d", true).unwrap();
         let parsed = &split(&["s3://bucket/pfx:/mnt/d:ro"]).1[0];
         assert_eq!(&structured, parsed);
-        // Same validation as the colon parser: relative target, missing
-        // rclone path colon, empty bucket.
+        // Same validation as the colon parser: relative target, non-S3
+        // source, empty bucket.
         assert!(from_parts("s3://b", "relative", false).is_err());
         assert!(from_parts(":http,url=\"https://h\"", "/mnt/x", false).is_err());
         assert!(from_parts("s3://", "/mnt/x", false).is_err());

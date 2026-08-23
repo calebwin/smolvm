@@ -436,8 +436,8 @@ pub struct VmRecord {
     #[serde(default)]
     pub init_completed: bool,
 
-    /// Remote volumes (object stores / network filesystems) mounted inside
-    /// the guest via rclone on every start. See `crate::remote_volume`.
+    /// Remote volumes (S3-compatible object stores) mounted inside the guest
+    /// by the agent on every start. See `crate::remote_volume`.
     #[serde(default)]
     pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
 
@@ -884,9 +884,10 @@ impl VmRecord {
         ))
     }
 
-    /// Remote volumes mount via rclone inside the workload image over the
-    /// guest network; refuse configurations that can never mount at create
-    /// instead of failing every start. Shared by the CLI and API create paths.
+    /// Remote volumes are mounted into the workload container's mount
+    /// namespace, so there has to be a container: refuse configurations that
+    /// can never mount at create instead of failing every start. Shared by the
+    /// CLI and API create paths.
     pub fn validate_remote_volumes(&self) -> crate::Result<()> {
         if self.remote_volumes.is_empty() {
             return Ok(());
@@ -894,8 +895,8 @@ impl VmRecord {
         if self.image.is_none() {
             return Err(crate::Error::config(
                 "create machine",
-                "remote volumes (s3:// or rclone remotes) require an image machine \
-                 whose image provides `rclone` and `fusermount3`",
+                "remote volumes require an image machine: they are mounted into \
+                 the workload container's mount namespace",
             ));
         }
         let plan = crate::network::plan_launch_network(
