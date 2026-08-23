@@ -52,11 +52,36 @@ live):
 python3 rfb_probe.py 127.0.0.1 5900
 ```
 
-## Not Omarchy yet
+## Omarchy
 
-Omarchy ships as an ISO that pacstraps `install/omarchy-base.packages`. 126 of
-those 148 packages resolve from the official Arch repos and install cleanly
-here; the remaining 22 are AUR or Omarchy-published (`omarchy-nvim`, `omacut`,
-`aether`, …) and are ordinary Arch packaging work, not a smolvm limitation.
-`run.sh` installs the Arch-resolvable base, which is the same compositor and
-the same session — just without Omarchy's own packages and theming.
+`omarchy.sh` runs the real thing: omarchy's package set (126 of its 148 base
+packages resolve from the official Arch repos; the rest are AUR or
+Omarchy-published and are packaging work, not a smolvm limitation), omarchy's
+actual Hyprland Lua config, and its theme — verified live over VNC with a
+two-captures-differ check.
+
+```sh
+SMOLVM_DISPLAY=1280x800 SMOLVM_VNC=127.0.0.1:5900 \
+  smolvm machine run --net --gpu --cpus 4 --mem 6144 \
+    -v "$PWD:/in" --image archlinux:latest -- bash /in/omarchy.sh
+```
+
+Four things the script handles that cost real debugging time:
+
+- omarchy's `hyprland.lua` loads `/usr/share/omarchy/default/hypr/bootstrap.lua`
+  — the **system** path. With the repo only under `~/.local/share`, the Lua
+  config errors and Hyprland silently drops into emergency mode: desktop up,
+  but no binds and no autostart.
+- `foot.ini` (and other app configs) include the **state** theme link
+  `~/.local/state/omarchy/current/theme/…`, which the installer normally
+  creates — without it foot exits at startup.
+- omarchy's shell (bar, notifications, wallpaper) is a single Quickshell app
+  launched through systemd user units; a workload container has no systemd
+  user session (and no `/etc/machine-id`, which D-Bus requires), so the script
+  runs `dbus-uuidgen --ensure`, starts a session bus, and spawns
+  `quickshell -p "$OMARCHY_PATH/shell"` directly. Under the Lua config,
+  `hyprctl dispatch exec` parses its argument as Lua — spawn clients as plain
+  processes.
+- virtio-gpu has no explicit-sync or hardware-cursor support yet:
+  `AQ_NO_ATOMIC=1` plus runtime `hyprctl keyword render:explicit_sync 0` and
+  `cursor:no_hardware_cursors true`.
