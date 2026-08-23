@@ -31,6 +31,12 @@ use crate::s3;
 const DIR_MODE: u32 = 0o040755;
 const FILE_MODE: u32 = 0o100644;
 
+/// `fuse_setattr_in.valid` bits this filesystem acts on. Ownership, mode and
+/// timestamps are accepted and ignored — an object store has no place to put
+/// them — but a size change is real and must be applied.
+const FATTR_SIZE: u32 = 1 << 3;
+const FATTR_FH: u32 = 1 << 6;
+
 /// A file opened for writing, staged on local disk until flush.
 struct Staged {
     file: std::fs::File,
@@ -120,6 +126,28 @@ impl S3Fs {
             if let Some(ino) = paths.remove(path) {
                 inodes.remove(&ino);
             }
+        }
+    }
+
+    /// Move an inode's mapping from `from` to `to`.
+    ///
+    /// `rename(2)` does not mint a new inode: the kernel moves the dentry and
+    /// keeps the same inode number under the new name. Forgetting the inode
+    /// here instead would leave the kernel holding one this filesystem no
+    /// longer recognises, and every later lookup on it would fail even though
+    /// the object is intact in the bucket.
+    fn rename_path(&self, from: &str, to: &str) {
+        let (Ok(mut paths), Ok(mut inodes)) = (self.paths.lock(), self.inodes.lock()) else {
+            return;
+        };
+        // A destination that already existed is replaced, exactly as rename
+        // replaces it in the bucket.
+        if let Some(old) = paths.remove(to) {
+            inodes.remove(&old);
+        }
+        if let Some(ino) = paths.remove(from) {
+            inodes.insert(ino, to.to_string());
+            paths.insert(to.to_string(), ino);
         }
     }
 
@@ -229,6 +257,45 @@ impl S3Fs {
         Ok(fh)
     }
 
+    /// Resize a file to `size`, in the staging file when a handle is open and
+    /// in the object itself otherwise.
+    ///
+    /// Truncation is not a formality here: unless `atomic_o_trunc` is
+    /// negotiated the kernel turns `O_TRUNC` into a `SETATTR` with a new size,
+    /// so a filesystem that ignores this silently keeps the old contents — a
+    /// program that rewrites a file with fewer bytes would leave the previous
+    /// tail in place and read back a mix of old and new data.
+    fn truncate(&self, path: &str, fh: Option<u64>, size: u64) -> Result<(), i32> {
+        if let Some(fh) = fh {
+            if let Ok(mut guard) = self.staged.lock() {
+                if let Some(st) = guard.get_mut(&fh) {
+                    st.file.set_len(size).map_err(|_| libc::EIO)?;
+                    st.size = size;
+                    st.dirty = true;
+                    if let Ok(mut pending) = self.pending.lock() {
+                        pending.insert(path.to_string(), size);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        // No open handle: rewrite the object at its new length. Growing pads
+        // with zeroes, which is what a sparse-less truncate(2) produces.
+        let mut bytes = if size == 0 {
+            Vec::new()
+        } else {
+            self.client.get(path, None).unwrap_or_default()
+        };
+        bytes.resize(size as usize, 0);
+        self.client.put(path, &bytes).map_err(|_| libc::EIO)?;
+        // The object now really is this size, so no pending entry is needed —
+        // and a stale one would misreport the size of every later read.
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(path);
+        }
+        Ok(())
+    }
+
     /// Upload a staged file and drop its staging state.
     fn flush_staged(&self, fh: u64, path: &str, close: bool) -> Result<(), i32> {
         let mut guard = match self.staged.lock() {
@@ -304,6 +371,14 @@ impl Filesystem for S3Fs {
                 let Some(path) = self.path_of(req.nodeid) else {
                     return Reply::Error(libc::ENOENT);
                 };
+                // fuse_setattr_in: valid(4) padding(4) fh(8) size(8) ...
+                let valid = req.u32_at(0);
+                if valid & FATTR_SIZE != 0 {
+                    let fh = (valid & FATTR_FH != 0).then(|| req.u64_at(8));
+                    if let Err(e) = self.truncate(&path, fh, req.u64_at(16)) {
+                        return Reply::Error(e);
+                    }
+                }
                 match self.stat(&path) {
                     Some(node) => Reply::Attr(self.attr_for(req.nodeid, &node)),
                     None => Reply::Error(libc::ENOENT),
@@ -612,7 +687,7 @@ impl Filesystem for S3Fs {
                     return Reply::Error(libc::EIO);
                 }
                 let _ = self.client.delete(&from);
-                self.forget_path(&from);
+                self.rename_path(&from, &to);
                 Reply::Ok
             }
 
@@ -657,6 +732,40 @@ mod tests {
             dir,
         )
         .expect("scratch dir is creatable")
+    }
+
+    // `rename(2)` keeps the inode and moves the name onto it. Forgetting the
+    // inode instead leaves the kernel holding one the filesystem no longer
+    // knows, and every later read of the renamed file comes back empty even
+    // though the object is intact in the bucket.
+    #[test]
+    fn renaming_repoints_the_inode_instead_of_dropping_it() {
+        let fs = fs();
+        let ino = fs.ino_for("d/old.txt");
+        fs.rename_path("d/old.txt", "d/new.txt");
+        assert_eq!(
+            fs.path_of(ino).as_deref(),
+            Some("d/new.txt"),
+            "the kernel still holds this inode, so it must resolve to the new name"
+        );
+        assert_eq!(
+            fs.ino_for("d/new.txt"),
+            ino,
+            "looking the new name up again must not mint a second inode"
+        );
+    }
+
+    // Renaming onto an existing name replaces it in the bucket, so the
+    // replaced inode must not linger and shadow the survivor.
+    #[test]
+    fn renaming_over_an_existing_name_drops_the_replaced_inode() {
+        let fs = fs();
+        let src = fs.ino_for("d/src.txt");
+        let dst = fs.ino_for("d/dst.txt");
+        assert_ne!(src, dst);
+        fs.rename_path("d/src.txt", "d/dst.txt");
+        assert_eq!(fs.path_of(src).as_deref(), Some("d/dst.txt"));
+        assert_eq!(fs.path_of(dst), None, "the replaced inode is gone");
     }
 
     #[test]
