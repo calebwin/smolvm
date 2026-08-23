@@ -21,18 +21,19 @@ connector, and every DRM compositor refuses to start with "not a KMS device".
 `SMOLVM_VNC=[host:]port` serves the resulting framebuffer over RFB. A bare port
 binds loopback only. The session is interactive: smolvm attaches a virtio
 keyboard and an absolute pointer, and client key/pointer events are injected
-into the guest. This needs a libkrun built with the input feature and a guest
-that runs udevd (see below); with either missing the session degrades to
-view-only.
+into the guest. This needs a libkrun built with the input feature; without it
+the session degrades to view-only.
 
-For the guest's compositor to *see* the devices, libinput's udev backend
-needs a udev database — a workload container does not run one, so start it
-before the compositor:
+For the guest's compositor to *see* the devices, two container-guest gaps
+must be bridged before it starts (both handled by `omarchy.sh`):
 
-```sh
-/usr/lib/systemd/systemd-udevd --daemon
-udevadm trigger --action=add && udevadm settle
-```
+- `/dev` is not devtmpfs, so the evdev nodes the kernel registers never
+  appear — `mknod` them from `/sys/class/input/event*/dev`.
+- libinput only adopts devices classified in the udev database, and
+  `systemd-udevd` cannot populate it without a full systemd runtime. libudev
+  reads `/run/udev/data` directly, so write `c<major>:<minor>` entries by
+  hand with `E:ID_INPUT=1` plus a type (`E:ID_INPUT_KEYBOARD=1` /
+  `E:ID_INPUT_MOUSE=1`).
 
 Both are opt-in. A connector changes guest topology, and existing GPU workloads
 (CUDA remoting, headless Vulkan) neither need nor want one.

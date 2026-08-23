@@ -38,12 +38,31 @@ chmod 666 /dev/dri/* 2>/dev/null
 # need a session bus — a container guest has neither out of the box.
 dbus-uuidgen --ensure 2>/dev/null || true
 
-# libinput's udev backend only sees devices that are in the udev database; a
-# container guest runs no udevd, so without this the compositor gets no
-# keyboard or pointer even though /dev/input has them.
-/usr/lib/systemd/systemd-udevd --daemon 2>/dev/null
-udevadm trigger --action=add 2>/dev/null
-udevadm settle 2>/dev/null
+# Input devices need two container-guest fixes. First: /dev is not devtmpfs,
+# so the evdev nodes the kernel registered (visible in /sys/class/input)
+# never appear in /dev — create them, the same way k3d guests need /dev/kmsg.
+mkdir -p /dev/input
+for e in /sys/class/input/event*; do
+  [ -e "$e" ] || continue
+  n=$(basename "$e")
+  maj=$(cut -d: -f1 "$e/dev"); min=$(cut -d: -f2 "$e/dev")
+  [ -e "/dev/input/$n" ] || mknod "/dev/input/$n" c "$maj" "$min"
+done
+
+# Second: libinput only adopts devices classified in the udev database, and
+# systemd-udevd cannot populate it without a full systemd runtime. libudev
+# reads /run/udev/data directly and needs no daemon, so write the entries by
+# hand (the file's existence also marks the device "initialized").
+mkdir -p /run/udev/data
+for e in /sys/class/input/event*; do
+  [ -e "$e" ] || continue
+  devnum=$(cat "$e/dev")
+  case "$(cat "$e/device/name" 2>/dev/null)" in
+    *keyboard*) type=ID_INPUT_KEYBOARD ;;
+    *)          type=ID_INPUT_MOUSE ;;
+  esac
+  printf 'E:ID_INPUT=1\nE:%s=1\nG:seat\nQ:seat\n' "$type" > "/run/udev/data/c$devnum"
+done
 
 # A VT-bound seat cannot open a session in a container with no /dev/tty0.
 SEATD_VTBOUND=0 seatd -g wheel >/tmp/seatd.log 2>&1 &
