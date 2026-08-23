@@ -614,7 +614,9 @@ impl PodBackend for EnginePodBackend {
                 },
                 persistent: true,
                 runtime_managed: true,
-                labels: Default::default(),
+                // Spread the rest so a new spec field does not break the shim.
+                // A pod sandbox mounts nothing remote of its own.
+                ..Default::default()
             };
             match rt.create_machine(spec.clone()) {
                 Ok(()) => {}
