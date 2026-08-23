@@ -43,6 +43,8 @@ pub struct MachineSpec {
     /// record so node-reboot reconciliation can reclaim it (and only it) when
     /// its process is gone. Defaults to false for CLI/SDK machines.
     pub runtime_managed: bool,
+    /// S3-compatible volumes the agent mounts inside the guest on every start.
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
 }
 
 impl MachineSpec {
@@ -70,6 +72,7 @@ impl MachineSpec {
         record.labels = self.labels.clone();
         record.ephemeral = !self.persistent;
         record.runtime_managed = self.runtime_managed;
+        record.remote_volumes = self.remote_volumes.clone();
         record
     }
 }
