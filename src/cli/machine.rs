@@ -2966,12 +2966,11 @@ pub struct CreateCmd {
     pub overlay: Option<u64>,
 
     /// Mount host directory (can be used multiple times). Also accepts
-    /// remote sources mounted inside the guest via rclone on every start:
+    /// S3-compatible object storage, mounted inside the guest on every start:
     /// `s3://bucket/prefix:/data[:ro]` (credentials from --env
     /// AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL
-    /// for R2/MinIO; anonymous without them) or any raw rclone remote,
-    /// e.g. `:sftp,host=example.com,user=me:/srv:/data`. The image must
-    /// provide `rclone` and `fusermount3`.
+    /// for R2/MinIO; anonymous without them). Nothing is required of the
+    /// image: the agent performs the mount itself.
     #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
     pub volume: Vec<String>,
 

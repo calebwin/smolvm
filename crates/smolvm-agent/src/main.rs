@@ -6632,7 +6632,7 @@ mod tests {
         std::fs::write(proc_dir.join("stat"), proc_stat_fixture(123, 'S', 4242)).unwrap();
 
         assert_eq!(
-            crun_container_pid_at("smolvm-test", &state_root, &proc_root),
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, true),
             Some(123)
         );
 
@@ -6640,14 +6640,22 @@ mod tests {
         // running workload and must not be selected for namespace entry.
         std::fs::write(state_dir.join("exec.fifo"), []).unwrap();
         assert_eq!(
-            crun_container_pid_at("smolvm-test", &state_root, &proc_root),
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, true),
             None
         );
 
         // Path traversal is rejected before any status lookup.
         assert_eq!(
-            crun_container_pid_at("../smolvm-test", &state_root, &proc_root),
+            crun_container_pid_at("../smolvm-test", &state_root, &proc_root, true),
             None
+        );
+
+        // Remote volumes are mounted between `crun create` and `crun start`,
+        // when the fifo still exists: that lookup must find the same pid the
+        // running one would, or the mount has no namespace to enter.
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, false),
+            Some(123)
         );
     }
 

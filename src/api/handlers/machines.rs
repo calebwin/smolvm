@@ -407,7 +407,7 @@ pub async fn create_machine(
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
-    // Split remote volumes (s3:// or rclone-remote sources) from host mounts,
+    // Split remote volumes (`s3://` sources) from host mounts,
     // mirroring the CLI's -v handling, then validate the host mount paths.
     let mut remote_volumes = Vec::new();
     let mut host_mount_specs: Vec<crate::api::types::MountSpec> = Vec::new();

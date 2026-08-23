@@ -129,7 +129,7 @@ pub struct MachineRegistration {
     pub manager: AgentManager,
     /// Host mounts to configure.
     pub mounts: Vec<MountSpec>,
-    /// Remote volumes (s3:// or rclone remotes) to mount in the workload.
+    /// Remote volumes (`s3://`) to mount in the workload.
     pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
     /// Port mappings to configure.
     pub ports: Vec<PortSpec>,

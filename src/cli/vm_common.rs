@@ -586,9 +586,8 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     validate_vm_name(&params.name, "machine name")
         .map_err(|reason| smolvm::Error::config("create machine", reason))?;
 
-    // Peel off remote volume specs (s3:// and raw rclone remotes) before the
-    // host-directory parse; they mount inside the guest at start instead of
-    // through virtiofs.
+    // Peel off remote volume specs (`s3://`) before the host-directory parse;
+    // they mount inside the guest at start instead of through virtiofs.
     let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
 
     // Parse and validate volume mounts
@@ -709,9 +708,9 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     // pull), so refuse here rather than deferring to a `start` that must fail.
     record.validate_image_fetchable()?;
 
-    // Remote volumes mount via rclone inside the workload image; an imageless
-    // machine has nowhere to run it, and they also need network to reach the
-    // remote. Refuse at create instead of failing every start.
+    // Remote volumes mount into the workload container's namespace, so an
+    // imageless machine has nowhere to put them, and they need network to
+    // reach the bucket. Refuse at create instead of failing every start.
     record.validate_remote_volumes()?;
 
     Ok(record)
