@@ -79,15 +79,21 @@ check "the image really has no fusermount3" \
 $S machine create --name rv-badbucket --image alpine:latest --net --net-backend virtio-net $CREDS \
   -v "s3://nosuchbucket:/mnt/q" -- sleep infinity >/dev/null 2>&1
 OUT=$($S machine start --name rv-badbucket 2>&1)
-echo "$OUT" | grep -q "not reachable" && ok "missing bucket fails the start" || bad "missing bucket fails the start"
-echo "$OUT" | grep -qi "nosuchbucket" && ok "the failure names the bucket" || bad "the failure names the bucket"
+# Assert the DISCRIMINATING part of the message. "not reachable" alone is also
+# what a transport error produces, so grepping only for that would pass when the
+# MinIO rig itself is down -- reporting success for the wrong reason while every
+# positive case fails.
+echo "$OUT" | grep -q "NoSuchBucket" && ok "missing bucket fails the start" || bad "missing bucket fails the start ($OUT)"
+echo "$OUT" | grep -qi "nosuchbucket:" && ok "the failure names the bucket" || bad "the failure names the bucket"
 
 $S machine create --name rv-deadendpoint --image alpine:latest --net --net-backend virtio-net \
   --env AWS_ACCESS_KEY_ID=smoltest --env AWS_SECRET_ACCESS_KEY=smoltest123 \
   --env AWS_ENDPOINT_URL=http://127.0.0.1:9999 \
   -v "s3://rv-bucket:/mnt/q" -- sleep infinity >/dev/null 2>&1
 OUT=$($S machine start --name rv-deadendpoint 2>&1)
-echo "$OUT" | grep -q "not reachable" && ok "dead endpoint fails the start" || bad "dead endpoint fails the start"
+# Here a transport failure IS the expected cause, so match it specifically
+# rather than the shared "not reachable" prefix.
+echo "$OUT" | grep -q "transport:" && ok "dead endpoint fails the start" || bad "dead endpoint fails the start ($OUT)"
 
 # ---- 4. rw round trip, out-of-band verified -------------------------------
 $S machine create --name rv-rw --image alpine:latest --net --net-backend virtio-net $CREDS \
@@ -242,7 +248,7 @@ check "ephemeral run write visible out-of-band" "$(oob run.txt)" "run-1"
 # against an empty directory.
 OUT=$($S machine run --image alpine:latest --net --net-backend virtio-net $CREDS \
   -v "s3://nosuchbucket:/mnt/run" -- echo SHOULD-NOT-RUN 2>&1)
-echo "$OUT" | grep -q "not reachable" && ok "ephemeral run fails on an unusable bucket" || bad "ephemeral run fails on an unusable bucket"
+echo "$OUT" | grep -q "NoSuchBucket" && ok "ephemeral run fails on an unusable bucket" || bad "ephemeral run fails on an unusable bucket"
 echo "$OUT" | grep -q "SHOULD-NOT-RUN" && bad "the command must not run without its volume" || ok "the command does not run without its volume"
 
 # ---- 12. service image keeps its own entrypoint AND still mounts -----------
