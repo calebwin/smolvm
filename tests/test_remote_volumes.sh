@@ -111,6 +111,27 @@ check "externally written object is visible" \
 $S machine exec --name rv-rw -- sh -c 'rm /mnt/rw/rt.txt' >/dev/null 2>&1
 check "unlink removes the object" "$(oob rt.txt)" ""
 
+# Rewriting a file with fewer bytes must not leave the old tail behind. This is
+# checked out-of-band on purpose: the mount can report the correct short length
+# from its own staging state while the stored object is still the long one.
+$S machine exec --name rv-rw -- sh -c 'printf AAAAAAAAAA > /mnt/rw/shrink.txt' >/dev/null 2>&1
+$S machine exec --name rv-rw -- sh -c 'printf BB > /mnt/rw/shrink.txt' >/dev/null 2>&1
+check "rewriting shorter leaves no old tail" "$(oob shrink.txt)" "BB"
+
+# Truncation has to reach the bucket too: unless atomic_o_trunc is negotiated
+# the kernel sends O_TRUNC as a size change, which is easy to accept and drop.
+$S machine exec --name rv-rw -- sh -c 'printf 0123456789 > /mnt/rw/trunc.txt' >/dev/null 2>&1
+$S machine exec --name rv-rw -- sh -c ': > /mnt/rw/trunc.txt' >/dev/null 2>&1
+check "truncate to zero is stored" \
+  "$($S machine exec --name rv-rw -- sh -c 'wc -c < /mnt/rw/trunc.txt' 2>/dev/null | tr -d ' \r\n')" "0"
+
+# rename(2) keeps the inode, so the renamed file must stay readable through the
+# live mount -- not only after a remount.
+$S machine exec --name rv-rw -- sh -c 'echo moved > /mnt/rw/from.txt; mv /mnt/rw/from.txt /mnt/rw/to.txt' >/dev/null 2>&1
+check "renamed file is readable through the live mount" \
+  "$($S machine exec --name rv-rw -- sh -c 'cat /mnt/rw/to.txt' 2>/dev/null | tr -d '\r\n')" "moved"
+check "renamed file is in the bucket" "$(oob to.txt)" "moved"
+
 # ---- 5. restart: mount returns, content intact ----------------------------
 $S machine exec --name rv-rw -- sh -c 'echo keep > /mnt/rw/keep.txt' >/dev/null 2>&1
 $S machine stop --name rv-rw >/dev/null 2>&1

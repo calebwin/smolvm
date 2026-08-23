@@ -41,6 +41,9 @@ const FATTR_FH: u32 = 1 << 6;
 struct Staged {
     file: std::fs::File,
     path: std::path::PathBuf,
+    /// Object key this handle stages, so a truncate that arrives without a
+    /// file handle can still find the staging files it has to resize.
+    key: String,
     size: u64,
     dirty: bool,
 }
@@ -246,6 +249,7 @@ impl S3Fs {
                 Staged {
                     file,
                     path: spath,
+                    key: path.to_string(),
                     size,
                     dirty: truncate,
                 },
@@ -266,18 +270,29 @@ impl S3Fs {
     /// program that rewrites a file with fewer bytes would leave the previous
     /// tail in place and read back a mix of old and new data.
     fn truncate(&self, path: &str, fh: Option<u64>, size: u64) -> Result<(), i32> {
-        if let Some(fh) = fh {
-            if let Ok(mut guard) = self.staged.lock() {
-                if let Some(st) = guard.get_mut(&fh) {
-                    st.file.set_len(size).map_err(|_| libc::EIO)?;
-                    st.size = size;
-                    st.dirty = true;
-                    if let Ok(mut pending) = self.pending.lock() {
-                        pending.insert(path.to_string(), size);
-                    }
-                    return Ok(());
+        let mut staged_any = false;
+        if let Ok(mut guard) = self.staged.lock() {
+            // Resize every open handle on this object, not only the one the
+            // request names. An `O_TRUNC` open arrives as a truncate with no
+            // file handle while a staging file is already open, and leaving
+            // that staging file at its old length puts the stale tail back
+            // over the new contents at flush — the file reads correctly
+            // through the mount while the stored object is corrupt.
+            for (handle, st) in guard.iter_mut() {
+                if st.key != path && Some(*handle) != fh {
+                    continue;
                 }
+                st.file.set_len(size).map_err(|_| libc::EIO)?;
+                st.size = size;
+                st.dirty = true;
+                staged_any = true;
             }
+        }
+        if staged_any {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.insert(path.to_string(), size);
+            }
+            return Ok(());
         }
         // No open handle: rewrite the object at its new length. Growing pads
         // with zeroes, which is what a sparse-less truncate(2) produces.
