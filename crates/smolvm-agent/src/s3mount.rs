@@ -23,40 +23,22 @@ use smolvm_s3fs::{s3, sigv4, MountOptions};
 
 const HELPER_ARG: &str = "s3-mount";
 
-/// Everything the helper needs, passed as one JSON argv entry so credentials
-/// never appear in a separate process's environment or on a shared command
-/// line more than once.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct MountSpec {
-    pub endpoint: String,
-    pub region: String,
-    pub bucket: String,
-    #[serde(default)]
-    pub prefix: String,
-    pub mountpoint: String,
-    #[serde(default)]
-    pub read_only: bool,
-    #[serde(default)]
-    pub access_key_id: Option<String>,
-    #[serde(default)]
-    pub secret_access_key: Option<String>,
-    #[serde(default)]
-    pub session_token: Option<String>,
-}
+/// The helper speaks the protocol's own volume type: one definition means the
+/// wire format and the mount helper cannot drift apart.
+pub type MountSpec = smolvm_protocol::S3Volume;
 
-impl MountSpec {
-    fn credentials(&self) -> Option<sigv4::Credentials> {
-        match (&self.access_key_id, &self.secret_access_key) {
-            // Both halves or neither: a half-configured key would sign
-            // requests that always fail, which is harder to diagnose than
-            // an explicit anonymous request.
-            (Some(k), Some(s)) if !k.is_empty() && !s.is_empty() => Some(sigv4::Credentials {
-                access_key_id: k.clone(),
-                secret_access_key: s.clone(),
-                session_token: self.session_token.clone(),
-            }),
-            _ => None,
-        }
+/// Credentials for a volume, or `None` for anonymous access.
+///
+/// A half-supplied key pair would sign every request with a broken credential,
+/// which is harder to diagnose than an explicit anonymous request.
+fn credentials_of(spec: &MountSpec) -> Option<sigv4::Credentials> {
+    match (&spec.access_key_id, &spec.secret_access_key) {
+        (Some(k), Some(sec)) if !k.is_empty() && !sec.is_empty() => Some(sigv4::Credentials {
+            access_key_id: k.clone(),
+            secret_access_key: sec.clone(),
+            session_token: spec.session_token.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -103,7 +85,7 @@ pub fn run_helper() -> i32 {
         region: spec.region.clone(),
         bucket: spec.bucket.clone(),
         prefix: spec.prefix.clone(),
-        credentials: spec.credentials(),
+        credentials: credentials_of(&spec),
         // Path-style works against AWS and every S3-compatible server; virtual
         // host style would need per-provider DNS assumptions.
         path_style: true,
@@ -269,20 +251,20 @@ mod tests {
     // credential; anonymous is both correct and far easier to diagnose.
     #[test]
     fn credentials_need_both_halves_or_none() {
-        assert!(spec().credentials().is_some());
+        assert!(credentials_of(&spec()).is_some());
 
         let mut half = spec();
         half.secret_access_key = None;
-        assert!(half.credentials().is_none());
+        assert!(credentials_of(&half).is_none());
 
         let mut empty = spec();
         empty.access_key_id = Some(String::new());
-        assert!(empty.credentials().is_none());
+        assert!(credentials_of(&empty).is_none());
 
         let mut anon = spec();
         anon.access_key_id = None;
         anon.secret_access_key = None;
-        assert!(anon.credentials().is_none());
+        assert!(credentials_of(&anon).is_none());
     }
 
     #[test]
@@ -298,6 +280,6 @@ mod tests {
         let s: MountSpec = serde_json::from_str(json).unwrap();
         assert_eq!(s.prefix, "");
         assert!(!s.read_only);
-        assert!(s.credentials().is_none());
+        assert!(credentials_of(&s).is_none());
     }
 }

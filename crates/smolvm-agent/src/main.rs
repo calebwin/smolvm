@@ -3274,7 +3274,7 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id,
         unprivileged,
-        remote_volume_mount,
+        s3_volumes,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3623,7 +3623,7 @@ fn handle_run_detached(
         mounts,
         persistent_overlay_id,
         unprivileged,
-        remote_volume_mount,
+        s3_volumes,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3710,16 +3710,19 @@ fn handle_run_detached(
     // (command, Env, WorkingDir, User) with the request layered on top.
     // `write_oci_bundle` requires a `ResolvedLaunch`, so the image config can't be
     // silently dropped here or on any other launch path.
-    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes) {
-        Ok(l) => l,
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    // `resolve` only needs to know WHETHER volumes exist (to pick a keep-alive
+    // command); the mount step below needs the values themselves.
+    let launch =
+        match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes.clone()) {
+            Ok(l) => l,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
     info!(image = %image, command = ?launch.command, workdir = ?launch.workdir, user = ?launch.user, "resolved launch from request + image config");
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
@@ -3825,8 +3828,8 @@ fn handle_run_detached(
     // that reads its data directory immediately cannot race the mount. It also
     // means the workload command itself is never rewritten: the image's own
     // entrypoint runs exactly as its author wrote it.
-    if !s3_mounts.is_empty() {
-        if let Err(e) = s3mount::mount_all(&container_id, &s3_mounts) {
+    if !s3_volumes.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, &s3_volumes) {
             let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
             let _ = crun::CrunCommand::delete(&container_id, true).output();
             send_response(
@@ -5433,7 +5436,7 @@ fn run_background_in_keepalive(
         user.map(str::to_string),
         // Keep-alive/exec path: it JOINS the workload container that already
         // holds the remote-volume mount, so no mount is established here.
-        None,
+        Vec::new(),
     )?;
 
     let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
@@ -5575,7 +5578,7 @@ fn run_in_keepalive_container(
         user.map(str::to_string),
         // Keep-alive/exec path: it JOINS the workload container that already
         // holds the remote-volume mount, so no mount is established here.
-        None,
+        Vec::new(),
     )?;
 
     // Reuse the running keep-alive container, or establish one now so this and
