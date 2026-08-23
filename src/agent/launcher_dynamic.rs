@@ -258,7 +258,37 @@ pub fn launch_agent_vm_dynamic(
                                 .as_deref()
                                 .and_then(crate::agent::vnc::parse_bind_addr)
                             {
-                                match crate::agent::vnc::serve(&bind, framebuffer) {
+                                // Input is best-effort: a libkrun without the
+                                // input feature degrades to view-only rather
+                                // than blocking the display.
+                                let input = match krun.add_input_device {
+                                    Some(add_input) => {
+                                        match crate::agent::input::install(add_input, ctx) {
+                                            Ok(i) => {
+                                                tracing::info!(
+                                                    "vnc input devices attached \
+                                                     (keyboard + pointer)"
+                                                );
+                                                Some(i)
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "vnc input unavailable; view-only"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::info!(
+                                            "libkrun has no krun_add_input_device; \
+                                             vnc is view-only"
+                                        );
+                                        None
+                                    }
+                                };
+                                match crate::agent::vnc::serve(&bind, framebuffer, input) {
                                     Ok(addr) => {
                                         tracing::info!(%addr, "vnc server listening")
                                     }

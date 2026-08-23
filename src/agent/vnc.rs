@@ -6,10 +6,10 @@
 //! sway, GNOME, a plain framebuffer — is visible through this without knowing
 //! it is being watched.
 //!
-//! Scope is deliberately small: RFB 3.8, no authentication, Raw encoding,
-//! output only. Input (keyboard/pointer) needs a virtio-input device that
-//! smolvm does not yet attach, so client input events are read and discarded
-//! rather than silently appearing to work.
+//! Scope is deliberately small: RFB 3.8, no authentication, Raw encoding.
+//! When the launcher attaches virtio-input devices, client key and pointer
+//! events are injected into the guest; on a libkrun without the input
+//! feature the session degrades to view-only and events are discarded.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -128,7 +128,13 @@ fn encode_pixels<'a>(bgrx: &'a [u8], fmt: &PixelFormat) -> std::borrow::Cow<'a, 
 }
 
 /// Start the RFB server. Returns the bound address so callers can log it.
-pub fn serve(addr: &str, fb: Arc<DisplayFramebuffer>) -> std::io::Result<std::net::SocketAddr> {
+/// With `input` present, client key and pointer events are injected into the
+/// guest's virtio-input devices; without it the session is view-only.
+pub fn serve(
+    addr: &str,
+    fb: Arc<DisplayFramebuffer>,
+    input: Option<super::input::VncInput>,
+) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
 
@@ -139,11 +145,12 @@ pub fn serve(addr: &str, fb: Arc<DisplayFramebuffer>) -> std::io::Result<std::ne
                 match stream {
                     Ok(s) => {
                         let fb = Arc::clone(&fb);
+                        let input = input.clone();
                         let peer = s.peer_addr().ok();
                         if let Err(e) = std::thread::Builder::new()
                             .name("smolvm-vnc-client".into())
                             .spawn(move || {
-                                if let Err(e) = handle_client(s, fb) {
+                                if let Err(e) = handle_client(s, fb, input) {
                                     tracing::debug!(?peer, error = %e, "vnc client ended");
                                 }
                             })
@@ -183,7 +190,11 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
         || e.raw_os_error() == Some(libc::ENOMEM)
 }
 
-fn handle_client(mut s: TcpStream, fb: Arc<DisplayFramebuffer>) -> std::io::Result<()> {
+fn handle_client(
+    mut s: TcpStream,
+    fb: Arc<DisplayFramebuffer>,
+    input: Option<super::input::VncInput>,
+) -> std::io::Result<()> {
     s.set_nodelay(true).ok();
 
     // --- handshake -------------------------------------------------------
@@ -234,6 +245,7 @@ fn handle_client(mut s: TcpStream, fb: Arc<DisplayFramebuffer>) -> std::io::Resu
     // --- message loop ----------------------------------------------------
     let mut last_generation = 0u64;
     let mut client_supports_resize = false;
+    let mut last_button_mask = 0u8;
 
     loop {
         let mut kind = [0u8; 1];
@@ -318,14 +330,67 @@ fn handle_client(mut s: TcpStream, fb: Arc<DisplayFramebuffer>) -> std::io::Resu
                 send_frame(&mut s, &frame, &fmt)?;
             }
             4 => {
-                // KeyEvent — read and drop; no input device is attached.
+                // KeyEvent: down-flag, 2 bytes padding, u32 keysym.
                 let mut buf = [0u8; 7];
                 s.read_exact(&mut buf)?;
+                if let Some(ref input) = input {
+                    let down = buf[0] != 0;
+                    let keysym = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+                    match super::input::keysym_to_evdev(keysym) {
+                        Some(code) => {
+                            input
+                                .keyboard
+                                .push(&[(super::input::EV_KEY, code, down as u32)])
+                        }
+                        None => tracing::debug!(keysym, "vnc keysym with no evdev mapping"),
+                    }
+                }
             }
             5 => {
-                // PointerEvent — read and drop.
+                // PointerEvent: button mask, u16 x, u16 y.
                 let mut buf = [0u8; 5];
                 s.read_exact(&mut buf)?;
+                if let Some(ref input) = input {
+                    let mask = buf[0];
+                    let x = u16::from_be_bytes([buf[1], buf[2]]) as u32;
+                    let y = u16::from_be_bytes([buf[3], buf[4]]) as u32;
+
+                    // Absolute axes use a fixed virtual range; scale from the
+                    // framebuffer size the client is looking at so a guest
+                    // mode change never needs new absinfo.
+                    let scale = |v: u32, span: u32| -> u32 {
+                        let span = span.max(2);
+                        (v.min(span - 1) * super::input::ABS_RANGE) / (span - 1)
+                    };
+                    let mut batch: Vec<(u16, u16, u32)> = vec![
+                        (super::input::EV_ABS, 0, scale(x, width)),
+                        (super::input::EV_ABS, 1, scale(y, height)),
+                    ];
+
+                    // RFB buttons: bit 0 = left, 1 = middle, 2 = right;
+                    // bits 3/4 are wheel up/down, sent as press+release per
+                    // notch, so only the rising edge scrolls.
+                    let changed = mask ^ last_button_mask;
+                    for (bit, code) in [
+                        (0u8, super::input::BTN_LEFT),
+                        (1, super::input::BTN_MIDDLE),
+                        (2, super::input::BTN_RIGHT),
+                    ] {
+                        if changed & (1 << bit) != 0 {
+                            let down = mask & (1 << bit) != 0;
+                            batch.push((super::input::EV_KEY, code, down as u32));
+                        }
+                    }
+                    if changed & mask & (1 << 3) != 0 {
+                        batch.push((super::input::EV_REL, super::input::REL_WHEEL, 1));
+                    }
+                    if changed & mask & (1 << 4) != 0 {
+                        batch.push((super::input::EV_REL, super::input::REL_WHEEL, -1i32 as u32));
+                    }
+                    last_button_mask = mask;
+
+                    input.pointer.push(&batch);
+                }
             }
             6 => {
                 // ClientCutText: 3 padding + u32 length + text

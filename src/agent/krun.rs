@@ -74,6 +74,11 @@ pub struct KrunFunctions {
     /// completes and a compositor blocks on it forever. `None` on libkrun
     /// builds predating the API.
     pub set_display_backend: Option<unsafe extern "C" fn(u32, *const libc::c_void, usize) -> i32>,
+    /// Registers a virtio-input device from a config vtable and an event
+    /// provider vtable; present only in libkrun builds with the input feature.
+    pub add_input_device: Option<
+        unsafe extern "C" fn(u32, *const libc::c_void, usize, *const libc::c_void, usize) -> i32,
+    >,
     /// Retrieve guest RAM regions (`gpa_start, host_va, len` triples) for
     /// zero-copy CUDA transfers. `None` on libkrun builds that predate the API.
     pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
@@ -168,6 +173,7 @@ impl KrunFunctions {
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
         let add_display = load_optional_sym!("krun_add_display");
         let set_display_backend = load_optional_sym!("krun_set_display_backend");
+        let add_input_device = load_optional_sym!("krun_add_input_device");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
@@ -196,6 +202,7 @@ impl KrunFunctions {
             set_gpu_options2,
             add_display,
             set_display_backend,
+            add_input_device,
             get_guest_ram,
             set_control_socket,
             set_snapshot,

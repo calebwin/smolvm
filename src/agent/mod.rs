@@ -8,6 +8,7 @@ mod client;
 pub mod display;
 pub mod fork;
 mod fsnotify_watch;
+pub mod input;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;

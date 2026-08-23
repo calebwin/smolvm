@@ -19,9 +19,20 @@ gives the guest GPU *rendering* only: `/dev/dri/card0` is a render node with no
 connector, and every DRM compositor refuses to start with "not a KMS device".
 
 `SMOLVM_VNC=[host:]port` serves the resulting framebuffer over RFB. A bare port
-binds loopback only. Output is one-way today — smolvm does not yet attach a
-virtio-input device, so keyboard and pointer events from the client are
-discarded rather than pretending to work.
+binds loopback only. The session is interactive: smolvm attaches a virtio
+keyboard and an absolute pointer, and client key/pointer events are injected
+into the guest. This needs a libkrun built with the input feature and a guest
+that runs udevd (see below); with either missing the session degrades to
+view-only.
+
+For the guest's compositor to *see* the devices, libinput's udev backend
+needs a udev database — a workload container does not run one, so start it
+before the compositor:
+
+```sh
+/usr/lib/systemd/systemd-udevd --daemon
+udevadm trigger --action=add && udevadm settle
+```
 
 Both are opt-in. A connector changes guest topology, and existing GPU workloads
 (CUDA remoting, headless Vulkan) neither need nor want one.

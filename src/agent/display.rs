@@ -121,6 +121,17 @@ pub struct DisplayFramebuffer {
     staging: std::cell::UnsafeCell<Staging>,
     front: Mutex<Frame>,
     presented: Condvar,
+    /// Optional call trace, enabled by `SMOLVM_DISPLAY_TRACE=<path>`.
+    ///
+    /// libkrun's own logging goes through `env_logger` in a process whose
+    /// stdout and stderr are `/dev/null` unless `SMOLVM_BOOT_DEBUG` is set,
+    /// and even with it set no libkrun line has ever reached us. Writing our
+    /// own trace to a plain file is the only way to see whether the guest is
+    /// actually presenting, which is the question that matters when a
+    /// compositor renders once and then stalls.
+    trace: Option<Mutex<std::fs::File>>,
+    /// Monotonic counter so trace lines are ordered and countable.
+    traced_calls: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: `staging` is only accessed from the single thread libkrun uses for
@@ -131,6 +142,16 @@ unsafe impl Send for DisplayFramebuffer {}
 
 impl DisplayFramebuffer {
     fn new() -> Self {
+        // Best effort: a missing or unwritable path just disables tracing
+        // rather than failing the boot.
+        let trace = std::env::var("SMOLVM_DISPLAY_TRACE").ok().and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        });
         Self {
             staging: std::cell::UnsafeCell::new(Staging {
                 buf: Vec::new(),
@@ -147,7 +168,37 @@ impl DisplayFramebuffer {
                 generation: 0,
             }),
             presented: Condvar::new(),
+            trace,
+            traced_calls: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Append a numbered line to the call trace, bounded so a long-running
+    /// desktop cannot fill the disk. Sampling was a mistake the first time
+    /// round: it could not distinguish "presents stopped" from "presents
+    /// continued but missed the sampling window".
+    fn trace_seq(&self, what: &str) {
+        if self.trace.is_none() {
+            return;
+        }
+        const MAX_TRACED_CALLS: u64 = 2000;
+        let n = self
+            .traced_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < MAX_TRACED_CALLS {
+            self.trace(&format!("{n:05} {what}"));
+        } else if n == MAX_TRACED_CALLS {
+            self.trace("... trace limit reached, further calls not logged");
+        }
+    }
+
+    /// Append one line to the call trace, if enabled.
+    fn trace(&self, line: &str) {
+        let Some(f) = self.trace.as_ref() else { return };
+        use std::io::Write;
+        let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(f, "{line}");
+        let _ = f.flush();
     }
 
     /// The most recently presented frame, or `None` before the guest has
@@ -241,6 +292,9 @@ unsafe extern "C" fn display_configure_scanout(
     staging.format = format;
     staging.configured = true;
 
+    fb.trace(&format!(
+        "configure_scanout scanout=0 {width}x{height} format={format} bytes={len}"
+    ));
     tracing::info!(
         width,
         height,
@@ -259,6 +313,7 @@ unsafe extern "C" fn display_disable_scanout(instance: *mut c_void, scanout_id: 
     };
     let staging = unsafe { &mut *fb.staging.get() };
     staging.configured = false;
+    fb.trace("disable_scanout scanout=0");
     tracing::debug!("virtio-gpu scanout disabled");
     0
 }
@@ -281,6 +336,7 @@ unsafe extern "C" fn display_alloc_frame(
 
     let staging = unsafe { &mut *fb.staging.get() };
     if !staging.configured || staging.buf.is_empty() {
+        fb.trace("alloc_frame REJECTED (scanout not configured)");
         return ERR_INVALID_SCANOUT_ID;
     }
 
@@ -288,6 +344,7 @@ unsafe extern "C" fn display_alloc_frame(
         *buffer = staging.buf.as_mut_ptr();
         *buffer_size = staging.buf.len();
     }
+    fb.trace_seq("alloc_frame");
     // Single staging buffer, so there is only ever one live frame id.
     0
 }
@@ -324,6 +381,8 @@ unsafe extern "C" fn display_present_frame(
         front.generation = front.generation.wrapping_add(1);
     }
     fb.presented.notify_all();
+
+    fb.trace_seq("present_frame");
     0
 }
 
@@ -377,6 +436,7 @@ pub fn install(
         ));
     }
 
+    state.trace("display backend installed");
     Ok(state)
 }
 

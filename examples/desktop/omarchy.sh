@@ -34,9 +34,16 @@ printf '%%wheel ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/wheel && chmod 440 /
 RT=/run/user/1000; mkdir -p "$RT"; chown omar:omar "$RT"; chmod 700 "$RT"
 chmod 666 /dev/dri/* 2>/dev/null
 
-# D-Bus refuses to start without a machine id, and mako/waybar need a session
-# bus — a container guest has neither out of the box.
+# D-Bus refuses to start without a machine id, and the session components
+# need a session bus — a container guest has neither out of the box.
 dbus-uuidgen --ensure 2>/dev/null || true
+
+# libinput's udev backend only sees devices that are in the udev database; a
+# container guest runs no udevd, so without this the compositor gets no
+# keyboard or pointer even though /dev/input has them.
+/usr/lib/systemd/systemd-udevd --daemon 2>/dev/null
+udevadm trigger --action=add 2>/dev/null
+udevadm settle 2>/dev/null
 
 # A VT-bound seat cannot open a session in a container with no /dev/tty0.
 SEATD_VTBOUND=0 seatd -g wheel >/tmp/seatd.log 2>&1 &
