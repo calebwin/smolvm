@@ -206,6 +206,39 @@ pub fn launch_agent_vm_dynamic(
                     ));
                 }
                 tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+
+                // Optional virtio-gpu scanout. Venus gives the guest GPU
+                // *rendering*; a scanout gives it a *display*. Without one the
+                // device reports num_scanouts = 0, so the guest sees no
+                // connector and card0 is render-only — which is why DRM
+                // compositors fail with "not a KMS device". Opt-in for now:
+                // adding a connector changes guest topology, and existing GPU
+                // workloads (CUDA, headless Vulkan) neither need nor want one.
+                if let Some((w, h)) =
+                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+                {
+                    match krun.add_display {
+                        Some(add_display) => {
+                            let ret = unsafe { add_display(ctx, w, h) };
+                            if ret < 0 {
+                                free_ctx_on_err!(format!(
+                                    "krun_add_display({w}x{h}) failed (ret={ret})"
+                                ));
+                            }
+                            tracing::info!(
+                                width = w,
+                                height = h,
+                                display_id = ret,
+                                "virtio-gpu scanout added (guest gets a KMS connector)"
+                            );
+                        }
+                        None => {
+                            free_ctx_on_err!(
+                                "SMOLVM_DISPLAY set but this libkrun has no krun_add_display"
+                            );
+                        }
+                    }
+                }
             }
             None => {
                 free_ctx_on_err!(

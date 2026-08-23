@@ -41,6 +41,30 @@ pub use manager::{
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
 
+/// Parse a `WIDTHxHEIGHT` display size (e.g. `"1920x1080"`).
+///
+/// Returns `None` for absent/blank input so "no display" stays the default —
+/// a scanout adds a KMS connector the guest can see, which existing GPU
+/// workloads (CUDA, headless Vulkan) do not need.
+///
+/// Rejects zero and absurd dimensions rather than passing them to libkrun: the
+/// virtio-gpu EDID generator will happily build a nonsense mode, and the guest
+/// then fails far away from the cause.
+pub fn parse_display_size(raw: Option<&str>) -> Option<(u32, u32)> {
+    const MAX_DIM: u32 = 16384;
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (w, h) = raw.split_once(['x', 'X'])?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+        return None;
+    }
+    Some((w, h))
+}
+
 /// Compute the `virgl_flags` bitmask for `krun_set_gpu_options2`.
 ///
 /// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)
@@ -122,4 +146,42 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod display_size_tests {
+    use super::parse_display_size;
+
+    #[test]
+    fn parses_wxh() {
+        assert_eq!(parse_display_size(Some("1920x1080")), Some((1920, 1080)));
+        assert_eq!(parse_display_size(Some("1280X800")), Some((1280, 800)));
+        assert_eq!(parse_display_size(Some("  1024x768 ")), Some((1024, 768)));
+    }
+
+    // Absent/blank must mean "no display", not a default one: adding a scanout
+    // changes guest topology for every existing --gpu workload.
+    #[test]
+    fn absent_or_blank_means_no_display() {
+        assert_eq!(parse_display_size(None), None);
+        assert_eq!(parse_display_size(Some("")), None);
+        assert_eq!(parse_display_size(Some("   ")), None);
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        for bad in ["1920", "1920x", "x1080", "axb", "1920*1080", "1920x1080x60"] {
+            assert_eq!(parse_display_size(Some(bad)), None, "should reject {bad}");
+        }
+    }
+
+    // Zero would produce a degenerate EDID mode; huge values blow up the
+    // framebuffer allocation. Fail here, where the error names the cause.
+    #[test]
+    fn rejects_zero_and_absurd() {
+        assert_eq!(parse_display_size(Some("0x1080")), None);
+        assert_eq!(parse_display_size(Some("1920x0")), None);
+        assert_eq!(parse_display_size(Some("99999x1080")), None);
+        assert_eq!(parse_display_size(Some("1920x99999")), None);
+    }
 }
