@@ -134,8 +134,11 @@ $S machine create --name rv-ro --image alpine:latest --net --net-backend virtio-
 $S machine start --name rv-ro >/dev/null 2>&1
 check "ro mount is readable" \
   "$($S machine exec --name rv-ro -- sh -c 'cat /mnt/q/keep.txt' 2>/dev/null | tr -d '\r\n')" "keep"
-OUT=$($S machine exec --name rv-ro -- sh -c 'echo x > /mnt/q/no.txt 2>&1 || true' 2>/dev/null)
-echo "$OUT" | grep -qi "read-only" && ok "ro mount rejects writes" || bad "ro mount rejects writes"
+# Keep stderr: `machine exec` forwards the guest's stderr to the host's stderr,
+# so discarding it here would throw away the very message being asserted.
+OUT=$($S machine exec --name rv-ro -- sh -c 'echo x > /mnt/q/no.txt' 2>&1)
+echo "$OUT" | grep -qi "read-only" && ok "ro mount rejects writes" || bad "ro mount rejects writes ($OUT)"
+check "the rejected write did not reach the bucket" "$(oob no.txt)" ""
 
 # ---- 8. fork of a remote-volume golden is refused cleanly -----------------
 OUT=$($S machine fork --golden rv-ro --name rv-clone 2>&1)
