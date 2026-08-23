@@ -1588,7 +1588,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
-            s3_volumes: Vec::new(),
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         expect_completed(resp, "run command")
@@ -1615,7 +1615,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
-            s3_volumes: Vec::new(),
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1659,7 +1659,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
-            s3_volumes: Vec::new(),
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1697,7 +1697,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
-                s3_volumes: Vec::new(),
+                s3_volumes: config.s3_volumes.clone(),
             },
             tty,
             "run interactive",
@@ -1972,7 +1972,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
-                s3_volumes: Vec::new(),
+                s3_volumes: config.s3_volumes.clone(),
             },
             input,
             on_output,

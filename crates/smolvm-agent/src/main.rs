@@ -2362,10 +2362,7 @@ fn handle_request(
             persistent_overlay_id,
             stdin_data,
             background,
-            // Remote volumes only ride the detached workload launch
-            // (`run_container_detached`, `detached: true`); every synchronous or
-            // background Run carries none, so there is nothing to mount here.
-            s3_volumes: _,
+            s3_volumes,
         } => {
             if background {
                 handle_run_background(
@@ -2377,6 +2374,7 @@ fn handle_request(
                     &mounts,
                     persistent_overlay_id.as_deref(),
                     unprivileged,
+                    &s3_volumes,
                 )
             } else {
                 handle_run(
@@ -2391,6 +2389,7 @@ fn handle_request(
                     stdin_data.as_deref(),
                     client_fd,
                     unprivileged,
+                    &s3_volumes,
                 )
             }
         }
@@ -3274,6 +3273,7 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id,
         unprivileged,
+        s3_volumes,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3286,6 +3286,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
+            s3_volumes,
             ..
         } => (
             image,
@@ -3298,6 +3299,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
+            s3_volumes,
         ),
         _ => {
             send_response(
@@ -3345,28 +3347,18 @@ fn handle_interactive_run(
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
     // interactive path can't drop the image's Env/WorkingDir/User either.
-    let launch = match ResolvedLaunch::resolve(
-        &image,
-        command,
-        env,
-        workdir,
-        user,
-        // Interactive sessions never carry remote volumes. A shell or exec
-        // joins the workload container, where the mounts already exist, and a
-        // one-shot run is rejected by the CLI before it reaches the agent
-        // because remote volumes are only accepted for machines that persist.
-        Vec::new(),
-    ) {
-        Ok(l) => l,
-        Err(e) => {
-            maybe_cleanup(&prepared.workload_id);
-            send_response(
-                stream,
-                &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    let launch =
+        match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes.clone()) {
+            Ok(l) => l,
+            Err(e) => {
+                maybe_cleanup(&prepared.workload_id);
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
 
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
@@ -3376,6 +3368,7 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id.as_deref(),
         unprivileged,
+        &s3_volumes,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -4283,12 +4276,14 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
 /// (`crun run --detach` hangs in the smolvm VM environment).
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn ensure_main_container(
     rootfs: &str,
-    overlay_id: &str,
+    overlay_id: Option<&str>,
     mounts: &[(String, String, bool)],
     unprivileged: bool,
     base_launch: &ResolvedLaunch,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -4326,6 +4321,19 @@ fn ensure_main_container(
         )
         .into());
     }
+    // Mount remote volumes in the window between create and start: the
+    // container's namespaces exist but its first instruction has not run, so
+    // anything exec'd into it afterwards is guaranteed to see the bucket. This
+    // is the same ordering `handle_run_detached` relies on, and the reason the
+    // container is established in two steps rather than with `crun run`.
+    if !s3_volumes.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, s3_volumes) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            return Err(format!("mount remote volume: {e}").into());
+        }
+    }
+
     let start = crun::CrunCommand::start(&container_id).output()?;
     if !start.status.success() {
         let _ = crun::CrunCommand::delete(&container_id, true).output();
@@ -4336,16 +4344,20 @@ fn ensure_main_container(
         .into());
     }
 
-    let workload_id = format!("persistent-{}", overlay_id);
-    if let Err(e) = std::fs::write(
-        paths::main_container_id_path(&workload_id),
-        container_id.as_bytes(),
-    ) {
-        let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
-        let _ = crun::CrunCommand::delete(&container_id, true).output();
-        return Err(format!("failed to persist main container id: {}", e).into());
+    // An ephemeral run has no overlay to key the container by; it lives and
+    // dies with this session, so there is nothing for a later exec to rejoin.
+    if let Some(overlay_id) = overlay_id {
+        let workload_id = format!("persistent-{}", overlay_id);
+        if let Err(e) = std::fs::write(
+            paths::main_container_id_path(&workload_id),
+            container_id.as_bytes(),
+        ) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            return Err(format!("failed to persist main container id: {}", e).into());
+        }
     }
-    info!(container_id = %container_id, overlay_id = %overlay_id, "established keep-alive main container for persistent machine");
+    info!(container_id = %container_id, overlay_id = ?overlay_id, "established keep-alive main container");
     Ok(container_id)
 }
 
@@ -4358,6 +4370,7 @@ fn spawn_interactive_command(
     tty: bool,
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -4393,12 +4406,35 @@ fn spawn_interactive_command(
     // the machine's lifetime. On failure, fall through to the fresh-container path
     // so exec never breaks outright.
     if let Some(overlay_id) = persistent_overlay_id {
-        match ensure_main_container(rootfs, overlay_id, mounts, unprivileged, launch) {
+        match ensure_main_container(
+            rootfs,
+            Some(overlay_id),
+            mounts,
+            unprivileged,
+            launch,
+            s3_volumes,
+        ) {
             Ok(cid) => return spawn_exec_in_container(&cid, launch, tty),
             Err(e) => {
+                // Falling back to a fresh container would silently drop the
+                // remote volumes, leaving the workload reading an empty
+                // directory. When volumes were requested the failure is the
+                // answer, not something to work around.
+                if !s3_volumes.is_empty() {
+                    return Err(e);
+                }
                 warn!(error = %e, "keep-alive main container setup failed; running in a fresh container")
             }
         }
+    }
+
+    // An ephemeral run with a remote volume cannot use `crun run`: that
+    // collapses create and start, leaving no window in which to mount, and the
+    // workload's first instruction would race the mount. Establish the
+    // container in two steps and exec the command into it instead.
+    if !s3_volumes.is_empty() {
+        let cid = ensure_main_container(rootfs, None, mounts, unprivileged, launch, s3_volumes)?;
+        return spawn_exec_in_container(&cid, launch, tty);
     }
 
     let rootfs_path = Path::new(rootfs);
@@ -4559,6 +4595,7 @@ fn spawn_interactive_command(
     _tty: bool,
     _persistent_overlay_id: Option<&str>,
     unprivileged: bool,
+    _s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -5372,6 +5409,7 @@ fn handle_run_background(
     mounts: &[(String, String, bool)],
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
 
@@ -5403,9 +5441,20 @@ fn handle_run_background(
             user,
             mounts,
             unprivileged,
+            s3_volumes,
         ) {
             Ok(resp) => return resp,
             Err(e) => {
+                // Falling back to a fresh container would silently drop the
+                // remote volumes, leaving the workload reading an empty
+                // directory. When volumes were requested the failure is the
+                // answer, not something to work around.
+                if !s3_volumes.is_empty() {
+                    return AgentResponse::error(
+                        format!("mount remote volume: {e}"),
+                        error_codes::SPAWN_FAILED,
+                    );
+                }
                 warn!(error = %e, "keep-alive background exec failed; falling back to a fresh container");
             }
         }
@@ -5445,6 +5494,7 @@ fn run_background_in_keepalive(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     let mut launch = ResolvedLaunch::resolve(
         image,
@@ -5464,10 +5514,11 @@ fn run_background_in_keepalive(
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
             let cid = ensure_main_container(
                 &prepared.rootfs_path,
-                overlay_id,
+                Some(overlay_id),
                 mounts,
                 unprivileged,
                 &launch,
+                s3_volumes,
             )?;
             (cid, std::path::PathBuf::from(&prepared.rootfs_path))
         }
@@ -5585,6 +5636,7 @@ fn run_in_keepalive_container(
     timeout_ms: Option<u64>,
     stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     use std::io::Write as _;
 
@@ -5610,10 +5662,11 @@ fn run_in_keepalive_container(
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
             let cid = ensure_main_container(
                 &prepared.rootfs_path,
-                overlay_id,
+                Some(overlay_id),
                 mounts,
                 unprivileged,
                 &launch,
+                s3_volumes,
             )?;
             (cid, std::path::PathBuf::from(&prepared.rootfs_path))
         }
@@ -5709,6 +5762,7 @@ fn handle_run(
     stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
 
@@ -5762,9 +5816,20 @@ fn handle_run(
                 timeout_ms,
                 stdin_data,
                 client_fd,
+                s3_volumes,
             ) {
                 Ok(resp) => return cap_exec_response(resp),
                 Err(e) => {
+                    // Falling back to a fresh container would silently drop the
+                    // remote volumes, leaving the workload reading an empty
+                    // directory. When volumes were requested the failure is the
+                    // answer, not something to work around.
+                    if !s3_volumes.is_empty() {
+                        return AgentResponse::error(
+                            format!("mount remote volume: {e}"),
+                            error_codes::SPAWN_FAILED,
+                        );
+                    }
                     warn!(error = %e, "keep-alive exec failed; running in a fresh container")
                 }
             }

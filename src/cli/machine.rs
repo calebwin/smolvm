@@ -1337,7 +1337,18 @@ impl RunCmd {
             .run();
         }
 
-        let mut mounts = HostMount::parse(&params.volume)?;
+        // Remote volumes are mounted inside the guest by the agent, so peel them
+        // off before the host-directory parse, which would reject an `s3://`
+        // source as a missing directory.
+        let (host_volume_specs, remote_volumes) =
+            smolvm::remote_volume::split_specs(&params.volume)?;
+        let mut mounts = HostMount::parse(&host_volume_specs)?;
+        if !remote_volumes.is_empty() && !params.net {
+            return Err(Error::config(
+                "machine run",
+                "remote volumes need network access to reach the bucket: add --net",
+            ));
+        }
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
@@ -1717,6 +1728,10 @@ impl RunCmd {
                 &env,
                 params.workdir.as_deref(),
             );
+            // Credentials and endpoint come from the workload's own env, the
+            // same place every AWS SDK reads them, so a remote volume needs no
+            // configuration beyond the `-v` spec and the usual variables.
+            let s3_volumes = smolvm::remote_volume::to_s3_volumes(&remote_volumes, &defaults.env);
             if self.detach {
                 // Start the main workload container first. If this fails, the
                 // VM is stopped and no DB record is written — a retry won't
@@ -1728,7 +1743,8 @@ impl RunCmd {
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings.clone())
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     client.run_container_detached(run_config)?;
                 }
 
@@ -1843,7 +1859,8 @@ impl RunCmd {
                         .with_timeout(self.timeout)
                         .with_tty(tty)
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
@@ -1853,7 +1870,8 @@ impl RunCmd {
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_persistent_overlay(Some(vm_name.clone()))
-                        .with_unprivileged(self.unprivileged);
+                        .with_unprivileged(self.unprivileged)
+                        .with_s3_volumes(s3_volumes.clone());
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);

@@ -227,7 +227,25 @@ else
   rm -f "$RVSOCK"
 fi
 
-# ---- 11. service image keeps its own entrypoint AND still mounts -----------
+# ---- 11. ephemeral `machine run` mounts too --------------------------------
+# `machine run` never creates the container with `crun create` + `crun start`,
+# so it has no window in which to mount; it must establish the container the
+# two-step way when a remote volume is present rather than silently skip it.
+GOT=$($S machine run --image alpine:latest --net --net-backend virtio-net $CREDS \
+  -v "s3://rv-bucket:/mnt/run" -- cat /mnt/run/keep.txt 2>/dev/null | tr -d '\r\n')
+check "ephemeral run mounts the volume" "$GOT" "keep"
+$S machine run --image alpine:latest --net --net-backend virtio-net $CREDS \
+  -v "s3://rv-bucket:/mnt/run" -- sh -c 'echo run-1 > /mnt/run/run.txt' >/dev/null 2>&1
+check "ephemeral run write visible out-of-band" "$(oob run.txt)" "run-1"
+
+# A run whose bucket is unusable must fail instead of running the command
+# against an empty directory.
+OUT=$($S machine run --image alpine:latest --net --net-backend virtio-net $CREDS \
+  -v "s3://nosuchbucket:/mnt/run" -- echo SHOULD-NOT-RUN 2>&1)
+echo "$OUT" | grep -q "not reachable" && ok "ephemeral run fails on an unusable bucket" || bad "ephemeral run fails on an unusable bucket"
+echo "$OUT" | grep -q "SHOULD-NOT-RUN" && bad "the command must not run without its volume" || ok "the command does not run without its volume"
+
+# ---- 12. service image keeps its own entrypoint AND still mounts -----------
 # No `--` command: the image's ENTRYPOINT/CMD is resolved inside the guest and
 # must still run. Mounting happens between container create and start, so the
 # entrypoint is never rewritten to carry a mount command.
