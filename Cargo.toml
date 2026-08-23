@@ -13,6 +13,7 @@ members = [
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
+    "crates/smolvm-s3fs",
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
