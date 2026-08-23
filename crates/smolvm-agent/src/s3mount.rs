@@ -49,6 +49,24 @@ fn credentials_of(spec: &MountSpec) -> Option<sigv4::Credentials> {
     }
 }
 
+/// Client configuration for a volume.
+///
+/// Shared by the reachability probe and the mount helper so the two can never
+/// disagree about which endpoint, prefix or credentials a volume means.
+fn client_config(spec: &MountSpec) -> s3::Config {
+    s3::Config {
+        endpoint: spec.endpoint.clone(),
+        region: spec.region.clone(),
+        bucket: spec.bucket.clone(),
+        prefix: spec.prefix.clone(),
+        credentials: credentials_of(spec),
+        // Path-style works against AWS and every S3-compatible server; virtual
+        // host style would need per-provider DNS assumptions.
+        path_style: true,
+        timeout: Duration::from_secs(60),
+    }
+}
+
 /// Whether this process was re-exec'd as the mount helper.
 ///
 /// Checked before the async runtime starts, because `setns(CLONE_NEWMNT)`
@@ -87,17 +105,7 @@ pub fn run_helper() -> i32 {
         }
     }
 
-    let cfg = s3::Config {
-        endpoint: spec.endpoint.clone(),
-        region: spec.region.clone(),
-        bucket: spec.bucket.clone(),
-        prefix: spec.prefix.clone(),
-        credentials: credentials_of(&spec),
-        // Path-style works against AWS and every S3-compatible server; virtual
-        // host style would need per-provider DNS assumptions.
-        path_style: true,
-        timeout: Duration::from_secs(60),
-    };
+    let cfg = client_config(&spec);
     let opts = MountOptions {
         mountpoint: spec.mountpoint.clone(),
         read_only: spec.read_only,
@@ -157,6 +165,32 @@ fn enter_mount_namespace(_pid: u32) -> Result<(), String> {
 /// worse than refusing to start.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Check that a bucket is really usable before mounting it.
+///
+/// `mount(2)` on `/dev/fuse` succeeds without ever contacting S3, so on its own
+/// a mount proves nothing: a typo'd bucket, an expired key or an unreachable
+/// endpoint all produce a machine that starts happily and serves an empty
+/// directory, and the workload then reads nothing and produces silently wrong
+/// results. One list request collapses all of those into a start failure that
+/// names the cause.
+///
+/// Runs in the agent's own namespace — reachability and credentials do not
+/// depend on the mount namespace the helper later joins.
+#[cfg(target_os = "linux")]
+fn probe(spec: &MountSpec) -> Result<(), String> {
+    s3::Client::new(client_config(spec))
+        .list_dir("")
+        .map(|_| ())
+        .map_err(|e| {
+            let at = if spec.prefix.is_empty() {
+                spec.bucket.clone()
+            } else {
+                format!("{}/{}", spec.bucket, spec.prefix)
+            };
+            format!("s3://{at} is not reachable: {e}")
+        })
+}
+
 /// Mount every volume into `container_id`'s namespace and wait until each is
 /// visible.
 ///
@@ -167,23 +201,34 @@ pub fn mount_all(container_id: &str, specs: &[MountSpec]) -> Result<(), String> 
     let pid = crate::crun_created_container_pid(container_id)
         .ok_or_else(|| format!("container {container_id} has no pid"))?;
 
+    // Probe every volume before mounting any of them, so a machine with two
+    // volumes fails on the bad one rather than half-mounting and then failing.
     for spec in specs {
-        // The helper runs for the life of the mount; it is intentionally not
-        // reaped here. It exits when the FUSE session ends (unmount or machine
-        // stop), and the container's teardown takes the namespace with it.
-        let child = spawn(pid, spec)?;
-        std::mem::forget(child);
+        probe(spec)?;
+    }
+
+    let mut children = Vec::with_capacity(specs.len());
+    for spec in specs {
+        children.push(spawn(pid, spec)?);
     }
 
     let deadline = std::time::Instant::now() + MOUNT_TIMEOUT;
-    for spec in specs {
+    for (spec, mut child) in specs.iter().zip(children) {
         loop {
             if mount_is_present(pid, &spec.mountpoint) {
                 break;
             }
+            // A helper that has already exited will never mount anything, so
+            // report that immediately instead of waiting out the full timeout.
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!(
+                    "mounting {} failed ({status}) — see the agent log for the cause",
+                    spec.mountpoint
+                ));
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
-                    "{} did not mount within {}s — check the endpoint, credentials and network",
+                    "{} did not mount within {}s",
                     spec.mountpoint,
                     MOUNT_TIMEOUT.as_secs()
                 ));
@@ -191,6 +236,10 @@ pub fn mount_all(container_id: &str, specs: &[MountSpec]) -> Result<(), String> 
             std::thread::sleep(Duration::from_millis(100));
         }
         tracing::info!(mountpoint = %spec.mountpoint, bucket = %spec.bucket, "s3 volume mounted");
+        // The helper serves the mount for as long as it exists, so it is
+        // deliberately never reaped: it exits when the FUSE session ends, and
+        // the container's teardown takes the namespace with it.
+        std::mem::forget(child);
     }
     Ok(())
 }
@@ -280,6 +329,33 @@ mod tests {
         // Guard the dispatch predicate: a stray match would make the agent exit
         // instead of booting the machine.
         assert_eq!(HELPER_ARG, "s3-mount");
+    }
+
+    #[test]
+    fn the_client_config_carries_the_spec_verbatim() {
+        // The probe and the helper share this; if it stopped reflecting the
+        // spec, a volume could be probed against one bucket and mounted from
+        // another.
+        let cfg = client_config(&spec());
+        assert_eq!(cfg.bucket, "b");
+        assert_eq!(cfg.prefix, "p");
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
+        assert!(cfg.path_style);
+        assert!(cfg.credentials.is_some());
+    }
+
+    // An unreachable endpoint must fail the start rather than mount an empty
+    // directory: `mount(2)` succeeds without contacting S3, so only the probe
+    // stands between a typo and a workload that silently reads nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreachable_endpoint_fails_the_probe_by_name() {
+        let mut s = spec();
+        // Port 1 on loopback refuses immediately, so this stays fast.
+        s.endpoint = "http://127.0.0.1:1".into();
+        let err = probe(&s).expect_err("a refused endpoint must not probe clean");
+        assert!(err.contains("s3://b/p"), "{err}");
+        assert!(err.contains("not reachable"), "{err}");
     }
 
     #[test]
