@@ -3274,7 +3274,6 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id,
         unprivileged,
-        s3_volumes,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3287,7 +3286,6 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
-            s3_volumes,
             ..
         } => (
             image,
@@ -3300,7 +3298,6 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
-            s3_volumes,
         ),
         _ => {
             send_response(
@@ -3354,8 +3351,10 @@ fn handle_interactive_run(
         env,
         workdir,
         user,
-        // Interactive runs never carry volumes: they join an existing container
-        // (or are one-shot), and mounts ride the detached workload launch.
+        // Interactive sessions never carry remote volumes. A shell or exec
+        // joins the workload container, where the mounts already exist, and a
+        // one-shot run is rejected by the CLI before it reaches the agent
+        // because remote volumes are only accepted for machines that persist.
         Vec::new(),
     ) {
         Ok(l) => l,
