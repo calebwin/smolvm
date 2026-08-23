@@ -1013,6 +1013,21 @@ fn default_devices() -> Vec<OciDevice> {
             uid: Some(0),
             gid: Some(0),
         },
+        // /dev/fuse - userspace filesystems. The guest kernel has FUSE, but the
+        // container /dev is built from this list, so without an entry here any
+        // FUSE client in the image (JuiceFS, s3fs, SeaweedFS, sshfs) fails to
+        // mount until the user runs `mknod /dev/fuse c 10 229` by hand. The
+        // agent's own remote-volume mounts create the node themselves; this
+        // makes a client the user brings work the same way.
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/fuse".to_string(),
+            major: 10,
+            minor: 229,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
     ]
 }
 
@@ -1303,6 +1318,19 @@ mod tests {
         assert_eq!(
             (kmsg.device_type.as_str(), kmsg.major, kmsg.minor),
             ("c", 1, 11)
+        );
+
+        // /dev/fuse (10:229) must be there too, or a FUSE client the user
+        // brings (JuiceFS, s3fs, sshfs) cannot mount without mknod'ing it.
+        let fuse = spec
+            .linux
+            .devices
+            .iter()
+            .find(|d| d.path == "/dev/fuse")
+            .expect("/dev/fuse device present");
+        assert_eq!(
+            (fuse.device_type.as_str(), fuse.major, fuse.minor),
+            ("c", 10, 229)
         );
     }
 
