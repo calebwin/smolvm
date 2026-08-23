@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+pub mod display;
 pub mod fork;
 mod fsnotify_watch;
 mod krun;
@@ -14,6 +15,7 @@ mod manager;
 pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
+pub mod vnc;
 mod vsock_service;
 
 pub use crate::data::network::PortMapping;

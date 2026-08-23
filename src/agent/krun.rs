@@ -66,6 +66,14 @@ pub struct KrunFunctions {
     /// render node only — so DRM compositors (Hyprland, GNOME, KDE) refuse to
     /// start with "not a KMS device". `None` on libkrun builds predating the API.
     pub add_display: Option<unsafe extern "C" fn(u32, u32, u32) -> i32>,
+    /// Register a host display backend that consumes scanout frames.
+    ///
+    /// `krun_add_display` only *describes* a display. Without a backend
+    /// libkrun installs a no-op whose `configure_scanout`/`alloc_frame`/
+    /// `present_frame` all fail, so the guest's first page flip never
+    /// completes and a compositor blocks on it forever. `None` on libkrun
+    /// builds predating the API.
+    pub set_display_backend: Option<unsafe extern "C" fn(u32, *const libc::c_void, usize) -> i32>,
     /// Retrieve guest RAM regions (`gpa_start, host_va, len` triples) for
     /// zero-copy CUDA transfers. `None` on libkrun builds that predate the API.
     pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
@@ -159,6 +167,7 @@ impl KrunFunctions {
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
         let add_display = load_optional_sym!("krun_add_display");
+        let set_display_backend = load_optional_sym!("krun_set_display_backend");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
@@ -186,6 +195,7 @@ impl KrunFunctions {
             get_egress_handle,
             set_gpu_options2,
             add_display,
+            set_display_backend,
             get_guest_ram,
             set_control_socket,
             set_snapshot,

@@ -231,6 +231,46 @@ pub fn launch_agent_vm_dynamic(
                                 display_id = ret,
                                 "virtio-gpu scanout added (guest gets a KMS connector)"
                             );
+
+                            // A described display is not a usable one. With no
+                            // backend to consume frames libkrun installs a
+                            // no-op that fails every scanout call, so the
+                            // guest's first page flip never completes and a
+                            // compositor blocks on it forever.
+                            let Some(set_backend) = krun.set_display_backend else {
+                                free_ctx_on_err!(
+                                    "SMOLVM_DISPLAY set but this libkrun has no \
+                                     krun_set_display_backend; without it the guest \
+                                     would hang on its first page flip"
+                                );
+                            };
+                            let framebuffer = match crate::agent::display::install(set_backend, ctx)
+                            {
+                                Ok(fb) => fb,
+                                Err(e) => free_ctx_on_err!(e.to_string()),
+                            };
+
+                            // Serving RFB from the host means the guest needs
+                            // no capture tool and no compositor-specific
+                            // screencopy protocol.
+                            if let Some(bind) = std::env::var("SMOLVM_VNC")
+                                .ok()
+                                .as_deref()
+                                .and_then(crate::agent::vnc::parse_bind_addr)
+                            {
+                                match crate::agent::vnc::serve(&bind, framebuffer) {
+                                    Ok(addr) => {
+                                        tracing::info!(%addr, "vnc server listening")
+                                    }
+                                    // A failed viewer must not take down the
+                                    // VM; the display works without it.
+                                    Err(e) => tracing::warn!(
+                                        bind = %bind,
+                                        error = %e,
+                                        "vnc server failed to start"
+                                    ),
+                                }
+                            }
                         }
                         None => {
                             free_ctx_on_err!(

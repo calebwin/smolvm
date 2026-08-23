@@ -853,6 +853,48 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     display_id = ret,
                     "virtio-gpu scanout added (guest gets a KMS connector)"
                 );
+
+                // A described display is not a usable one. Without a backend
+                // to consume frames libkrun installs a no-op that fails every
+                // scanout call, so the guest's first page flip never completes
+                // and the compositor blocks on it forever. Register the host
+                // framebuffer that actually takes the frames.
+                let set_backend = match krun.set_display_backend {
+                    Some(f) => f,
+                    None => {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure display",
+                            "SMOLVM_DISPLAY set but this libkrun has no \
+                             krun_set_display_backend; without it the guest \
+                             would hang on its first page flip",
+                        ));
+                    }
+                };
+                let framebuffer = match super::display::install(set_backend, ctx) {
+                    Ok(fb) => fb,
+                    Err(e) => {
+                        krun_free_ctx(ctx);
+                        return Err(e);
+                    }
+                };
+
+                // Serving RFB from the host means the guest needs no capture
+                // tool and no compositor-specific screencopy protocol.
+                if let Some(bind) = std::env::var("SMOLVM_VNC")
+                    .ok()
+                    .as_deref()
+                    .and_then(super::vnc::parse_bind_addr)
+                {
+                    match super::vnc::serve(&bind, framebuffer) {
+                        Ok(addr) => tracing::info!(%addr, "vnc server listening"),
+                        Err(e) => {
+                            // A failed viewer must not take down the VM: the
+                            // display itself is already working without it.
+                            tracing::warn!(bind = %bind, error = %e, "vnc server failed to start");
+                        }
+                    }
+                }
             }
         }
 
