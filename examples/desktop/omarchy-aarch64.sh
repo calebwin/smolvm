@@ -124,6 +124,11 @@ RT=/run/user/1000; mkdir -p "$RT"; chown omar:omar "$RT"; chmod 700 "$RT"
 chmod 666 /dev/dri/* 2>/dev/null
 dbus-uuidgen --ensure 2>/dev/null || true
 
+# Chromium passes fonts and tiles between processes through POSIX shared
+# memory; at the 64M container-default /dev/shm its font service hits ENOSPC
+# and CHECK-crashes the renderer whenever a video plays.
+mount -o remount,size=2G /dev/shm 2>/dev/null || true
+
 # Container-guest input fixes: /dev is not devtmpfs, and libinput needs the
 # udev db entries systemd-udevd would normally write.
 mkdir -p /dev/input /run/udev/data

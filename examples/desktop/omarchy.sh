@@ -34,6 +34,11 @@ printf '%%wheel ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/wheel && chmod 440 /
 RT=/run/user/1000; mkdir -p "$RT"; chown omar:omar "$RT"; chmod 700 "$RT"
 chmod 666 /dev/dri/* 2>/dev/null
 
+# Chromium passes fonts and tiles between processes through POSIX shared
+# memory; at the 64M container-default /dev/shm its font service hits ENOSPC
+# and CHECK-crashes the renderer whenever a video plays.
+mount -o remount,size=2G /dev/shm 2>/dev/null || true
+
 # D-Bus refuses to start without a machine id, and the session components
 # need a session bus — a container guest has neither out of the box.
 dbus-uuidgen --ensure 2>/dev/null || true
