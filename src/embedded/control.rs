@@ -303,7 +303,7 @@ pub(crate) fn fork_vm_with_options(
         &std::collections::BTreeMap::new(),
     )?;
 
-    boot_prepared_fork(db, clone, prep, share_weights, watch_parent)
+    boot_prepared_fork(db, clone, prep, share_weights, watch_parent, None)
 }
 
 fn boot_prepared_fork(
@@ -312,6 +312,7 @@ fn boot_prepared_fork(
     prep: crate::agent::fork::PreparedFork,
     share_weights: bool,
     watch_parent: Option<bool>,
+    retry_gate: Option<&std::sync::Mutex<()>>,
 ) -> Result<VmHandle> {
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
@@ -321,31 +322,69 @@ fn boot_prepared_fork(
         watch_parent,
         ..LaunchFeatures::default()
     };
-    match launch_from_record(&prep.clone_record, features) {
-        Ok(started) => {
+    // A restore can reach the agent socket and still fail its first command on
+    // affected KVM hosts. Retry the complete boot transaction, not just VMM
+    // launch: a clone is not usable until identity reset and forkpoint release
+    // have both been acknowledged. The first failed attempt is stopped but its
+    // prepared CoW disks and DB record are retained for the clean restore retry.
+    let attempt = || {
+        let started = launch_from_record(&prep.clone_record, features.clone())?;
+        (|| {
             let mut handle = started.handle;
             // Fresh on-disk identity (hostname, machine-id, SSH host keys, RNG).
             // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone
             // and roll it back rather than leave it live with the golden's
             // per-machine secrets.
-            crate::agent::fork::fail_closed_on_rejuvenation(
-                crate::agent::fork::rejuvenate_clone(clone, &prep.clone_record),
-                || {
-                    let _ = handle.stop();
-                    let _ = db.remove_vm(clone);
-                    let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
-                },
-            )?;
-            mark_running(db, clone, handle.child_pid())?;
+            if let Err(error) = crate::agent::fork::rejuvenate_clone(clone, &prep.clone_record) {
+                let _ = handle.stop();
+                return Err(error);
+            }
+            // Embedded SDK forks are immediately consumable workers (there is
+            // no held-slot option on this path). A live workload may be parked
+            // in `smolvm-fork-ready` in the retained snapshot; release that
+            // clone-local barrier only after identity reset succeeds, matching
+            // the CLI and serve fork paths. Publishing a release marker is
+            // harmless for an arbitrary checkpoint with no waiting helper.
+            if let Err(error) = crate::agent::fork::release_forkpoint(clone) {
+                let _ = handle.stop();
+                return Err(error);
+            }
+            if let Err(error) = mark_running(db, clone, handle.child_pid()) {
+                let _ = handle.stop();
+                return Err(error);
+            }
             Ok(handle)
-        }
-        Err(e) => {
-            // prepare_fork already registered the clone; roll it back on boot failure.
+        })()
+    };
+    match retry_once_serialized(retry_gate, attempt) {
+        Ok(handle) => Ok(handle),
+        Err((first, retry)) => {
+            // prepare_fork already registered the clone; fail closed only after
+            // both complete boot transactions fail.
             let _ = db.remove_vm(clone);
             let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
-            Err(e)
+            Err(Error::agent(
+                "fork clone boot",
+                format!("clone '{clone}' first attempt failed: {first}; retry failed: {retry}"),
+            ))
         }
     }
+}
+
+fn retry_once_serialized<T, E>(
+    gate: Option<&std::sync::Mutex<()>>,
+    mut operation: impl FnMut() -> std::result::Result<T, E>,
+) -> std::result::Result<T, (E, E)> {
+    let first = match operation() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    let _guard = gate.map(|gate| {
+        gate.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    operation().map_err(|retry| (first, retry))
 }
 
 /// Fork a group of embedded machines from one retained snapshot and boot them
@@ -384,6 +423,7 @@ pub fn fork_vm_batch(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),
     ));
     let stop = std::sync::atomic::AtomicBool::new(false);
+    let retry_gate = std::sync::Mutex::new(());
 
     let results = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..width)
@@ -391,6 +431,7 @@ pub fn fork_vm_batch(
                 let db = db.clone();
                 let queue = &queue;
                 let stop = &stop;
+                let retry_gate = &retry_gate;
                 scope.spawn(move || {
                     let mut results = Vec::new();
                     loop {
@@ -406,7 +447,7 @@ pub fn fork_vm_batch(
                         };
                         let clone = prep.clone_record.name.clone();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            boot_prepared_fork(&db, &clone, prep, false, None)
+                            boot_prepared_fork(&db, &clone, prep, false, None, Some(retry_gate))
                         }))
                         .unwrap_or_else(|_| {
                             Err(Error::agent(
@@ -600,6 +641,23 @@ pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_clone_transaction_retries_once() {
+        let attempts = std::cell::Cell::new(0);
+        let gate = std::sync::Mutex::new(());
+        let result = retry_once_serialized(Some(&gate), || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt == 1 {
+                Err("transient")
+            } else {
+                Ok("ready")
+            }
+        });
+        assert_eq!(result, Ok("ready"));
+        assert_eq!(attempts.get(), 2);
+    }
 
     fn test_db() -> SmolvmDb {
         let unique = std::time::SystemTime::now()

@@ -31,6 +31,14 @@ fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
     }
 }
 
+/// Compose the environment used for an exec that joins a workload container.
+///
+/// Kept public within the agent so the restored-container namespace path and
+/// ordinary `crun exec` receive the same PATH, CUDA, and Vulkan additions.
+pub(crate) fn augmented_exec_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    crate::vulkan::augment_exec_env(crate::cuda::augment_exec_env(ensure_path_in_env(env)))
+}
+
 /// Builder for crun commands with consistent configuration.
 ///
 /// This ensures all crun invocations use the same cgroup-manager setting
@@ -275,8 +283,7 @@ impl CrunCommand {
         let mut c = Self::new();
         c.cmd.arg("exec").arg("--tty");
         c.cmd.arg("--console-socket").arg(console_socket);
-        let env_with_path =
-            crate::vulkan::augment_exec_env(crate::cuda::augment_exec_env(ensure_path_in_env(env)));
+        let env_with_path = augmented_exec_env(env);
         for (key, value) in &env_with_path {
             c.cmd.arg("--env").arg(format!("{}={}", key, value));
         }
@@ -346,8 +353,7 @@ impl CrunCommand {
             c.cmd.arg("--tty");
         }
         // Ensure PATH is set for command lookup; forward CUDA zero-copy opt-in.
-        let env_with_path =
-            crate::vulkan::augment_exec_env(crate::cuda::augment_exec_env(ensure_path_in_env(env)));
+        let env_with_path = augmented_exec_env(env);
         for (key, value) in &env_with_path {
             c.cmd.arg("--env").arg(format!("{}={}", key, value));
         }

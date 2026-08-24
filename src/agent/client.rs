@@ -729,6 +729,20 @@ pub struct AgentClient {
     trace_id: Option<String>,
 }
 
+fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
+    if bytes_read == 0 && propagate_initial_wouldblock {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "timed out waiting for an agent response frame",
+        )
+    } else {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out reading frame body: peer stalled mid-frame",
+        )
+    }
+}
+
 // ============================================================================
 // Response match helpers
 // ============================================================================
@@ -2476,6 +2490,43 @@ impl AgentClient {
 
         let mut pos = 0;
         while pos < buf.len() {
+            // SO_RCVTIMEO is normally enough to bound a blocking read, but a
+            // restored vsock/UDS bridge can occasionally leave recv() blocked
+            // past that socket timeout while many clones reconnect at once.
+            // Poll the descriptor against the same idle deadline before every
+            // read on Unix so a missing response cannot pin a fork-batch worker
+            // forever. A readable event also covers EOF/error; read() below
+            // preserves the precise result in those cases.
+            #[cfg(unix)]
+            if let Some(d) = deadline {
+                let mut pollfd = libc::pollfd {
+                    fd: std::os::unix::io::AsRawFd::as_raw_fd(&self.stream),
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                };
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= d {
+                        return Err(stalled_read_error(pos, propagate_initial_wouldblock));
+                    }
+                    let remaining = d.saturating_duration_since(now);
+                    let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+                    // SAFETY: `pollfd` points to one initialized entry for the
+                    // duration of the call; poll does not retain the pointer.
+                    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+                    if ready > 0 {
+                        break;
+                    }
+                    if ready == 0 {
+                        return Err(stalled_read_error(pos, propagate_initial_wouldblock));
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
             match self.stream.read(&mut buf[pos..]) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -2500,10 +2551,7 @@ impl AgentClient {
                     // can't busy-spin forever.
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "timed out reading frame body: peer stalled mid-frame",
-                            ));
+                            return Err(stalled_read_error(pos, propagate_initial_wouldblock));
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -3434,6 +3482,33 @@ mod stalled_body_tests {
     use super::*;
     use std::io::Write;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn receive_times_out_when_peer_never_starts_a_frame() {
+        let (client_stream, server_stream) = UdsStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            drop(server_stream);
+        });
+        let mut client = AgentClient::from_stream(client_stream);
+
+        let start = Instant::now();
+        let error = client
+            .receive()
+            .expect_err("an idle peer must not block receive forever");
+        let elapsed = start.elapsed();
+
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "an idle response must honor the socket deadline (got {elapsed:?})"
+        );
+        server.join().expect("server thread joined");
+    }
 
     #[test]
     fn receive_times_out_on_stalled_mid_frame_body() {

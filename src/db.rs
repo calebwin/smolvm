@@ -565,7 +565,14 @@ impl SmolvmDb {
     /// Read + delete happen in a single transaction to prevent TOCTOU races.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin transaction")?;
+            // Reserve the writer before reading. A deferred transaction can
+            // observe a record, lose a cross-process writer race, and fail its
+            // DELETE upgrade with SQLITE_BUSY_SNAPSHOT — which surfaced when
+            // NeMo Gym closed 100 fork leaves concurrently. `busy_timeout`
+            // cannot repair a stale snapshot; IMMEDIATE prevents one.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin vm removal")?;
 
             let data: Option<Vec<u8>> = tx
                 .query_row(

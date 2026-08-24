@@ -13,7 +13,8 @@ use std::time::Duration;
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
     CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, HELPER_PATH, READY_PATH, READY_VERSION, RELEASE_PATH,
-    RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+    RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH,
+    WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
@@ -58,6 +59,7 @@ pub fn setup() {
         tracing::warn!(%error, "failed to set forkpoint state permissions");
     }
     let _ = std::fs::remove_file(READY_PATH);
+    let _ = std::fs::remove_file(RESTORED_CONTAINER_PATH);
     let _ = std::fs::remove_file(RESTORED_PATH);
     let _ = std::fs::remove_file(RELEASE_PATH);
     let _ = std::fs::remove_file(WORKER_READY_PATH);

@@ -126,6 +126,37 @@ const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
 /// Poll interval for checking process completion in VM exec.
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
+/// Match mainstream container runtimes and leave enough descriptor headroom
+/// for package managers, browsers, language servers, and concurrent tools.
+pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
+
+#[cfg(target_os = "linux")]
+fn raise_nofile_limit() {
+    let desired = libc::rlimit {
+        rlim_cur: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
+        rlim_max: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
+    };
+    // SAFETY: `desired` is initialized and setrlimit copies it synchronously.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &desired) } == 0 {
+        return;
+    }
+
+    // Some kernels cap the hard limit below the conventional 1M default. Use
+    // every descriptor the guest was granted instead of leaving the legacy
+    // soft limit at 1,024.
+    let mut available = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `available` points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut available) } == 0 {
+        available.rlim_cur = available.rlim_max;
+        // SAFETY: `available` came from getrlimit and only its soft limit was
+        // raised to the already-authorized hard limit.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &available) };
+    }
+}
+
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
     if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
@@ -238,6 +269,11 @@ fn main() {
         "INFO",
         &format!("boot agent_entry uptime_ms={}", boottime_ms()),
     );
+
+    // crun exec inherits the agent's descriptor ceiling rather than the
+    // original OCI process limit, so raise PID 1 before launching workloads.
+    #[cfg(target_os = "linux")]
+    raise_nofile_limit();
 
     // Seed the guest wall clock from the host's launch time when the hypervisor
     // gives the guest no readable paravirt clock and it boots at ~1999 (WHP on
@@ -4067,9 +4103,10 @@ fn spawn_exec_in_container(
     container_id: &str,
     launch: &ResolvedLaunch,
     tty: bool,
+    unprivileged: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
     use std::io::Read as _;
-    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
     use std::sync::atomic::Ordering;
 
     // An exec joining a running container inherits the same image-resolved env /
@@ -4082,8 +4119,37 @@ fn spawn_exec_in_container(
         container_id = %container_id,
         command = ?command,
         tty = tty,
-        "joining running container via crun exec"
+        "joining running container"
     );
+
+    // A restored crun runtime can accept several execs and then stall even
+    // though the container and its processes remain healthy. Entering the
+    // inherited namespaces directly avoids that restored-runtime state while
+    // preserving the workload's live memory and process tree.
+    if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(container_id, launch)? {
+            if tty {
+                let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+                let slave_raw = slave_fd.as_raw_fd();
+                // SAFETY: `slave_fd` is a valid open PTY slave descriptor.
+                unsafe {
+                    command
+                        .stdin(Stdio::from_raw_fd(libc::dup(slave_raw)))
+                        .stdout(Stdio::from_raw_fd(libc::dup(slave_raw)))
+                        .stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+                }
+                let child = command.spawn()?;
+                drop(slave_fd);
+                return Ok((child, Some(pty_master)));
+            }
+            let child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            return Ok((child, None));
+        }
+    }
 
     if tty {
         // Preferred: console socket (resizable). Mirrors the create path.
@@ -4156,6 +4222,127 @@ fn spawn_exec_in_container(
             .spawn()?;
         Ok((child, None))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn restored_container_id() -> Option<String> {
+    restored_container_id_at(std::path::Path::new(
+        smolvm_protocol::forkpoint::RESTORED_CONTAINER_PATH,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn restored_container_id_at(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn container_workdir_path(
+    root: &std::path::Path,
+    guest_workdir: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let path = std::path::Path::new(guest_workdir);
+    if !path.is_absolute() {
+        return Err(format!(
+            "container workdir must be absolute: {guest_workdir}"
+        ));
+    }
+    let mut relative = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(value) => relative.push(value),
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return Err(format!(
+                        "container workdir escapes its root: {guest_workdir}"
+                    ));
+                }
+            }
+            Component::Prefix(_) => {
+                return Err(format!("invalid container workdir: {guest_workdir}"));
+            }
+        }
+    }
+    Ok(root.join(relative))
+}
+
+/// Build a process that enters a snapshot-restored workload container without
+/// asking crun to create another process through restored runtime state.
+///
+/// Returning `None` means this is a fresh container and should use the normal
+/// OCI runtime path. Unprivileged workloads deliberately never call this path.
+#[cfg(target_os = "linux")]
+fn restored_container_exec_command(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+) -> Result<Option<Command>, Box<dyn std::error::Error>> {
+    if restored_container_id().as_deref() != Some(container_id) {
+        return Ok(None);
+    }
+    let pid = crun_container_pid(container_id).ok_or_else(|| {
+        format!("restored container '{container_id}' no longer has a live init process")
+    })?;
+    let root = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+    let guest_workdir = launch.workdir.as_deref().unwrap_or("/");
+    let host_workdir = container_workdir_path(&root, guest_workdir)?;
+
+    let target_environment = std::fs::read(format!("/proc/{pid}/environ"))?;
+    let mut environment = target_environment
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    for (key, value) in &launch.env {
+        environment.retain(|(existing, _)| existing != key);
+        environment.push((key.clone(), value.clone()));
+    }
+    let environment = crun::augmented_exec_env(&environment);
+
+    let user = launch.user.as_deref().unwrap_or("0:0");
+    let (uid, gid) = user
+        .split_once(':')
+        .ok_or_else(|| format!("resolved container user is not uid:gid: {user}"))?;
+    let uid: u32 = uid.parse()?;
+    let gid: u32 = gid.parse()?;
+
+    let mut command = Command::new("/usr/bin/nsenter");
+    command
+        .arg("--target")
+        .arg(pid.to_string())
+        .args(["--mount", "--uts", "--ipc", "--pid"])
+        .arg(format!("--root={}", root.display()))
+        .arg(format!("--wd={}", host_workdir.display()))
+        .arg(format!("--setgid={gid}"))
+        .arg(format!("--setuid={uid}"))
+        .arg("--")
+        .args(&launch.command)
+        .env_clear()
+        .envs(environment);
+
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setgroups is async-signal-safe and touches only child credentials.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    info!(
+        container_id,
+        pid,
+        command = ?launch.command,
+        "joining snapshot-restored container namespaces"
+    );
+    Ok(Some(command))
 }
 
 /// Look up a running main workload container for the given overlay ID.
@@ -4393,7 +4580,7 @@ fn spawn_interactive_command(
 
     // If a main workload container is running for this overlay, join it.
     if let Some(cid) = resolve_main_container(persistent_overlay_id) {
-        return spawn_exec_in_container(&cid, launch, tty);
+        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
     }
 
     // On a persistent machine with no main container yet, establish a long-lived
@@ -4414,7 +4601,7 @@ fn spawn_interactive_command(
             launch,
             s3_volumes,
         ) {
-            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty),
+            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty, unprivileged),
             Err(e) => {
                 // Falling back to a fresh container would silently drop the
                 // remote volumes, leaving the workload reading an empty
@@ -4434,7 +4621,7 @@ fn spawn_interactive_command(
     // container in two steps and exec the command into it instead.
     if !s3_volumes.is_empty() {
         let cid = ensure_main_container(rootfs, None, mounts, unprivileged, launch, s3_volumes)?;
-        return spawn_exec_in_container(&cid, launch, tty);
+        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
     }
 
     let rootfs_path = Path::new(rootfs);
@@ -5541,30 +5728,20 @@ fn run_background_in_keepalive(
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let status = crun::CrunCommand::exec_detached(
-        &cid,
-        &launch.env,
-        &launch.command,
-        launch.workdir.as_deref(),
-        Some(&pid_file),
-    )
-    .user(launch.user.as_deref())
-    .stdin_null()
-    .discard_output()
-    .status()?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&pid_file);
-        return Err(format!(
-            "crun exec --detach failed (exit {})",
-            status.code().unwrap_or(-1)
-        )
-        .into());
-    }
-
-    let pid: u32 = std::fs::read_to_string(&pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+    let pid = if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+            let child = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            child.id()
+        } else {
+            run_crun_background_exec(&cid, &launch, &pid_file)?
+        }
+    } else {
+        run_crun_background_exec(&cid, &launch, &pid_file)?
+    };
     let _ = std::fs::remove_file(&pid_file);
 
     Ok(AgentResponse::Completed {
@@ -5572,6 +5749,36 @@ fn run_background_in_keepalive(
         stdout: format!("{pid}").into_bytes(),
         stderr: Vec::new(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn run_crun_background_exec(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    pid_file: &std::path::Path,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let status = crun::CrunCommand::exec_detached(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        Some(pid_file),
+    )
+    .user(launch.user.as_deref())
+    .stdin_null()
+    .discard_output()
+    .status()?;
+    if !status.success() {
+        return Err(format!(
+            "crun exec --detach failed (exit {})",
+            status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+    Ok(std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0))
 }
 
 /// Non-streaming exec/run returns the whole output in a single wire frame. If it
@@ -5717,22 +5924,30 @@ fn run_in_keepalive_container(
     // silently ignored `timeout_ms` — an `exec --timeout N` against an image
     // machine ran to completion regardless (found by QA 2026-07-19).
     let exec_pid_file = crun::ExecPidFile::new()?;
-    let mut builder = crun::CrunCommand::exec(
-        &cid,
-        &launch.env,
-        &launch.command,
-        launch.workdir.as_deref(),
-        false,
-    )
-    .user(launch.user.as_deref())
-    .pid_file(exec_pid_file.path())
-    .capture_output();
-    builder = if stdin_data.is_some() {
-        builder.stdin_piped()
+    let (mut child, namespace_exec) = if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if stdin_data.is_some() {
+                command.stdin(Stdio::piped());
+            } else {
+                command.stdin(Stdio::null());
+            }
+            (command.spawn()?, true)
+        } else {
+            (
+                spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
+                false,
+            )
+        }
     } else {
-        builder.stdin_null()
+        (
+            spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
+            false,
+        )
     };
-    let mut child = builder.spawn()?;
+    if namespace_exec {
+        std::fs::write(exec_pid_file.path(), child.id().to_string())?;
+    }
     if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
         let _ = stdin.write_all(data.as_bytes());
         // Drop closes the pipe → the command sees EOF.
@@ -5777,6 +5992,31 @@ fn run_in_keepalive_container(
             }
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_crun_foreground_exec(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    exec_pid_file: &crun::ExecPidFile,
+    stdin_data: Option<&str>,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let mut builder = crun::CrunCommand::exec(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
+    .capture_output();
+    builder = if stdin_data.is_some() {
+        builder.stdin_piped()
+    } else {
+        builder.stdin_null()
+    };
+    Ok(builder.spawn()?)
 }
 
 // Mirrors `storage::run_command`'s workload parameter list one-for-one; both
@@ -6688,6 +6928,33 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_container_marker_is_trimmed_and_empty_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("restored-container");
+        assert_eq!(restored_container_id_at(&marker), None);
+        std::fs::write(&marker, "  smolvm-restored-1\n").unwrap();
+        assert_eq!(
+            restored_container_id_at(&marker).as_deref(),
+            Some("smolvm-restored-1")
+        );
+        std::fs::write(&marker, " \n").unwrap();
+        assert_eq!(restored_container_id_at(&marker), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_container_workdir_cannot_escape_proc_root() {
+        let root = std::path::Path::new("/proc/123/root");
+        assert_eq!(
+            container_workdir_path(root, "/testbed/./src/../tests").unwrap(),
+            root.join("testbed/tests")
+        );
+        assert!(container_workdir_path(root, "relative").is_err());
+        assert!(container_workdir_path(root, "/../../agent-root").is_err());
+    }
 
     #[cfg(target_os = "linux")]
     fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {

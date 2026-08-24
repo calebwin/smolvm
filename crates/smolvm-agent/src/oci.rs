@@ -537,8 +537,8 @@ impl OciSpec {
                 capabilities: Some(capabilities),
                 rlimits: Some(vec![OciRlimit {
                     rlimit_type: "RLIMIT_NOFILE".to_string(),
-                    hard: 1024,
-                    soft: 1024,
+                    hard: crate::DEFAULT_NOFILE_LIMIT,
+                    soft: crate::DEFAULT_NOFILE_LIMIT,
                 }]),
                 no_new_privileges: false,
             },
@@ -1413,6 +1413,25 @@ mod tests {
                 .is_none(),
             "consoleSize must be omitted when unset"
         );
+    }
+
+    #[test]
+    fn default_nofile_limit_supports_dependency_heavy_workloads() {
+        let spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+            false,
+        );
+        let limits = spec.process.rlimits.expect("default process limits");
+        let nofile = limits
+            .iter()
+            .find(|limit| limit.rlimit_type == "RLIMIT_NOFILE")
+            .expect("RLIMIT_NOFILE");
+        assert_eq!(nofile.soft, 1_048_576);
+        assert_eq!(nofile.hard, 1_048_576);
     }
 
     #[test]

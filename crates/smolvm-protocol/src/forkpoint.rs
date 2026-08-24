@@ -18,6 +18,13 @@ pub const WORKER_READY_CAPABILITY: &str = "fork-worker-ready-v1";
 /// Marker written after a restored clone can safely enter ordinary timed waits.
 pub const RESTORED_PATH: &str = "/run/smolvm/forkpoint/restored";
 
+/// Container ID inherited with a live VM snapshot.
+///
+/// The restored container remains the owner of the workload's live process
+/// state, but new commands must join its namespaces directly: a post-restore
+/// `crun exec` can fail after trivial commands have already succeeded.
+pub const RESTORED_CONTAINER_PATH: &str = "/run/smolvm/forkpoint/restored-container";
+
 /// Marker written by the host after a clone is ready to resume.
 pub const RELEASE_PATH: &str = "/run/smolvm/forkpoint/release";
 

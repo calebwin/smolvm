@@ -1491,7 +1491,7 @@ fn spawn_pod_exec(
     use_process_spec: bool,
 ) -> Result<(std::process::Child, Option<crate::pty::PtyMaster>), Box<dyn std::error::Error>> {
     if !use_process_spec {
-        return crate::spawn_exec_in_container(id, launch, entry.tty);
+        return crate::spawn_exec_in_container(id, launch, entry.tty, false);
     }
     let bundle = pod_dir(id).join("bundle");
     std::fs::create_dir_all(&bundle)?;
