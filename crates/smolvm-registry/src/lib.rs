@@ -137,10 +137,26 @@ pub struct OciIndex {
     pub manifests: Vec<OciIndexManifest>,
 }
 
+/// Render an error with its full source chain.
+///
+/// `reqwest::Error`'s own Display stops at "error sending request for url",
+/// hiding whether the cause was a timeout, a reset, or DNS — the difference
+/// that decides how a failed multi-gigabyte upload gets debugged.
+fn format_error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        s.push_str(": ");
+        s.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    s
+}
+
 /// Error type for registry operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
-    #[error("HTTP request failed: {0}")]
+    #[error("HTTP request failed: {}", format_error_chain(.0))]
     Http(#[from] reqwest::Error),
 
     #[error("registry returned {status}: {body}")]
