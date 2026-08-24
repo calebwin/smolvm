@@ -345,6 +345,18 @@ install_smolvm() {
         warn "$prefix/lib exists but no .version file found — skipping lib/ removal"
         warn "If this is a previous smolvm install, remove it manually first"
     fi
+    # An older layout bundled agent-rootfs next to the binary, and the wrapper
+    # prefers that copy over the one in the data directory. Upgrades refresh the
+    # data-dir copy but left this one in place, so a new binary kept booting a
+    # stale agent — which silently ignores request fields it does not know (a
+    # remote volume, say) rather than failing. Remove it so the wrapper falls
+    # through to the rootfs this install actually wrote.
+    if [[ -d "$prefix/agent-rootfs" ]] && [[ -f "$prefix/.version" ]]; then
+        rm -rf "$prefix/agent-rootfs"
+    elif [[ -d "$prefix/agent-rootfs" ]]; then
+        warn "$prefix/agent-rootfs exists but no .version file found — skipping removal"
+        warn "If this is a previous smolvm install, remove it manually first"
+    fi
     if [[ -f "$prefix/smolvm" ]]; then
         rm -f "$prefix/smolvm"
     fi
