@@ -144,7 +144,7 @@ done
 # HYPRLAND's environment, so the bus must exist (at the standard path) before
 # Hyprland starts, or every client sees a broken/missing address.
 mkdir -p /run/dbus
-pgrep -x dbus-daemon >/dev/null || dbus-daemon --system --fork 2>/dev/null || true
+[ -S /run/dbus/system_bus_socket ] || dbus-daemon --system --fork 2>/dev/null || true
 sudo -u omar env XDG_RUNTIME_DIR=$RT dbus-daemon --session \
   --address=unix:path=$RT/bus --fork 2>/dev/null || true
 
