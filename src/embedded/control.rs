@@ -37,6 +37,11 @@ pub struct MachineSpec {
     pub allowed_hosts: Vec<String>,
     /// Whether the machine should persist across stop/start.
     pub persistent: bool,
+    /// Whether every start must use cloneable, memfd-backed guest RAM.
+    ///
+    /// This is persisted in the VM record so an SDK-created fork base remains
+    /// forkable after its creating process exits and a later process reconnects.
+    pub forkable: bool,
     /// Caller metadata, mirroring the CLI's `--label` and surfaced by
     /// `machine ls --json`. smolvm never interprets these.
     ///
@@ -83,6 +88,7 @@ impl MachineSpec {
         record.image = self.image.clone();
         record.labels = self.labels.clone();
         record.ephemeral = !self.persistent;
+        record.forkable = self.forkable;
         record.runtime_managed = self.runtime_managed;
         record.remote_volumes = self.remote_volumes.clone();
         record
@@ -157,6 +163,20 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
     features
 }
 
+fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result<LaunchFeatures> {
+    let mut features = merge_record_launch_features(record, features).with_packed_layers(
+        &crate::agent::machine_layers_cache_dir(&record.name),
+        record.source_smolmachine.as_deref(),
+    )?;
+    if features.packed_layers_dir.is_none() {
+        features.packed_layers_dir = record
+            .image
+            .as_deref()
+            .and_then(crate::data::image_source::packed_layers_dir_for_ref);
+    }
+    Ok(features)
+}
+
 /// Result of an embedded launch attempt.
 pub(crate) struct StartedVm {
     pub(crate) handle: VmHandle,
@@ -166,7 +186,12 @@ pub(crate) struct StartedVm {
 /// Boot `record` with the given launch features and return a handle. Shared by
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
 fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<StartedVm> {
-    let mut features = merge_record_launch_features(record, features);
+    // Reconstruct host-backed image devices on every launch.  These devices are
+    // part of the libkrun snapshot topology: omitting one while restoring a
+    // local-image clone makes krun reject the otherwise-valid checkpoint with
+    // EINVAL.  The CLI start path performs the same two resolutions; embedded
+    // SDK users must not get a subtly different VM configuration.
+    let mut features = record_launch_features(record, features)?;
     if record.forkable_on_start() {
         features.forkable = true;
     }
@@ -209,6 +234,8 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 /// `machine start --forkable`, surfaced for the embedded SDK.
 /// Start or reconnect to a forkable VM and retain the actual launch status.
 pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
+    db.update_vm(name, |record| record.forkable = true)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         forkable: true,
@@ -651,6 +678,15 @@ mod tests {
     }
 
     #[test]
+    fn record_carries_durable_forkable_start() {
+        let mut spec = test_spec("fork-base", true);
+        spec.forkable = true;
+        let record = spec.to_record();
+        assert!(record.forkable);
+        assert!(record.forkable_on_start());
+    }
+
+    #[test]
     fn record_carries_gpu_resources() {
         // Vulkan and CUDA must survive MachineSpec -> VmRecord (the `_boot-vm`
         // config), otherwise SDK and Kubernetes requests are silently dropped.
@@ -725,6 +761,19 @@ mod tests {
         assert_eq!(
             features.dns_filter_hosts,
             Some(vec!["override.example.com".into()])
+        );
+    }
+
+    #[test]
+    fn embedded_launch_restores_local_image_device_topology() {
+        let mut record = test_spec("local-image", true).to_record();
+        record.image = Some("local-dir:/srv/prepared-rootfs".into());
+
+        let features = record_launch_features(&record, LaunchFeatures::default()).unwrap();
+
+        assert_eq!(
+            features.packed_layers_dir,
+            Some(std::path::PathBuf::from("/srv/prepared-rootfs"))
         );
     }
 

@@ -86,6 +86,50 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Attach to an existing machine, starting it only when it is not already
+    /// available. A frozen fork base is intentionally not agent-reachable: its
+    /// vCPUs are paused while its retained checkpoint backs future clones.
+    /// Treating that state as a stopped VM launches a second VMM over the same
+    /// disks and replaces its control socket, destroying the fork source.
+    pub fn connect_or_start_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.cached_handle(name)? {
+                if lock_handle(&handle)?.is_process_alive() {
+                    return Ok(());
+                }
+                self.remove_cached_handle(name)?;
+            }
+
+            let record = control::get_record(&self.db, name)?;
+            // The DB remains `Running` while a retained live-RAM checkpoint is
+            // paused; the shared state probe resolves its control-socket state
+            // to `Frozen`. Looking only at the stored enum misses the normal
+            // retained-snapshot case and starts a second VMM over the golden.
+            if crate::agent::state_probe::resolve_state(name, &record)
+                == crate::config::RecordState::Frozen
+            {
+                return Ok(());
+            }
+
+            if let Ok(handle) = control::connect_vm(&self.db, name) {
+                self.insert_handle(name, handle)?;
+                return Ok(());
+            }
+
+            let started = control::start_vm(&self.db, name)?;
+            let mut handle = started.handle;
+            if started.freshly_started {
+                if let Err(error) = self.launch_image_workload(name, &mut handle) {
+                    let _ = handle.stop();
+                    let _ = control::mark_stopped(&self.db, name);
+                    return Err(error);
+                }
+            }
+            self.insert_handle(name, handle)?;
+            Ok(())
+        })
+    }
+
     /// Start a persisted machine attached to a Kubernetes pod network namespace.
     /// The launcher bridges the guest virtio-net NIC to a tap inside `netns` so
     /// the pod carries its CNI-assigned IP (see [`control::start_vm_with_netns`]).
@@ -713,6 +757,26 @@ mod tests {
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));
         assert_eq!(runtime.pid("runtime-state"), None);
+    }
+
+    #[test]
+    fn reconnect_never_restarts_a_frozen_fork_base() {
+        let db = test_db();
+        let mut record = test_spec("frozen-checkpoint", true).to_record();
+        record.state = crate::config::RecordState::Frozen;
+        db.insert_vm_if_not_exists("frozen-checkpoint", &record)
+            .unwrap();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+
+        runtime
+            .connect_or_start_machine("frozen-checkpoint")
+            .unwrap();
+
+        assert_eq!(
+            db.get_vm("frozen-checkpoint").unwrap().unwrap().state,
+            crate::config::RecordState::Frozen
+        );
+        assert!(runtime.registry.read().unwrap().is_empty());
     }
 
     #[test]
