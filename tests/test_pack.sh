@@ -1319,6 +1319,103 @@ test_from_vm_short_name() {
 }
 
 # =============================================================================
+# Local-image --from-vm tests
+#
+# A machine created from a rootfs dir or an image archive has no registry
+# manifest to re-pull, and the export used to refuse it outright. The base layer
+# is still reachable — a dir machine boots from the host directory, an archive
+# machine has the archive flattened onto its own storage disk — so both must
+# pack, with the machine's own writes layered on top.
+# =============================================================================
+
+test_from_vm_local_rootfs_dir() {
+    local vm_name="pack-localdir-$$"
+    local pack_output="$TEST_DIR/from-vm-localdir"
+    local rootfs="$TEST_DIR/localdir-rootfs"
+
+    # A rootfs the guest can actually run: reuse the agent rootfs, which ships
+    # busybox, and mark it so the packed result can be identified.
+    rm -rf "$rootfs"
+    local agent_rootfs="$PROJECT_ROOT/target/release/agent-rootfs"
+    [[ -d "$agent_rootfs" ]] || {
+        echo "SKIP: no agent rootfs at $agent_rootfs to build a local dir image from"
+        return 0
+    }
+    cp -R "$agent_rootfs" "$rootfs" || return 1
+    echo "local-dir-base" > "$rootfs/etc/pack-marker"
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    $SMOLVM machine create --name "$vm_name" --image "$rootfs" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo written-after > /etc/pack-state' 2>&1 || true
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || true
+
+    local exit_code=0
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+        echo "FAIL: pack create --from-vm refused a local rootfs dir machine (exit $exit_code)"
+        return 1
+    fi
+
+    # The pack must carry BOTH the base layer and the machine's own writes.
+    local out
+    out=$("$pack_output" run -- sh -c 'cat /etc/pack-marker; cat /etc/pack-state' 2>&1)
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    rm -rf "$rootfs"; rm -f "$pack_output" "$pack_output.smolmachine"
+
+    echo "$out" | grep -q "local-dir-base" || {
+        echo "FAIL: packed local-dir machine lost its base layer: $out"; return 1; }
+    echo "$out" | grep -q "written-after" || {
+        echo "FAIL: packed local-dir machine lost the machine's own writes: $out"; return 1; }
+}
+
+test_from_vm_local_archive() {
+    local vm_name="pack-localtar-$$"
+    local pack_output="$TEST_DIR/from-vm-localtar"
+    local archive="$TEST_DIR/local-image.tar"
+
+    command -v crane >/dev/null 2>&1 || {
+        echo "SKIP: crane not available to build a local image archive"
+        return 0
+    }
+    crane pull alpine:latest "$archive" 2>&1 || {
+        echo "SKIP: could not pull an image archive"
+        return 0
+    }
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    $SMOLVM machine create --name "$vm_name" --image "$archive" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo archive-state > /etc/pack-state' 2>&1 || true
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || true
+
+    local exit_code=0
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+        echo "FAIL: pack create --from-vm refused a local archive machine (exit $exit_code)"
+        return 1
+    fi
+
+    local out
+    out=$("$pack_output" run -- sh -c 'cat /etc/alpine-release; cat /etc/pack-state' 2>&1)
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    rm -f "$archive" "$pack_output" "$pack_output.smolmachine"
+
+    echo "$out" | grep -q "archive-state" || {
+        echo "FAIL: packed archive machine lost the machine's own writes: $out"; return 1; }
+}
+
+# =============================================================================
 # Case-Insensitive Collision Test (macOS regression)
 #
 # =============================================================================
@@ -1740,6 +1837,8 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""
 
     run_test "from-vm: short VM name (1 char) does not panic" test_from_vm_short_name || true
+    run_test "from-vm: local rootfs dir packs with the machine's writes" test_from_vm_local_rootfs_dir || true
+    run_test "from-vm: local image archive packs with the machine's writes" test_from_vm_local_archive || true
 fi
 
 # =============================================================================
