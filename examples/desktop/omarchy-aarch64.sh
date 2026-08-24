@@ -140,11 +140,19 @@ for e in /sys/class/input/event*; do
     > "/run/udev/data/c$(cat "$e/dev")"
 done
 
+# D-Bus before the compositor: apps launched from Hyprland keybinds inherit
+# HYPRLAND's environment, so the bus must exist (at the standard path) before
+# Hyprland starts, or every client sees a broken/missing address.
+mkdir -p /run/dbus
+pgrep -x dbus-daemon >/dev/null || dbus-daemon --system --fork 2>/dev/null || true
+sudo -u omar env XDG_RUNTIME_DIR=$RT dbus-daemon --session \
+  --address=unix:path=$RT/bus --fork 2>/dev/null || true
+
 SEATD_VTBOUND=0 seatd -g wheel >/tmp/seatd.log 2>&1 &
 sleep 2
 
 sudo -u omar env HOME=/home/omar XDG_RUNTIME_DIR=$RT XDG_SESSION_TYPE=wayland \
-  LIBSEAT_BACKEND=seatd AQ_NO_ATOMIC=1 PATH=/usr/local/bin:/usr/bin:/usr/sbin \
+  LIBSEAT_BACKEND=seatd AQ_NO_ATOMIC=1 DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus PATH=/usr/local/bin:/usr/bin:/usr/sbin \
   bash -s <<'INNER'
 set -o pipefail
 setsid Hyprland >/tmp/hypr.log 2>&1 &
@@ -157,11 +165,6 @@ export HYPRLAND_INSTANCE_SIGNATURE=$(ls -t "$XDG_RUNTIME_DIR"/hypr 2>/dev/null |
 for i in $(seq 1 20); do timeout 10 hyprctl -j monitors >/dev/null 2>&1 && break; sleep 5; done
 echo "omarchy hyprland up on $WAYLAND_DISPLAY"
 
-# dbus-launch plain output single-quotes the address; export $(...) keeps
-# the quotes in the variable and every D-Bus client then fails to parse
-# it. --sh-syntax emits eval-able assignments instead.
-eval "$(dbus-launch --sh-syntax 2>/dev/null)"
-export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 export OMARCHY_PATH=$HOME/.local/share/omarchy
 (setsid env DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS \
   QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
