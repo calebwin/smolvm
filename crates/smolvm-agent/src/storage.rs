@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 const LAYERS_DIR: &str = "layers";
 const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
+const IMAGE_METADATA_DIR: &str = "image-metadata";
 const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
@@ -1676,24 +1677,49 @@ fn layer_ok_marker(layer_dir: &Path) -> PathBuf {
     layer_dir.with_file_name(name)
 }
 
-/// Check if a layer directory is properly cached: its completion marker exists
-/// and the directory has content.
+fn image_size_cache_path(root: &Path, image: &str) -> PathBuf {
+    root.join(IMAGE_METADATA_DIR)
+        .join(sanitize_image_name(image) + ".size")
+}
+
+fn read_cached_image_size(root: &Path, image: &str) -> Option<u64> {
+    std::fs::read_to_string(image_size_cache_path(root, image))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn calculate_image_size(root: &Path, layers: &[String]) -> u64 {
+    layers
+        .iter()
+        .filter_map(|digest| {
+            let id = digest.strip_prefix("sha256:").unwrap_or(digest);
+            dir_size(&root.join(LAYERS_DIR).join(id)).ok()
+        })
+        .sum()
+}
+
+fn cache_image_size(root: &Path, image: &str, size: u64) {
+    let dir = root.join(IMAGE_METADATA_DIR);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(image_size_cache_path(root, image), size.to_string());
+    }
+}
+
+/// Check if a layer directory is properly cached: its completion marker and
+/// directory both exist.
 ///
 /// The marker is written only after extraction succeeded and the filesystem
 /// reported the data flushed, so its absence covers every bad state the old
 /// "directory is non-empty" check trusted: interrupted extraction, and
 /// extraction whose writeback later failed (a host out of disk surfaces as
-/// guest I/O errors AFTER tar exits, leaving non-empty corrupt layers that were
-/// then reused on every restart).
+/// guest I/O errors AFTER tar exits, leaving corrupt layers that were then
+/// reused on every restart). A successfully extracted OCI layer may legitimately
+/// contain no filesystem entries, so the marker—not directory contents—is the
+/// integrity signal.
 fn is_layer_cached(layer_dir: &Path) -> bool {
-    if !layer_ok_marker(layer_dir).exists() {
-        return false;
-    }
-    // Check if the directory has any entries
-    match std::fs::read_dir(layer_dir) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(_) => false,
-    }
+    layer_dir.is_dir() && layer_ok_marker(layer_dir).is_file()
 }
 
 /// Force writeback of everything extracted onto the storage filesystem and
@@ -1844,6 +1870,7 @@ pub fn format() -> Result<()> {
         (root.join(LAYERS_DIR), "layers"),
         (root.join(CONFIGS_DIR), "configs"),
         (root.join(MANIFESTS_DIR), "manifests"),
+        (root.join(IMAGE_METADATA_DIR), "image metadata"),
         (root.join(OVERLAYS_DIR), "overlays"),
         (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
         (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
@@ -1992,6 +2019,7 @@ where
                 .join(MANIFESTS_DIR)
                 .join(sanitize_image_name(image) + ".json");
             let _ = std::fs::remove_file(&manifest_path);
+            let _ = std::fs::remove_file(image_size_cache_path(root, image));
         }
     }
 
@@ -2060,7 +2088,6 @@ where
         serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
     // Extract layers with progress updates
-    let mut total_size = 0u64;
     // Layers extracted by THIS pull; their completion markers are written only
     // after the writeback barrier below confirms the data reached the disk.
     let mut newly_extracted: Vec<PathBuf> = Vec::new();
@@ -2181,10 +2208,6 @@ where
             return Err(StorageError::new(message));
         }
 
-        if let Ok(size) = dir_size(&layer_dir) {
-            total_size += size;
-        }
-
         newly_extracted.push(layer_dir);
 
         // Report progress after successful extraction
@@ -2216,6 +2239,12 @@ where
         std::fs::write(layer_ok_marker(dir), "ok")
             .map_err(|e| StorageError::new(format!("write layer completion marker: {}", e)))?;
     }
+
+    // Directory traversal is expensive for multi-gigabyte images and image
+    // metadata is consulted on every persistent exec. Compute the physical
+    // size once after the verified pull and keep it out of the command hot path.
+    let total_size = calculate_image_size(root, &layers);
+    cache_image_size(root, image, total_size);
 
     // Build ImageInfo
     let architecture = config_json["architecture"]
@@ -2322,7 +2351,6 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     // that exists without its marker is an interrupted or unflushed extraction —
     // trusting it is how a corrupted store kept "booting" after an out-of-disk
     // pull — so the image re-pulls instead.
-    let mut total_size = 0u64;
     for layer_digest in &layers {
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
@@ -2330,12 +2358,18 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
             // Clean up corrupt manifest to avoid repeated failures
             warn!(layer = %layer_id, image = %image, "cached image has a missing or unverified layer, cleaning up and will re-pull");
             let _ = std::fs::remove_file(&manifest_path);
+            let _ = std::fs::remove_file(image_size_cache_path(root, image));
             return Ok(None);
         }
-        if let Ok(size) = dir_size(&layer_dir) {
-            total_size += size;
-        }
     }
+
+    // Older stores have no size sidecar. Pay the directory walk once, persist
+    // it, and keep all subsequent execs O(layer-count) instead of O(files).
+    let total_size = read_cached_image_size(root, image).unwrap_or_else(|| {
+        let size = calculate_image_size(root, &layers);
+        cache_image_size(root, image, size);
+        size
+    });
 
     // Extract OCI config fields
     let oci_config = &config_json["config"];
@@ -2471,12 +2505,16 @@ pub fn purge_all_images() -> Result<()> {
     let root = Path::new(STORAGE_ROOT);
     let manifests_dir = root.join(MANIFESTS_DIR);
     let configs_dir = root.join(CONFIGS_DIR);
+    let metadata_dir = root.join(IMAGE_METADATA_DIR);
 
     if manifests_dir.exists() {
         std::fs::remove_dir_all(&manifests_dir)?;
     }
     if configs_dir.exists() {
         std::fs::remove_dir_all(&configs_dir)?;
+    }
+    if metadata_dir.exists() {
+        std::fs::remove_dir_all(&metadata_dir)?;
     }
 
     Ok(())
@@ -5395,8 +5433,12 @@ mod tests {
         // dirs are overlay lowerdirs).
         assert!(layer_ok_marker(&layer).parent() == layer.parent());
 
-        // Marker present but dir emptied: not cached.
+        // Empty directories are valid OCI layers once extraction is verified.
         std::fs::remove_dir_all(layer.join("bin")).unwrap();
+        assert!(is_layer_cached(&layer));
+
+        // The marker alone is insufficient if the layer directory disappeared.
+        std::fs::remove_dir(&layer).unwrap();
         assert!(!is_layer_cached(&layer));
     }
 
