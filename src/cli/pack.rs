@@ -340,7 +340,7 @@ impl PackCreateCmd {
             &mut client,
             &image,
             pack_config.oci_platform.as_deref(),
-            self.proxy_opts.proxy().as_deref(),
+            self.proxy_opts.resolved_proxy()?.as_deref(),
             self.proxy_opts.no_proxy().as_deref(),
         )?;
         debug!(image_info = ?image_info, "image pulled");
@@ -575,7 +575,7 @@ impl PackCreateCmd {
         // single-layer flatten).
         self.collect_base_assets(&mut collector)?;
         let export_opts = smolvm::pack_export::FromVmExportOptions {
-            proxy: self.proxy_opts.proxy(),
+            proxy: self.proxy_opts.resolved_proxy()?,
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
         };
