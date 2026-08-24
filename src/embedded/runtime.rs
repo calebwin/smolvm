@@ -139,9 +139,45 @@ impl EmbeddedRuntime {
     /// remaps the golden's forwards to fresh host ports. The golden freezes as the
     /// shared base and must not be started again while clones exist.
     pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
-        self.with_name_lock(clone, || {
+        self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm(&self.db, golden, clone, ports)?;
             self.insert_handle(clone, handle)?;
+            Ok(())
+        })
+    }
+
+    /// Fork several clones from one retained snapshot and boot them with
+    /// bounded parallelism. All names are locked together so overlapping SDK
+    /// calls cannot race the golden freeze or claim the same clone name.
+    pub fn fork_machines(
+        &self,
+        golden: &str,
+        clones: &[String],
+        ports: &[(u16, u16)],
+        parallel: usize,
+    ) -> Result<()> {
+        let mut lock_names = Vec::with_capacity(clones.len() + 1);
+        lock_names.push(golden);
+        lock_names.extend(clones.iter().map(String::as_str));
+        self.with_name_locks(&lock_names, || {
+            let requests: Vec<_> = clones
+                .iter()
+                .map(|name| (name.clone(), ports.to_vec()))
+                .collect();
+            let mut started = control::fork_vm_batch(&self.db, golden, &requests, parallel)?;
+            let mut registry = match self.registry.write() {
+                Ok(registry) => registry,
+                Err(error) => {
+                    for (name, handle) in &mut started {
+                        let _ = handle.stop();
+                        let _ = control::delete_vm(&self.db, name);
+                    }
+                    return Err(Error::agent("runtime registry", error.to_string()));
+                }
+            };
+            for (name, handle) in started {
+                registry.insert(name, Arc::new(Mutex::new(handle)));
+            }
             Ok(())
         })
     }
@@ -156,7 +192,7 @@ impl EmbeddedRuntime {
         ports: &[(u16, u16)],
         share_weights: bool,
     ) -> Result<()> {
-        self.with_name_lock(clone, || {
+        self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm_with_options(
                 &self.db,
                 golden,
@@ -514,8 +550,21 @@ impl EmbeddedRuntime {
     where
         F: FnOnce() -> Result<T>,
     {
-        let lock = self.lock_for_name(name)?;
-        let _guard = lock_name(&lock)?;
+        self.with_name_locks(&[name], op)
+    }
+
+    fn with_name_locks<T, F>(&self, names: &[&str], op: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let mut names = names.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        let locks = names
+            .into_iter()
+            .map(|name| self.lock_for_name(name))
+            .collect::<Result<Vec<_>>>()?;
+        let _guards = locks.iter().map(lock_name).collect::<Result<Vec<_>>>()?;
         op()
     }
 

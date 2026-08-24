@@ -728,6 +728,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     })?;
     let krun =
         unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
+    if resources.gpu {
+        krun.ensure_gpu_runtime()
+            .map_err(|e| Error::agent("configure gpu", e))?;
+    }
     boot_timing!("dylib loaded");
 
     // Pre-read the agent binary into the OS page cache so the virtiofs thread

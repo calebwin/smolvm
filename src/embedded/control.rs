@@ -28,6 +28,13 @@ pub struct MachineSpec {
     /// a bare VM. Mirrors the CLI's `--image`: without it the guest comes up as a
     /// bare VM and any image the caller asked for is silently not applied.
     pub image: Option<String>,
+    /// Workload command overriding the image entrypoint/CMD. Empty preserves
+    /// the image defaults, matching the CLI and REST create APIs.
+    pub command: Vec<String>,
+    /// Hostnames permitted by the TSI egress filter. Kept outside
+    /// `VmResources` because hostname rules are persisted separately from the
+    /// resolved CIDRs and refreshed by the DNS filter at runtime.
+    pub allowed_hosts: Vec<String>,
     /// Whether the machine should persist across stop/start.
     pub persistent: bool,
     /// Caller metadata, mirroring the CLI's `--label` and surfaced by
@@ -64,6 +71,11 @@ impl MachineSpec {
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
+        record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
+            None
+        } else {
+            Some(self.allowed_hosts.clone())
+        };
         record.network_backend = self.resources.network_backend;
         record.gpu = Some(self.resources.gpu);
         record.gpu_vram_mib = self.resources.gpu_vram_mib;
@@ -93,6 +105,16 @@ pub(crate) fn create_vm_with_workload(
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
     let mut record = spec.to_record();
+    if let Some(cidrs) = &spec.resources.allowed_cidrs {
+        record.allowed_cidrs = Some(
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| Error::config("validate allowed CIDR", reason))?,
+        );
+    }
+    record.cmd = spec.command.clone();
     record.env = env;
     record.workdir = workdir;
     if db.insert_vm_if_not_exists(&spec.name, &record)? {
@@ -124,6 +146,17 @@ fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
     launch_from_record(record, LaunchFeatures::default())
 }
 
+fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
+    if features.dns_filter_hosts.is_none() {
+        features.dns_filter_hosts = record.dns_filter_hosts.clone();
+    }
+    if !record.init_completed {
+        features
+            .allow_image_pull_egress(record.image.as_deref(), record.source_smolmachine.is_some());
+    }
+    features
+}
+
 /// Result of an embedded launch attempt.
 pub(crate) struct StartedVm {
     pub(crate) handle: VmHandle,
@@ -133,7 +166,7 @@ pub(crate) struct StartedVm {
 /// Boot `record` with the given launch features and return a handle. Shared by
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
 fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<StartedVm> {
-    let mut features = features;
+    let mut features = merge_record_launch_features(record, features);
     if record.forkable_on_start() {
         features.forkable = true;
     }
@@ -243,6 +276,16 @@ pub(crate) fn fork_vm_with_options(
         &std::collections::BTreeMap::new(),
     )?;
 
+    boot_prepared_fork(db, clone, prep, share_weights, watch_parent)
+}
+
+fn boot_prepared_fork(
+    db: &SmolvmDb,
+    clone: &str,
+    prep: crate::agent::fork::PreparedFork,
+    share_weights: bool,
+    watch_parent: Option<bool>,
+) -> Result<VmHandle> {
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
         snapshot_dir: Some(prep.snapshot_dir.clone()),
@@ -276,6 +319,142 @@ pub(crate) fn fork_vm_with_options(
             Err(e)
         }
     }
+}
+
+/// Fork a group of embedded machines from one retained snapshot and boot them
+/// with bounded parallelism. The operation is transactional: a preparation,
+/// boot, identity-rejuvenation, or bookkeeping failure stops and removes every
+/// clone created by this call. Once captured, the golden remains a paused,
+/// reusable fork base even when clone boot fails; this does not require newer
+/// libkrun rollback commands and lets a later batch retry from the checkpoint.
+pub fn fork_vm_batch(
+    db: &SmolvmDb,
+    golden: &str,
+    clones: &[(String, Vec<(u16, u16)>)],
+    parallel: usize,
+) -> Result<Vec<(String, VmHandle)>> {
+    if clones.is_empty() {
+        return Err(Error::config(
+            "fork batch",
+            "at least one clone is required",
+        ));
+    }
+    let empty_secrets = std::collections::BTreeMap::new();
+    let specs: Vec<_> = clones
+        .iter()
+        .map(|(name, ports)| crate::agent::fork::ForkSpec {
+            clone: name,
+            pinned_ports: ports,
+            clone_forkable: false,
+            fork_env: &[],
+            fork_secrets: &empty_secrets,
+            hold: false,
+        })
+        .collect();
+    let prepared = crate::agent::fork::prepare_forks(db, golden, &specs)?;
+    let width = parallel.max(1).min(prepared.len());
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
+        prepared.into_iter().enumerate().collect::<Vec<_>>(),
+    ));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+
+    let results = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..width)
+            .map(|_| {
+                let db = db.clone();
+                let queue = &queue;
+                let stop = &stop;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        let job = queue
+                            .lock()
+                            .expect("embedded fork batch queue poisoned")
+                            .pop_front();
+                        let Some((index, prep)) = job else {
+                            break;
+                        };
+                        let clone = prep.clone_record.name.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            boot_prepared_fork(&db, &clone, prep, false, None)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(Error::agent(
+                                "fork batch",
+                                format!("clone '{clone}' boot worker panicked"),
+                            ))
+                        });
+                        if result.is_err() {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        results.push((index, clone, result));
+                    }
+                    results
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(results) => results,
+                Err(_) => vec![(
+                    usize::MAX,
+                    "unknown".to_string(),
+                    Err(Error::agent(
+                        "fork batch",
+                        "clone boot worker terminated unexpectedly",
+                    )),
+                )],
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let first_error = results
+        .iter()
+        .find_map(|(_, name, result)| {
+            result
+                .as_ref()
+                .err()
+                .map(|error| Error::agent("fork batch", format!("clone '{name}' failed: {error}")))
+        })
+        .or_else(|| {
+            (results.len() != clones.len()).then(|| {
+                Error::agent(
+                    "fork batch",
+                    format!(
+                        "only {} of {} prepared clones reached a terminal boot result",
+                        results.len(),
+                        clones.len()
+                    ),
+                )
+            })
+        });
+
+    if let Some(error) = first_error {
+        for (_, _, result) in results {
+            if let Ok(mut handle) = result {
+                let _ = handle.stop();
+            }
+        }
+        for (name, _) in clones {
+            let _ = db.remove_vm(name);
+            let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(name));
+        }
+        return Err(error);
+    }
+
+    let mut ordered = results
+        .into_iter()
+        .map(|(index, name, result)| result.map(|handle| (index, name, handle)))
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by_key(|(index, _, _)| *index);
+    Ok(ordered
+        .into_iter()
+        .map(|(_, name, handle)| (name, handle))
+        .collect())
 }
 
 /// Connect to an already-running VM and return a cached handle.
@@ -479,12 +658,19 @@ mod tests {
         spec.resources.gpu = true;
         spec.resources.gpu_vram_mib = Some(512);
         spec.resources.cuda = true;
+        spec.resources.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
+        spec.allowed_hosts = vec!["api.example.com".into()];
         let record = spec.to_record();
         assert_eq!(record.gpu, Some(true));
         assert_eq!(record.gpu_vram_mib, Some(512));
         assert!(record.vm_resources().gpu);
         assert!(record.cuda);
         assert!(record.vm_resources().cuda);
+        assert_eq!(record.allowed_cidrs, Some(vec!["10.0.0.0/8".into()]));
+        assert_eq!(
+            record.dns_filter_hosts,
+            Some(vec!["api.example.com".into()])
+        );
 
         // Default (no GPU) records leave gpu off.
         let plain = test_spec("plain", false).to_record();
@@ -498,6 +684,7 @@ mod tests {
     fn record_carries_image_workload_configuration() {
         let mut spec = test_spec("workload", true);
         spec.image = Some("example/service:latest".into());
+        spec.command = vec!["python".into(), "-m".into(), "service".into()];
         let db = test_db();
         create_vm_with_workload(
             &db,
@@ -508,8 +695,37 @@ mod tests {
         .unwrap();
         let record = get_record(&db, "workload").unwrap();
         assert_eq!(record.image.as_deref(), Some("example/service:latest"));
+        assert_eq!(record.cmd, vec!["python", "-m", "service"]);
         assert_eq!(record.env, vec![("SESSION".into(), "golden".into())]);
         assert_eq!(record.workdir.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn embedded_launch_restores_persisted_hostname_egress_policy() {
+        let mut spec = test_spec("scoped", false);
+        spec.image = Some("ghcr.io/acme/service:latest".into());
+        spec.allowed_hosts = vec!["api.example.com".into()];
+        let mut record = spec.to_record();
+
+        let features = merge_record_launch_features(&record, LaunchFeatures::default());
+        assert_eq!(
+            features.dns_filter_hosts,
+            Some(vec!["api.example.com".into(), "ghcr.io".into()])
+        );
+
+        record.init_completed = true;
+        let features = merge_record_launch_features(&record, LaunchFeatures::default());
+        assert_eq!(features.dns_filter_hosts, spec.allowed_hosts.clone().into());
+
+        let explicit = LaunchFeatures {
+            dns_filter_hosts: Some(vec!["override.example.com".into()]),
+            ..LaunchFeatures::default()
+        };
+        let features = merge_record_launch_features(&record, explicit);
+        assert_eq!(
+            features.dns_filter_hosts,
+            Some(vec!["override.example.com".into()])
+        );
     }
 
     #[test]
@@ -526,5 +742,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn create_vm_normalizes_and_rejects_invalid_egress_cidrs() {
+        let db = test_db();
+        let mut spec = test_spec("normalized-cidr", false);
+        spec.resources.allowed_cidrs = Some(vec!["192.0.2.7".into(), "10.1.2.3/8".into()]);
+        create_vm(&db, &spec).unwrap();
+        assert_eq!(
+            get_record(&db, "normalized-cidr").unwrap().allowed_cidrs,
+            Some(vec!["192.0.2.7/32".into(), "10.1.2.3/8".into()])
+        );
+
+        let mut invalid = test_spec("invalid-cidr", false);
+        invalid.resources.allowed_cidrs = Some(vec!["not-a-cidr".into()]);
+        assert!(create_vm(&db, &invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid CIDR"));
+        assert!(db.get_vm("invalid-cidr").unwrap().is_none());
+    }
+
+    #[test]
+    fn embedded_batch_fork_rejects_empty_and_duplicate_groups_before_boot() {
+        let db = test_db();
+        assert!(fork_vm_batch(&db, "missing", &[], 4)
+            .err()
+            .expect("empty batch must fail")
+            .to_string()
+            .contains("at least one clone"));
+
+        let clones = vec![
+            ("duplicate".to_string(), Vec::new()),
+            ("duplicate".to_string(), Vec::new()),
+        ];
+        assert!(fork_vm_batch(&db, "missing", &clones, 4)
+            .err()
+            .expect("duplicate batch must fail")
+            .to_string()
+            .contains("duplicate clone name"));
+        assert!(db.get_vm("duplicate").unwrap().is_none());
     }
 }

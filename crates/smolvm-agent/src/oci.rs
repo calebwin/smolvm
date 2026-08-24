@@ -1179,19 +1179,37 @@ fn proc_filesystems_has(fstype: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// The container's hostname: the machine's name when the host supplied one
-/// out of the box. The name is validated as a lowercase DNS label at machine
-/// creation (see `validate_vm_name`), so it is a valid hostname verbatim — the
-/// name primary key's uniqueness carries straight through to the hostname with
-/// no lossy fold that could collide distinct names. The value is used as-is
-/// when it is a well-formed label (a defensive check, not a transform), and
-/// falls back to "container" only when no name was supplied.
+/// The container's hostname.
+///
+/// A normal boot uses the machine name supplied in the agent environment. A
+/// restored fork clone inherits that immutable process environment from its
+/// golden, but clone rejuvenation updates the VM's kernel hostname before it
+/// publishes `RESTORED_PATH`. Prefer that runtime hostname only after restore,
+/// so a recycled keep-alive container receives the clone's identity rather
+/// than recreating the golden's private UTS namespace.
 pub fn container_hostname() -> String {
-    std::env::var(smolvm_protocol::guest_env::MACHINE_NAME)
-        .ok()
-        .map(|name| name.trim().to_string())
-        .filter(|name| is_dns_label(name))
-        .unwrap_or_else(|| "container".to_string())
+    let restored = Path::new(smolvm_protocol::forkpoint::RESTORED_PATH).is_file();
+    let runtime = restored
+        .then(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .flatten();
+    let configured = std::env::var(smolvm_protocol::guest_env::MACHINE_NAME).ok();
+    resolve_container_hostname(restored, runtime.as_deref(), configured.as_deref())
+}
+
+fn resolve_container_hostname(
+    restored: bool,
+    runtime: Option<&str>,
+    configured: Option<&str>,
+) -> String {
+    restored
+        .then_some(runtime)
+        .flatten()
+        .into_iter()
+        .chain(configured)
+        .map(str::trim)
+        .find(|name| is_dns_label(name))
+        .unwrap_or("container")
+        .to_string()
 }
 
 /// Whether `s` is a lowercase DNS label usable verbatim as a hostname:
@@ -1222,6 +1240,27 @@ mod tests {
         assert!(!is_dns_label("-edge"));
         assert!(!is_dns_label("edge-"));
         assert!(!is_dns_label(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn restored_container_prefers_rejuvenated_runtime_hostname() {
+        assert_eq!(
+            resolve_container_hostname(true, Some("clone-7\n"), Some("golden")),
+            "clone-7"
+        );
+        assert_eq!(
+            resolve_container_hostname(false, Some("clone-7"), Some("golden")),
+            "golden"
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_hostname_falls_back_to_configured_name() {
+        assert_eq!(
+            resolve_container_hostname(true, Some("NOT A LABEL"), Some("golden")),
+            "golden"
+        );
+        assert_eq!(resolve_container_hostname(true, None, None), "container");
     }
 
     use super::*;

@@ -143,6 +143,10 @@ pub fn launch_agent_vm_dynamic(
     // SAFETY: Each FFI call below is individually wrapped in unsafe.
     // All CString/pointer construction is safe Rust outside the unsafe blocks.
 
+    if config.resources.gpu {
+        krun.ensure_gpu_runtime()?;
+    }
+
     // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug).
     // Honor SMOLVM_KRUN_LOG_LEVEL like the non-packed launcher so a packed VM's
     // boot can be traced; otherwise fall back to info under --debug.
