@@ -244,6 +244,8 @@ fn handle_client(
 
     // --- message loop ----------------------------------------------------
     let mut last_generation = 0u64;
+    // BGRX pixels of the last frame this client was sent, for damage diffing.
+    let mut last_sent: Option<Vec<u8>> = None;
     let mut client_supports_resize = false;
     let mut last_button_mask = 0u8;
 
@@ -327,7 +329,14 @@ fn handle_client(
                     }
                 }
 
-                send_frame(&mut s, &frame, &fmt)?;
+                let bgrx = display::to_bgrx(&frame);
+                match last_sent.as_ref() {
+                    Some(prev) if incremental && prev.len() == bgrx.len() => {
+                        send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)?;
+                    }
+                    _ => send_frame(&mut s, &frame, &bgrx, &fmt)?,
+                }
+                last_sent = Some(bgrx.into_owned());
             }
             4 => {
                 // KeyEvent: down-flag, 2 bytes padding, u32 keysym.
@@ -423,9 +432,13 @@ fn send_resize(s: &mut TcpStream, width: u32, height: u32) -> std::io::Result<()
     s.write_all(&msg)
 }
 
-fn send_frame(s: &mut TcpStream, frame: &Frame, fmt: &PixelFormat) -> std::io::Result<()> {
-    let bgrx = display::to_bgrx(frame);
-    let pixels = encode_pixels(&bgrx, fmt);
+fn send_frame(
+    s: &mut TcpStream,
+    frame: &Frame,
+    bgrx: &[u8],
+    fmt: &PixelFormat,
+) -> std::io::Result<()> {
+    let pixels = encode_pixels(bgrx, fmt);
 
     let mut header = vec![0u8, 0];
     header.extend_from_slice(&1u16.to_be_bytes()); // one rectangle
@@ -436,6 +449,57 @@ fn send_frame(s: &mut TcpStream, frame: &Frame, fmt: &PixelFormat) -> std::io::R
     header.extend_from_slice(&ENCODING_RAW.to_be_bytes());
     s.write_all(&header)?;
     s.write_all(&pixels)
+}
+
+/// Send only the row bands that changed since the frame this client last
+/// received. Raw encoding ships every pixel of a rectangle, so cursor-sized
+/// damage would otherwise cost a full-frame update (~5 MB at 1440x900) on
+/// every pointer movement.
+fn send_frame_diff(
+    s: &mut TcpStream,
+    frame: &Frame,
+    bgrx: &[u8],
+    prev: &[u8],
+    fmt: &PixelFormat,
+) -> std::io::Result<()> {
+    const BAND_ROWS: usize = 16;
+    let row = frame.width as usize * 4;
+    let height = frame.height as usize;
+
+    // Dirty 16-row bands, with adjacent bands merged into one rectangle.
+    let mut rects: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    while start < height {
+        let rows = BAND_ROWS.min(height - start);
+        if bgrx[start * row..(start + rows) * row] != prev[start * row..(start + rows) * row] {
+            match rects.last_mut() {
+                Some(last) if last.0 + last.1 == start => last.1 += rows,
+                _ => rects.push((start, rows)),
+            }
+        }
+        start += rows;
+    }
+
+    if rects.is_empty() {
+        // The frame generation moved but the pixels did not.
+        return s.write_all(&[0u8, 0, 0, 0]);
+    }
+
+    let mut header = vec![0u8, 0];
+    header.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+    s.write_all(&header)?;
+    for (band_start, band_rows) in rects {
+        let mut rect = Vec::with_capacity(12);
+        rect.extend_from_slice(&0u16.to_be_bytes());
+        rect.extend_from_slice(&(band_start as u16).to_be_bytes());
+        rect.extend_from_slice(&(frame.width as u16).to_be_bytes());
+        rect.extend_from_slice(&(band_rows as u16).to_be_bytes());
+        rect.extend_from_slice(&ENCODING_RAW.to_be_bytes());
+        s.write_all(&rect)?;
+        let band = &bgrx[band_start * row..(band_start + band_rows) * row];
+        s.write_all(&encode_pixels(band, fmt))?;
+    }
+    Ok(())
 }
 
 /// Resolve `SMOLVM_VNC` into a bind address. Accepts a bare port ("5900"), a
