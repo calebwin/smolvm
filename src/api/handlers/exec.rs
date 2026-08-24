@@ -84,6 +84,18 @@ pub async fn exec_command(
         let workdir = req.workdir.clone();
         let machine_rec = state.lookup_vm(&id).await?;
         let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+        let exec_s3_volumes = machine_rec
+            .as_ref()
+            .map(|r| crate::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+            .unwrap_or_default();
+        // An exec may be what establishes the workload container — the machine's
+        // command exited, or the image's own default was short-lived — and that
+        // container is where the mount lives. Carry the machine's volumes so the
+        // bucket is present in whichever container serves this session.
+        let exec_s3_volumes = machine_rec
+            .as_ref()
+            .map(|r| crate::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+            .unwrap_or_default();
         let machine_image = machine_rec.and_then(|r| r.image);
         let pid = if let Some(image) = machine_image {
             let mounts_config = {
@@ -106,6 +118,7 @@ pub async fn exec_command(
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_mounts(mounts_config)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_id));
                 c.run_background(config)
             })
@@ -140,6 +153,14 @@ pub async fn exec_command(
     // directly via `vm_exec`.
     let machine_rec = state.lookup_vm(&id).await?;
     let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+    // An exec may be what establishes the workload container — the machine's
+    // command exited, or the image's own default was short-lived — and that
+    // container is where the mount lives. Carry the machine's volumes so the
+    // bucket is present in whichever container serves this session.
+    let exec_s3_volumes = machine_rec
+        .as_ref()
+        .map(|r| crate::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+        .unwrap_or_default();
     let machine_image = machine_rec.and_then(|r| r.image);
 
     let start = std::time::Instant::now();
@@ -167,6 +188,7 @@ pub async fn exec_command(
                 .with_workdir(workdir)
                 .with_mounts(mounts_config)
                 .with_timeout(timeout)
+                .with_s3_volumes(exec_s3_volumes.clone())
                 .with_persistent_overlay(Some(overlay_id))
                 .with_stdin(stdin_data);
             c.run_non_interactive(config)
@@ -239,6 +261,14 @@ pub async fn exec_stream(
     // output (the agent-base streaming path doesn't enter the container).
     let machine_rec = state.lookup_vm(&id).await?;
     let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+    // An exec may be what establishes the workload container — the machine's
+    // command exited, or the image's own default was short-lived — and that
+    // container is where the mount lives. Carry the machine's volumes so the
+    // bucket is present in whichever container serves this session.
+    let exec_s3_volumes = machine_rec
+        .as_ref()
+        .map(|r| crate::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+        .unwrap_or_default();
     let machine_image = machine_rec.and_then(|r| r.image);
 
     // Bridge the blocking, synchronous vsock streaming exec to an async SSE
@@ -276,6 +306,7 @@ pub async fn exec_stream(
                     .with_workdir(workdir)
                     .with_mounts(mounts_config)
                     .with_timeout(timeout)
+                    .with_s3_volumes(exec_s3_volumes.clone())
                     .with_persistent_overlay(Some(overlay_id));
                 c.run_streaming_with(config, |e| {
                     let _ = tx.send(e);
@@ -438,7 +469,14 @@ pub async fn exec_interactive(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+    let machine_record = state.lookup_vm(&id).await?;
+    let machine_image = machine_record.as_ref().and_then(|r| r.image.clone());
+    // Carry the machine's bucket mounts: an interactive session may be what
+    // establishes the workload container, and the mount lives there.
+    let exec_s3_volumes = machine_record
+        .as_ref()
+        .map(|r| crate::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
+        .unwrap_or_default();
 
     let command = vec![q.cmd.clone().unwrap_or_else(|| "/bin/sh".to_string())];
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
@@ -508,6 +546,7 @@ pub async fn exec_interactive(
                     let config = crate::agent::RunConfig::new(image, command)
                         .with_mounts(mounts_config)
                         .with_tty(true)
+                        .with_s3_volumes(exec_s3_volumes.clone())
                         .with_persistent_overlay(Some(id));
                     client
                         .run_interactive_io(config, in_rx, on_output)
