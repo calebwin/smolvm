@@ -68,6 +68,23 @@ pub fn parse_display_size(raw: Option<&str>) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// Default `KRUN_GPU_BACKEND=2d` on macOS when a display is requested.
+///
+/// The virglrenderer bundled on macOS is Venus-only: it cannot create the
+/// classic 2D resources a scanout serves, so every display path fails until
+/// libkrun is switched to rutabaga's CPU 2D component. Users shouldn't need
+/// to know that; an explicit KRUN_GPU_BACKEND still wins.
+///
+/// Shared by both launchers. Must run before the VM starts — libkrun reads
+/// the variable when it builds the virtio-gpu device.
+pub fn default_gpu_backend_for_display() {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("KRUN_GPU_BACKEND").is_none() {
+        std::env::set_var("KRUN_GPU_BACKEND", "2d");
+        tracing::info!("display requested on macOS: defaulting KRUN_GPU_BACKEND=2d");
+    }
+}
+
 /// Compute the `virgl_flags` bitmask for `krun_set_gpu_options2`.
 ///
 /// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)

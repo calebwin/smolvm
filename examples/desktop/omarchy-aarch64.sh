@@ -7,7 +7,7 @@
 #   smolvm machine create -n omarchy -I menci/archlinuxarm:latest \
 #     --cpus 6 --mem 8192 --storage 20 --net --gpu -p 5901:5901 \
 #     -v "$PWD:/in"
-#   KRUN_GPU_BACKEND=2d SMOLVM_DISPLAY=1024x768 SMOLVM_VNC=127.0.0.1:5900 \
+#   SMOLVM_DISPLAY=1024x768 SMOLVM_VNC=127.0.0.1:5900 \
 #     smolvm machine start --name omarchy
 #   smolvm machine exec --name omarchy -- bash /in/omarchy-aarch64.sh
 #
@@ -16,8 +16,9 @@
 #     native damage tracking and a client-side cursor. Point a VNC client (or
 #     websockify+noVNC for a browser) at 127.0.0.1:5901.
 #   - Console path: the host-side scanout VNC on SMOLVM_VNC (5900). On macOS
-#     this requires KRUN_GPU_BACKEND=2d — the bundled virglrenderer there has
-#     no GL support, so classic 2D resources need rutabaga's CPU component.
+#     smolvm defaults KRUN_GPU_BACKEND=2d automatically — the bundled
+#     virglrenderer there has no GL support, so classic 2D resources need
+#     rutabaga's CPU component. Set the variable yourself to override.
 #
 # Deltas from the x86 recipe, each learned the hard way:
 #   - Base is Arch Linux ARM (no snapshot archive; pacman keyring needs init).

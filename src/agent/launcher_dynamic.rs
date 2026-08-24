@@ -217,6 +217,7 @@ pub fn launch_agent_vm_dynamic(
                 if let Some((w, h)) =
                     super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
                 {
+                    super::default_gpu_backend_for_display();
                     match krun.add_display {
                         Some(add_display) => {
                             let ret = unsafe { add_display(ctx, w, h) };
