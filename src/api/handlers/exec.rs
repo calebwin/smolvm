@@ -84,10 +84,6 @@ pub async fn exec_command(
         let workdir = req.workdir.clone();
         let machine_rec = state.lookup_vm(&id).await?;
         let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
-        let exec_s3_volumes = machine_rec
-            .as_ref()
-            .map(|r| crate::remote_volume::to_s3_volumes(&r.remote_volumes, &r.env))
-            .unwrap_or_default();
         // An exec may be what establishes the workload container — the machine's
         // command exited, or the image's own default was short-lived — and that
         // container is where the mount lives. Carry the machine's volumes so the
