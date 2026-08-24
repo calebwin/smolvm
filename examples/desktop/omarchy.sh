@@ -43,6 +43,15 @@ mount -o remount,size=2G /dev/shm 2>/dev/null || true
 # need a session bus — a container guest has neither out of the box.
 dbus-uuidgen --ensure 2>/dev/null || true
 
+# Chromium wrapper: Wayland, software rendering, and software WebGL —
+# --enable-unsafe-swiftshader matters: modern Chromium blocks software WebGL
+# in windowed mode without it, so CAD/3D sites silently render nothing.
+cat > /usr/local/bin/chromium <<'CHROMIUMWRAP'
+#!/bin/bash
+exec /usr/bin/chromium --ozone-platform=wayland --disable-gpu --enable-unsafe-swiftshader "$@"
+CHROMIUMWRAP
+chmod +x /usr/local/bin/chromium
+
 # Input devices need two container-guest fixes. First: /dev is not devtmpfs,
 # so the evdev nodes the kernel registered (visible in /sys/class/input)
 # never appear in /dev — create them, the same way k3d guests need /dev/kmsg.

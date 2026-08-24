@@ -114,6 +114,17 @@ if [ -n "$dir" ] && [ -d "$dir" ]; then exec foot -D "$dir" "$@"; fi
 exec foot "$@"
 EOF
   chmod +x /usr/local/bin/uwsm-app /usr/local/bin/xdg-terminal-exec
+
+  # Chromium: Wayland, software rendering, and software WebGL. The Arch ARM
+  # chromium is a bare ELF with no flags-file launcher, so a PATH wrapper is
+  # the only way to apply flags to every launch. --enable-unsafe-swiftshader
+  # matters: modern Chromium blocks software WebGL in windowed mode without
+  # it (headless allows it), so CAD/3D sites silently render nothing.
+  cat > /usr/local/bin/chromium <<'CHROMIUMWRAP'
+#!/bin/bash
+exec /usr/bin/chromium --ozone-platform=wayland --disable-gpu --enable-unsafe-swiftshader "$@"
+CHROMIUMWRAP
+  chmod +x /usr/local/bin/chromium
   log "setup complete"
 fi
 
