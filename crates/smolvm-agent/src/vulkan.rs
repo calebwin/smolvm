@@ -87,17 +87,43 @@ fn inject_into_container_if(
 /// exec env. Used on the `crun exec` path (joining a persistent machine's
 /// keep-alive container), where the workload env is passed via `--env` rather
 /// than inherited from the container spec, so the spec injection above doesn't
-/// reach it. The bind mount itself was established when the container was
-/// created. Gates mirror the inject path as seen from the AGENT's namespace
-/// (GPU present + bundle shipped); a container that skipped the mount (musl,
-/// opt-out) merely gets env pointing at a path that doesn't exist there — the
-/// loader finds no driver, exactly today's behavior. A user-provided driver
-/// choice in the exec env still wins.
-pub fn augment_exec_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
-    if !std::path::Path::new("/dev/dri").exists()
-        || !std::path::Path::new(GUEST_BUNDLE_DIR)
-            .join(DRIVER)
-            .is_file()
+/// reach it. A user-provided driver choice in the exec env still wins.
+///
+/// The gate is the bundle's ACTUAL presence inside the target container, read
+/// through the container's own mount namespace — not a re-derivation of the
+/// inject path's policy. Pointing `VK_DRIVER_FILES` at a bundle the container
+/// never received is worse than leaving Vulkan alone: the loader fails with
+/// `Found no drivers!` naming a smolvm path, which reads as a broken install
+/// rather than an unsupported image, and sends people hunting for a missing
+/// mount (#1050). Asking the container covers every reason the mount can be
+/// absent — a musl image, the opt-out, or a creation path that never injects —
+/// without duplicating a check that then has to be kept in sync.
+pub fn augment_exec_env(env: Vec<(String, String)>, container_id: &str) -> Vec<(String, String)> {
+    let container_root =
+        crate::crun_container_pid(container_id).map(|pid| format!("/proc/{pid}/root"));
+    augment_exec_env_in(env, container_root.as_deref().map(std::path::Path::new))
+}
+
+/// Testable core of [`augment_exec_env`]. `container_root` is the agent's view
+/// of the container's filesystem (`/proc/<pid>/root`), or `None` when the
+/// container's PID could not be resolved.
+fn augment_exec_env_in(
+    mut env: Vec<(String, String)>,
+    container_root: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    // Fail closed. An unconfirmed bundle leaves the workload on whatever driver
+    // its image ships — the behavior from before the bundle existed, and the
+    // silent no-op every other gate in this module degrades to.
+    let Some(root) = container_root else {
+        return env;
+    };
+    // `CONTAINER_BUNDLE_DIR` is absolute, which `Path::join` would treat as a
+    // replacement rather than a descent; strip the root so it stays relative to
+    // the container's view.
+    if !root
+        .join(CONTAINER_BUNDLE_DIR.trim_start_matches('/'))
+        .join(ICD_JSON)
+        .is_file()
     {
         return env;
     }
@@ -276,6 +302,94 @@ mod tests {
         let mut s = spec();
         inject_into_container_if(&mut s, rootfs.path(), true, bundle.path());
         assert!(!bundle_mounted(&s));
+    }
+
+    /// A container root as the agent sees it (`/proc/<pid>/root`) with the
+    /// bundle bind-mounted at `CONTAINER_BUNDLE_DIR`.
+    fn container_root_with_bundle() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = dir
+            .path()
+            .join(CONTAINER_BUNDLE_DIR.trim_start_matches('/'));
+        std::fs::create_dir_all(&mounted).unwrap();
+        std::fs::write(mounted.join(ICD_JSON), b"{}").unwrap();
+        std::fs::write(mounted.join(DRIVER), b"").unwrap();
+        dir
+    }
+
+    fn value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn exec_env_pins_driver_when_the_container_has_the_bundle() {
+        let root = container_root_with_bundle();
+        let env = augment_exec_env_in(vec![], Some(root.path()));
+        assert_eq!(
+            value(&env, "VK_DRIVER_FILES"),
+            Some("/opt/smolvm-vulkan/virtio_icd.json")
+        );
+        assert_eq!(value(&env, "LD_LIBRARY_PATH"), Some(CONTAINER_BUNDLE_DIR));
+    }
+
+    /// #1050: a musl image skips the mount on the inject path, so the exec path
+    /// must not hand it env pointing at the bundle that was never mounted.
+    #[test]
+    fn exec_env_untouched_when_the_container_lacks_the_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let env = augment_exec_env_in(vec![], Some(root.path()));
+        assert!(env.is_empty(), "expected no Vulkan env, got {env:?}");
+    }
+
+    /// The mount point can exist without the bundle behind it; only a readable
+    /// ICD proves the container actually received a driver.
+    #[test]
+    fn exec_env_untouched_when_the_mount_point_is_empty() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            root.path()
+                .join(CONTAINER_BUNDLE_DIR.trim_start_matches('/')),
+        )
+        .unwrap();
+        let env = augment_exec_env_in(vec![], Some(root.path()));
+        assert!(env.is_empty(), "expected no Vulkan env, got {env:?}");
+    }
+
+    #[test]
+    fn exec_env_untouched_when_the_container_pid_is_unresolvable() {
+        let env = augment_exec_env_in(vec![], None);
+        assert!(env.is_empty(), "expected no Vulkan env, got {env:?}");
+    }
+
+    #[test]
+    fn exec_env_defers_to_a_user_driver_choice() {
+        let root = container_root_with_bundle();
+        let chosen = vec![(
+            "VK_ICD_FILENAMES".to_string(),
+            "/usr/share/vulkan/icd.d/mine.json".to_string(),
+        )];
+        let env = augment_exec_env_in(chosen, Some(root.path()));
+        assert!(value(&env, "VK_DRIVER_FILES").is_none());
+        // The loader path is still added — only the driver pin defers.
+        assert_eq!(value(&env, "LD_LIBRARY_PATH"), Some(CONTAINER_BUNDLE_DIR));
+    }
+
+    #[test]
+    fn exec_env_appends_to_an_existing_ld_library_path_once() {
+        let root = container_root_with_bundle();
+        let env = augment_exec_env_in(
+            vec![("LD_LIBRARY_PATH".to_string(), "/usr/lib".to_string())],
+            Some(root.path()),
+        );
+        assert_eq!(
+            value(&env, "LD_LIBRARY_PATH"),
+            Some(format!("/usr/lib:{CONTAINER_BUNDLE_DIR}").as_str())
+        );
+        let twice = augment_exec_env_in(env, Some(root.path()));
+        assert_eq!(
+            value(&twice, "LD_LIBRARY_PATH"),
+            Some(format!("/usr/lib:{CONTAINER_BUNDLE_DIR}").as_str())
+        );
     }
 
     #[test]

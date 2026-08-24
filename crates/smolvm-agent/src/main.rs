@@ -4303,7 +4303,7 @@ fn restored_container_exec_command(
         environment.retain(|(existing, _)| existing != key);
         environment.push((key.clone(), value.clone()));
     }
-    let environment = crun::augmented_exec_env(&environment);
+    let environment = crun::augmented_exec_env(&environment, container_id);
 
     let user = launch.user.as_deref().unwrap_or("0:0");
     let (uid, gid) = user
