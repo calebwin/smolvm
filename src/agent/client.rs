@@ -481,6 +481,52 @@ impl RunConfig {
         }
     }
 
+    /// Target an existing machine: the overlay it runs in AND the buckets it
+    /// mounts, which must travel together.
+    ///
+    /// These two facts were previously set independently at ~15 launch and exec
+    /// sites, and a site that set the overlay but forgot the volumes produced a
+    /// workload running in the right filesystem with its bucket silently
+    /// missing — an empty directory, not an error. Binding them to one call
+    /// means a site either targets a machine completely or not at all, and a
+    /// future per-machine fact is added here rather than at every caller.
+    ///
+    /// `env` is the environment the machine will actually see (request env and
+    /// resolved secrets merged over the record's), because that is where the
+    /// bucket credentials come from.
+    pub fn in_machine(
+        mut self,
+        record: &crate::config::VmRecord,
+        machine_name: &str,
+        env: &[(String, String)],
+    ) -> Self {
+        // A caller with no env of its own (an interactive session, say) still
+        // needs the machine's credentials, which live on the record.
+        let env = if env.is_empty() { &record.env } else { env };
+        self.s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, env);
+        self.persistent_overlay_id = Some(crate::workload::persistent_overlay_owner(
+            machine_name,
+            record.golden.as_deref(),
+        ));
+        self
+    }
+
+    /// [`Self::in_machine`] for callers holding an optional record.
+    ///
+    /// A machine with no record (an ephemeral or bare-VM session) simply keeps
+    /// the config as-is, so a caller never has to branch on it.
+    pub fn in_machine_opt(
+        self,
+        record: Option<&crate::config::VmRecord>,
+        machine_name: &str,
+        env: &[(String, String)],
+    ) -> Self {
+        match record {
+            Some(record) => self.in_machine(record, machine_name, env),
+            None => self,
+        }
+    }
+
     /// Set the remote-volume mount script run inside the workload container.
     pub fn with_s3_volumes(mut self, volumes: Vec<smolvm_protocol::S3Volume>) -> Self {
         self.s3_volumes = volumes;

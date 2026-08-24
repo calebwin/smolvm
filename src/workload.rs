@@ -74,18 +74,13 @@ pub fn launch_image_workload(
     // Remote volumes are mounted by the agent itself, natively, between the
     // container's create and start — so the workload sees its data from its
     // first instruction and its command is never rewritten.
-    let s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, &exec_env);
     match client.run_container_detached(
         RunConfig::new(image, command)
-            .with_env(exec_env)
             .with_workdir(record.workdir.clone())
             .with_user(record.user.clone())
             .with_mounts(record_mounts_to_bindings(&record.mounts))
-            .with_persistent_overlay(Some(persistent_overlay_owner(
-                machine_name,
-                record.golden.as_deref(),
-            )))
-            .with_s3_volumes(s3_volumes),
+            .in_machine(record, machine_name, &exec_env)
+            .with_env(exec_env),
     ) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {
