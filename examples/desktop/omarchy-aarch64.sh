@@ -157,7 +157,11 @@ export HYPRLAND_INSTANCE_SIGNATURE=$(ls -t "$XDG_RUNTIME_DIR"/hypr 2>/dev/null |
 for i in $(seq 1 20); do timeout 10 hyprctl -j monitors >/dev/null 2>&1 && break; sleep 5; done
 echo "omarchy hyprland up on $WAYLAND_DISPLAY"
 
-export $(dbus-launch 2>/dev/null)
+# dbus-launch plain output single-quotes the address; export $(...) keeps
+# the quotes in the variable and every D-Bus client then fails to parse
+# it. --sh-syntax emits eval-able assignments instead.
+eval "$(dbus-launch --sh-syntax 2>/dev/null)"
+export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 export OMARCHY_PATH=$HOME/.local/share/omarchy
 (setsid env DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS \
   QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \

@@ -110,7 +110,11 @@ timeout 10 hyprctl keyword cursor:no_hardware_cursors true >/dev/null 2>&1
 # a container guest does not run. Spawn it directly. (Under the lua config
 # `hyprctl dispatch exec` parses its argument as lua — spawn clients as plain
 # processes instead.)
-export $(dbus-launch 2>/dev/null)
+# dbus-launch plain output single-quotes the address; export $(...) keeps
+# the quotes in the variable and every D-Bus client then fails to parse
+# it. --sh-syntax emits eval-able assignments instead.
+eval "$(dbus-launch --sh-syntax 2>/dev/null)"
+export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 export OMARCHY_PATH=$HOME/.local/share/omarchy
 (setsid env DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS \
   QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
