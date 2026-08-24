@@ -967,6 +967,7 @@ fn write_pod_bundle(
     crate::rosetta::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, &pod.rootfs);
+    crate::vulkan::inject_into_container(&mut spec, &pod.rootfs);
 
     // Graft the container's securityContext from the host OCI spec so the
     // container runs with exactly what Kubernetes requested. OciSpec models

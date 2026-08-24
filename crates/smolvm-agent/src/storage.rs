@@ -3226,6 +3226,7 @@ pub fn run_command(
             crate::publish_socket::inject_into_container(&mut spec);
             crate::forkpoint::inject_into_container(&mut spec);
             crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
+            crate::vulkan::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
             spec
         };
 
@@ -3350,6 +3351,7 @@ pub fn spawn_in_overlay(
     crate::publish_socket::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
+    crate::vulkan::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
     spec.add_gpu_devices_if_available();
 
     spec.write_to(&bundle_path)
