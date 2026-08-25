@@ -105,37 +105,6 @@ fn is_missing_launch_metadata(message: &str) -> bool {
     message.contains("defines no entrypoint or cmd")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // A plain machine's overlay is keyed by its own name; a fork clone's by
-    // its golden's name, so clone execs land in the CoW-inherited overlay
-    // (and its still-live restored mount) instead of a fresh empty one.
-    #[test]
-    fn overlay_owner_aliases_fork_clones_to_their_golden() {
-        assert_eq!(persistent_overlay_owner("m1", None), "m1");
-        assert_eq!(
-            persistent_overlay_owner("clone-a", Some("golden-a")),
-            "golden-a"
-        );
-    }
-
-    // Only the agent's metadata-less-image failure downgrades a machine start
-    // to a bare-agent boot; every other launch failure must stay fatal.
-    #[test]
-    fn only_the_missing_metadata_error_is_downgraded() {
-        assert!(is_missing_launch_metadata(
-            "agent operation failed: run container detached: no command given \
-             and image 'local-dir:/images/ubuntu' defines no entrypoint or cmd"
-        ));
-        assert!(!is_missing_launch_metadata("image not found: whatever"));
-        assert!(!is_missing_launch_metadata(
-            "run container detached: crun exited with status 1"
-        ));
-    }
-}
-
 /// Progress heartbeat for a long workload launch.
 ///
 /// A pack machine's first start unpacks the whole flattened image before the
@@ -205,5 +174,36 @@ impl Drop for WaitTicker {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A plain machine's overlay is keyed by its own name; a fork clone's by
+    // its golden's name, so clone execs land in the CoW-inherited overlay
+    // (and its still-live restored mount) instead of a fresh empty one.
+    #[test]
+    fn overlay_owner_aliases_fork_clones_to_their_golden() {
+        assert_eq!(persistent_overlay_owner("m1", None), "m1");
+        assert_eq!(
+            persistent_overlay_owner("clone-a", Some("golden-a")),
+            "golden-a"
+        );
+    }
+
+    // Only the agent's metadata-less-image failure downgrades a machine start
+    // to a bare-agent boot; every other launch failure must stay fatal.
+    #[test]
+    fn only_the_missing_metadata_error_is_downgraded() {
+        assert!(is_missing_launch_metadata(
+            "agent operation failed: run container detached: no command given \
+             and image 'local-dir:/images/ubuntu' defines no entrypoint or cmd"
+        ));
+        assert!(!is_missing_launch_metadata("image not found: whatever"));
+        assert!(!is_missing_launch_metadata(
+            "run container detached: crun exited with status 1"
+        ));
     }
 }
