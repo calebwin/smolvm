@@ -109,7 +109,21 @@ const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 /// Archive flattening may take arbitrarily long, but the agent streams progress
 /// while work is advancing. Each progress response starts a fresh socket read,
 /// so this remains an inactivity timeout rather than a total operation limit.
-const DETACHED_START_TIMEOUT_SECS: u64 = 120;
+const DETACHED_START_TIMEOUT_SECS: u64 = 600;
+
+/// Resolve the detached-start read window, honoring `SMOLVM_START_TIMEOUT_SECS`
+/// (seconds, must be > 0). A pack-backed machine's FIRST boot unpacks the whole
+/// flattened layer into guest storage before the workload can start, which on a
+/// loaded disk takes minutes — a window sized for warm boots kills every cold
+/// one.
+fn detached_start_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_START_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DETACHED_START_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 // (Removed INTERACTIVE_TIMEOUT_SECS — no-user-timeout execs now disable
 // the socket read timeout entirely, matching interactive_session behavior.)
@@ -1778,8 +1792,7 @@ impl AgentClient {
         // Container startup involves overlay setup, a one-time flatten of a local
         // image archive into guest storage, and crun init, which can far exceed
         // the default 30s read timeout on first run (cold overlay, cold image).
-        let _timeout_guard =
-            self.set_extended_read_timeout(Duration::from_secs(DETACHED_START_TIMEOUT_SECS))?;
+        let _timeout_guard = self.set_extended_read_timeout(detached_start_timeout())?;
 
         self.send(&AgentRequest::Run {
             image: config.image,
