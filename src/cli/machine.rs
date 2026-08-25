@@ -563,6 +563,12 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
 
+    /// Let the guest reach services on the HOST's own loopback (127.0.0.1 / ::1);
+    /// off by default so a sandbox can't reach host debuggers, Docker, or local
+    /// databases. Cloud-metadata stays blocked. Implies --net.
+    #[arg(long = "allow-host-loopback", help_heading = "Network")]
+    pub allow_host_loopback: bool,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu)
     #[arg(long, help_heading = "Resources")]
     pub gpu: bool,
@@ -1112,11 +1118,20 @@ impl RunCmd {
             }
         }
 
+        // `--allow-host-loopback` relaxes only the host-loopback part of the egress
+        // floor via libkrun's `SMOLVM_ALLOW_HOST_LOOPBACK` env (read once at launch),
+        // rather than adding loopback to the allow-list — an allow-list would make
+        // egress restrictive and force the guest onto virtio-net, where a guest's
+        // 127.0.0.1 never reaches the host. Setting the env keeps the default TSI
+        // datapath and leaves cloud-metadata blocked.
+        if self.allow_host_loopback {
+            std::env::set_var("SMOLVM_ALLOW_HOST_LOOPBACK", "1");
+        }
         let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
-            self.net,
+            self.net || self.allow_host_loopback,
         )?;
 
         let params = crate::cli::smolfile::build_create_params(
