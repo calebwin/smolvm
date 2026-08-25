@@ -74,6 +74,8 @@ pub fn launch_image_workload(
     // Remote volumes are mounted by the agent itself, natively, between the
     // container's create and start — so the workload sees its data from its
     // first instruction and its command is never rewritten.
+    let _ticker =
+        WaitTicker::start("preparing the workload (a first start unpacks the machine image)");
     match client.run_container_detached(
         RunConfig::new(image, command)
             .with_workdir(record.workdir.clone())
@@ -131,5 +133,77 @@ mod tests {
         assert!(!is_missing_launch_metadata(
             "run container detached: crun exited with status 1"
         ));
+    }
+}
+
+/// Progress heartbeat for a long workload launch.
+///
+/// A pack machine's first start unpacks the whole flattened image before the
+/// workload can run — minutes of silence that read as a hang. After a short
+/// grace period this prints an elapsed-time line to stderr: rewritten in
+/// place on a terminal, one line every 30 s when piped. Dropping the guard
+/// stops the ticker and clears the line.
+struct WaitTicker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WaitTicker {
+    fn start(what: &'static str) -> Self {
+        use std::io::{IsTerminal, Write};
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let tty = std::io::stderr().is_terminal();
+            let grace = std::time::Duration::from_secs(3);
+            let step = if tty {
+                std::time::Duration::from_secs(1)
+            } else {
+                std::time::Duration::from_secs(30)
+            };
+            let mut printed = false;
+            while !stop_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if started.elapsed() < grace {
+                    continue;
+                }
+                let due = match printed {
+                    false => true,
+                    true => started.elapsed().as_millis() % step.as_millis() < 250,
+                };
+                if !due {
+                    continue;
+                }
+                let secs = started.elapsed().as_secs();
+                let mut err = std::io::stderr();
+                if tty {
+                    let _ = write!(err, "\r  {what}... {secs}s");
+                } else {
+                    let _ = writeln!(err, "  {what}... {secs}s");
+                }
+                let _ = err.flush();
+                printed = true;
+            }
+            if printed && tty {
+                let mut err = std::io::stderr();
+                let _ = write!(err, "\r{}\r", " ".repeat(what.len() + 16));
+                let _ = err.flush();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for WaitTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
