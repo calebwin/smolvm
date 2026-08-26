@@ -292,6 +292,7 @@ pub(crate) fn fork_vm_with_options(
     share_weights: bool,
     watch_parent: Option<bool>,
 ) -> Result<VmHandle> {
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     // Freeze + snapshot the source, then register the clone and its CoW disks.
     let prep = crate::agent::fork::prepare_fork(
         db,
@@ -400,6 +401,7 @@ pub fn fork_vm_batch(
     clones: &[(String, Vec<(u16, u16)>)],
     parallel: usize,
 ) -> Result<Vec<(String, VmHandle)>> {
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     if clones.is_empty() {
         return Err(Error::config(
             "fork batch",
@@ -562,6 +564,12 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
 
 /// Remove a VM record and its storage directory.
 pub fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+    let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+    delete_vm_locked(db, name)
+}
+
+/// Delete with the caller already holding this machine's fork-source lock.
+pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
     let dependents = db.dependent_clones(name)?;
     if !dependents.is_empty() {
         return Err(Error::agent(

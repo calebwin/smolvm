@@ -518,7 +518,7 @@ impl RunConfig {
         // needs the machine's credentials, which live on the record.
         let env = if env.is_empty() { &record.env } else { env };
         self.s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, env);
-        self.persistent_overlay_id = Some(crate::workload::persistent_overlay_owner(
+        self.persistent_overlay_id = Some(crate::workload::persistent_overlay_owner_with_lineage(
             machine_name,
             record.golden.as_deref(),
             record.fork_overlay_owner.as_deref(),

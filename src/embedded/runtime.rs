@@ -323,6 +323,7 @@ impl EmbeddedRuntime {
     /// Stop best-effort, remove from the registry and DB, and delete storage.
     pub fn delete_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            let _source_lock = crate::agent::fork::lock_fork_source(name)?;
             let Some(record) = self.db.get_vm(name)? else {
                 self.remove_name_lock(name)?;
                 return Ok(());
@@ -361,7 +362,7 @@ impl EmbeddedRuntime {
             // Idempotent: deleting an already-deleted machine is a no-op success
             // (the desired end state — gone — already holds). Lets SDK callers
             // call delete() more than once without an error.
-            match control::delete_vm(&self.db, name) {
+            match control::delete_vm_locked(&self.db, name) {
                 Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
                 Err(e) => return Err(e),
             }
@@ -528,7 +529,7 @@ impl EmbeddedRuntime {
     /// overlay so their writes survive — matching non-streaming exec.
     fn image_and_overlay_owner(&self, name: &str) -> Result<(Option<String>, String)> {
         let record = control::get_record(&self.db, name)?;
-        let overlay_owner = crate::workload::persistent_overlay_owner(
+        let overlay_owner = crate::workload::persistent_overlay_owner_with_lineage(
             name,
             record.golden.as_deref(),
             record.fork_overlay_owner.as_deref(),

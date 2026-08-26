@@ -15,12 +15,94 @@ use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
 /// compacted into a new root rather than accumulating unbounded lookup cost.
 const MAX_FORK_LINEAGE_DEPTH: usize = 32;
+
+/// Cross-process guard for one source machine's complete fork transaction.
+///
+/// The in-process API/SDK lifecycle locks cannot serialize a separate CLI
+/// process. Without this guard, two first forks can both wait in the guest;
+/// after one freezes it, the other remains blocked in the now-paused VM. The
+/// lock spans readiness, checkpointing, clone boot, and any rollback.
+pub struct ForkSourceLock {
+    _file: File,
+}
+
+impl ForkSourceLock {
+    fn acquire_at(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        lock_file_exclusive(&file)
+            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Serialize a complete fork operation for `source` across CLI, SDK, and serve
+/// processes. The sibling lock file intentionally lives outside the machine's
+/// removable data directory, so a concurrent delete cannot replace its inode.
+pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
+    validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
+    ForkSourceLock::acquire_at(&fork_source_lock_path(source))
+}
+
+fn fork_source_lock_path(source: &str) -> PathBuf {
+    let data_dir = vm_data_dir(source);
+    data_dir
+        .parent()
+        .expect("a VM data directory always has a parent")
+        .join(format!(".{source}.fork-operation.lock"))
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
@@ -317,10 +399,6 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
-    /// Whether a caller must resume the golden if clone boot/finalization fails.
-    /// False for pool refill from an already-paused golden: resuming that base
-    /// would invalidate every existing clone and retained CUDA snapshot.
-    pub resume_golden_on_rollback: bool,
 }
 
 /// A checkpoint that may be reused while the exact same golden process remains
@@ -343,8 +421,6 @@ pub(crate) struct PreparedForkBatch {
     /// Checkpoint bound to the current golden process, when its identity is
     /// strong enough to reuse safely.
     pub(crate) retained_snapshot: Option<RetainedForkSnapshot>,
-    /// Whether this call reused `retained_snapshot` instead of checkpointing.
-    pub(crate) snapshot_reused: bool,
 }
 
 /// Parameters for one clone in a single-snapshot fork operation.
@@ -669,32 +745,28 @@ pub(crate) fn prepare_forks_reusing(
             spec,
             &mut reserved_ports,
         ) {
-            Ok(mut clone) => {
-                clone.resume_golden_on_rollback = !golden_was_paused;
-                prepared.push(clone);
-            }
+            Ok(clone) => prepared.push(clone),
             Err(error) => {
                 for clone in &prepared {
                     let _ = db.remove_vm(&clone.clone_record.name);
                     let _ = std::fs::remove_dir_all(vm_data_dir(&clone.clone_record.name));
                 }
-                if snapshot_reused || golden_was_paused {
-                    return Err(error);
-                }
-                return Err(rollback_new_snapshot(
-                    db,
-                    golden,
-                    &snapshot_dir,
-                    persist_snapshot,
-                    error,
-                ));
+                return Err(if snapshot_reused || golden_was_paused {
+                    error
+                } else {
+                    Error::agent(
+                        "fork",
+                        format!(
+                            "{error}; source '{golden}' remains frozen at its retained checkpoint so the fork can be retried safely"
+                        ),
+                    )
+                });
             }
         }
     }
     Ok(PreparedForkBatch {
         forks: prepared,
         retained_snapshot,
-        snapshot_reused,
     })
 }
 
@@ -904,7 +976,6 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
-            resume_golden_on_rollback: true,
         })
     })();
 
@@ -1028,7 +1099,7 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
     // restored. A bare VM (no image) keeps the plain VM-rootfs paths.
     let (root, require_root, runtime_hostname, restored_container) = match record.image {
         Some(_) => {
-            let owner = crate::workload::persistent_overlay_owner(
+            let owner = crate::workload::persistent_overlay_owner_with_lineage(
                 clone,
                 record.golden.as_deref(),
                 record.fork_overlay_owner.as_deref(),
@@ -1349,7 +1420,7 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
     // Overlay owner is a validated machine name (alphanumeric + dashes), so
     // splicing it into the script is injection-safe — same contract as the
     // rejuvenation script's clone name.
-    let owner = crate::workload::persistent_overlay_owner(
+    let owner = crate::workload::persistent_overlay_owner_with_lineage(
         clone,
         record.golden.as_deref(),
         record.fork_overlay_owner.as_deref(),
@@ -1408,7 +1479,7 @@ pub fn activate_held_fork(
     validate_fork_env(assignment)?;
     let merged = merge_fork_env(&record.fork_env, assignment);
     let content = render_fork_env(&merged);
-    let owner = crate::workload::persistent_overlay_owner(
+    let owner = crate::workload::persistent_overlay_owner_with_lineage(
         clone,
         record.golden.as_deref(),
         record.fork_overlay_owner.as_deref(),
@@ -1718,6 +1789,41 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    #[cfg(unix)]
+    fn fork_source_lock_serializes_independent_open_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.lock");
+        let first = ForkSourceLock::acquire_at(&path).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter_path = path.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = ForkSourceLock::acquire_at(&waiter_path).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a second fork transaction must wait for the first"
+        );
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn dotted_machine_names_have_distinct_fork_locks() {
+        assert_ne!(
+            fork_source_lock_path("worker.one"),
+            fork_source_lock_path("worker.two")
+        );
+    }
 
     // Per-fork parameters double as env var names and dotenv file lines, so
     // keys must be valid identifiers and values single-line — anything else

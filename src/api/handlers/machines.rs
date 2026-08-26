@@ -1249,7 +1249,7 @@ pub async fn start_machine(
                 .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                 .collect::<Vec<_>>()
         };
-        let overlay_id = crate::workload::persistent_overlay_owner(
+        let overlay_id = crate::workload::persistent_overlay_owner_with_lineage(
             &name,
             record.golden.as_deref(),
             record.fork_overlay_owner.as_deref(),
@@ -1384,6 +1384,15 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
     }
 }
 
+async fn acquire_fork_source_lock(
+    source: String,
+) -> Result<crate::agent::fork::ForkSourceLock, ApiError> {
+    tokio::task::spawn_blocking(move || crate::agent::fork::lock_fork_source(&source))
+        .await
+        .map_err(|error| ApiError::internal(format!("fork lock task failed: {error}")))?
+        .map_err(classify_fork_error)
+}
+
 /// Fork a running, forkable golden machine into a new clone (copy-on-write
 /// memory + disks).
 #[utoipa::path(
@@ -1471,6 +1480,7 @@ pub(crate) async fn fork_machine_inner(
     // observe the golden between failed-clone teardown and rollback.
     let golden_lifecycle = state.lifecycle_lock(&golden);
     let _golden_guard = golden_lifecycle.lock().await;
+    let _source_lock = acquire_fork_source_lock(golden.clone()).await?;
 
     // Reject an already-registered target before taking its lifecycle lock.
     // Besides avoiding a pointless forkpoint wait, this prevents two invalid
@@ -1531,9 +1541,7 @@ pub(crate) async fn fork_machine_inner(
         .map_err(classify_fork_error)?
     };
 
-    let snapshot_dir = prep.snapshot_dir.clone();
-    let resume_golden_on_rollback = prep.resume_golden_on_rollback;
-    let result = boot_prepared_fork_inner(
+    boot_prepared_fork_inner(
         state.clone(),
         clone,
         prep,
@@ -1546,40 +1554,7 @@ pub(crate) async fn fork_machine_inner(
             boot_permit: None,
         },
     )
-    .await;
-
-    let Err(ApiError::CloneIdentityRejuvenationFailed(message)) = result else {
-        return result;
-    };
-    if !resume_golden_on_rollback {
-        return Err(ApiError::CloneIdentityRejuvenationFailed(message));
-    }
-
-    // `fail_closed_on_rejuvenation` has torn down the only clone prepared from
-    // this new checkpoint. It is therefore safe to restore the initially-running
-    // golden and invalidate the checkpoint before releasing its lifecycle lock.
-    let db = state.db().clone();
-    let golden_for_rollback = golden.clone();
-    let rollback = match tokio::task::spawn_blocking(move || {
-        crate::agent::fork::rollback_retained_fork_snapshot(
-            &db,
-            &golden_for_rollback,
-            &snapshot_dir,
-            true,
-        )
-    })
     .await
-    {
-        Ok(result) => result,
-        Err(error) => Err(SmolvmError::agent(
-            "fork rollback",
-            format!("task error: {error}"),
-        )),
-    };
-    match rollback {
-        Ok(()) => Err(ApiError::CloneIdentityRejuvenationFailed(message)),
-        Err(rollback_error) => Err(ApiError::Internal(format!("{message}; {rollback_error}"))),
-    }
 }
 
 /// Prepare several clean held workers from one golden checkpoint and boot them
@@ -1618,6 +1593,8 @@ pub(crate) async fn fork_held_machines_inner(
     if clones.is_empty() {
         return Ok(ForkBatchOutcome { retained_snapshot });
     }
+
+    let _source_lock = acquire_fork_source_lock(golden.clone()).await?;
 
     let golden_for_wait = golden.clone();
     tokio::task::spawn_blocking(move || {
@@ -1668,9 +1645,6 @@ pub(crate) async fn fork_held_machines_inner(
         .map_err(classify_fork_error)?
     };
 
-    let snapshot_dir = prepared.forks[0].snapshot_dir.clone();
-    let resume_golden_on_rollback = prepared.forks[0].resume_golden_on_rollback;
-    let snapshot_reused = prepared.snapshot_reused;
     let reusable_snapshot = prepared.retained_snapshot.clone();
     let pending_boots = prepared.forks.len();
     let boots = prepared.forks.into_iter().zip(clones).map(|(prep, clone)| {
@@ -1705,7 +1679,7 @@ pub(crate) async fn fork_held_machines_inner(
     // permit and wait for CUDA reconstruction without blocking the next VM.
     // The semaphore, not this result stream, preserves the qualified launch
     // width; completed results are still reported as soon as each is usable.
-    let any_succeeded = run_bounded_futures(boots, pending_boots, |result| {
+    run_bounded_futures(boots, pending_boots, |result| {
         let succeeded = result.1.is_ok();
         if succeeded {
             if let (Some(sender), Some(snapshot)) =
@@ -1721,50 +1695,14 @@ pub(crate) async fn fork_held_machines_inner(
     })
     .await;
 
-    // If every restore failed, no clone depends on this checkpoint and an
-    // initially-running golden can safely resume for a later retry. A partial
-    // success must retain the paused golden and shared snapshot.
-    let mut rollback_completed = true;
-    if !any_succeeded && !snapshot_reused {
-        if resume_golden_on_rollback {
-            if let Err(error) = crate::agent::fork::resume_golden(&golden, &snapshot_dir) {
-                tracing::warn!(%golden, %error, "failed to resume golden after batch restore failure");
-                rollback_completed = false;
-            }
-        }
-        if rollback_completed {
-            if let Err(error) = state.db().remove_retained_fork_snapshot(&golden) {
-                tracing::warn!(%golden, %error, "failed to remove rolled-back fork pool checkpoint");
-            }
-            if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
-                tracing::warn!(path = %snapshot_dir.display(), %error, "failed to remove unused batch fork snapshot");
-            }
-        }
-    }
-
     drop(guards);
     Ok(ForkBatchOutcome {
-        retained_snapshot: retained_snapshot_after_boots(
-            snapshot_reused,
-            any_succeeded,
-            rollback_completed,
-            reusable_snapshot,
-        ),
+        // A completed checkpoint remains the safe retry source even when every
+        // clone boot fails. In-place golden rollback has proven capable of
+        // resuming vCPUs while leaving virtio I/O wedged; keep the known-good
+        // frozen snapshot instead.
+        retained_snapshot: reusable_snapshot,
     })
-}
-
-fn retained_snapshot_after_boots(
-    snapshot_reused: bool,
-    any_succeeded: bool,
-    rollback_completed: bool,
-    reusable_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
-) -> Option<crate::agent::fork::RetainedForkSnapshot> {
-    // A failed boot does not invalidate a checkpoint that preparation just
-    // verified against the paused golden. Keep it so a transient KVM or guest
-    // readiness failure cannot strand that golden without a refill path.
-    (snapshot_reused || any_succeeded || !rollback_completed)
-        .then_some(reusable_snapshot)
-        .flatten()
 }
 
 async fn run_bounded_futures<F, T>(
@@ -2353,6 +2291,7 @@ pub(crate) async fn delete_one(
     // detach is a no-op.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Check if VM exists and get its state (off the reactor)
     let record = state
@@ -2926,49 +2865,6 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
-
-    fn retained_snapshot() -> crate::agent::fork::RetainedForkSnapshot {
-        crate::agent::fork::RetainedForkSnapshot {
-            path: std::path::PathBuf::from("/golden/s/12345678"),
-            golden_pid: 123,
-            golden_pid_start_time: 456,
-        }
-    }
-
-    #[test]
-    fn failed_reused_checkpoint_remains_available_for_retry() {
-        let snapshot = retained_snapshot();
-        assert_eq!(
-            retained_snapshot_after_boots(true, false, true, Some(snapshot.clone())),
-            Some(snapshot)
-        );
-    }
-
-    #[test]
-    fn failed_new_checkpoint_is_not_retained() {
-        assert_eq!(
-            retained_snapshot_after_boots(false, false, true, Some(retained_snapshot())),
-            None
-        );
-    }
-
-    #[test]
-    fn successful_new_checkpoint_is_retained() {
-        let snapshot = retained_snapshot();
-        assert_eq!(
-            retained_snapshot_after_boots(false, true, true, Some(snapshot.clone())),
-            Some(snapshot)
-        );
-    }
-
-    #[test]
-    fn failed_new_checkpoint_remains_available_when_rollback_fails() {
-        let snapshot = retained_snapshot();
-        assert_eq!(
-            retained_snapshot_after_boots(false, false, false, Some(snapshot.clone())),
-            Some(snapshot)
-        );
-    }
 
     #[tokio::test]
     async fn bounded_futures_stream_results_without_exceeding_the_limit() {

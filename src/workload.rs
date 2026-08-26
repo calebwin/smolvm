@@ -31,7 +31,14 @@ pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(Stri
 /// workload container running from it). Aliasing the lookup, instead of
 /// renaming the directory on disk, keeps that live mount valid while making
 /// the clone's execs land in the inherited state.
-pub fn persistent_overlay_owner(
+pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
+    persistent_overlay_owner_with_lineage(name, golden, None)
+}
+
+/// Resolve the persistent overlay owner for a machine whose immediate parent
+/// may itself be a fork. `fork_overlay_owner` keeps every generation pointed
+/// at the root overlay inherited by the live restored workload.
+pub fn persistent_overlay_owner_with_lineage(
     name: &str,
     golden: Option<&str>,
     fork_overlay_owner: Option<&str>,
@@ -45,8 +52,8 @@ pub fn persistent_overlay_owner(
 /// a host-side concern the caller owns. An empty entrypoint+cmd makes the
 /// agent resolve the image's own ENTRYPOINT+CMD, so service-style images
 /// start as their authors intended. The persistent overlay is keyed by
-/// [`persistent_overlay_owner`] (the machine name, or the golden's for a fork
-/// clone) so filesystem state survives restarts and forks.
+/// [`persistent_overlay_owner_with_lineage`] (the machine name, or the root
+/// golden's for a fork clone) so filesystem state survives restarts and forks.
 ///
 /// Returns `Ok(false)` (no launch) for machines without an image, and for
 /// image machines where neither the record nor the image supplies a command —
@@ -190,13 +197,13 @@ mod tests {
     // (and its still-live restored mount) instead of a fresh empty one.
     #[test]
     fn overlay_owner_aliases_fork_clones_to_their_golden() {
-        assert_eq!(persistent_overlay_owner("m1", None, None), "m1");
+        assert_eq!(persistent_overlay_owner("m1", None), "m1");
         assert_eq!(
-            persistent_overlay_owner("clone-a", Some("golden-a"), None),
+            persistent_overlay_owner("clone-a", Some("golden-a")),
             "golden-a"
         );
         assert_eq!(
-            persistent_overlay_owner("grandchild", Some("child"), Some("root")),
+            persistent_overlay_owner_with_lineage("grandchild", Some("child"), Some("root")),
             "root"
         );
     }
