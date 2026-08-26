@@ -582,6 +582,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
 
+    /// Persistent container-overlay owner inherited from the root of a fork
+    /// lineage. A clone's live overlay keeps its original on-disk name across
+    /// every generation; descendants must continue addressing that root name.
+    /// Older one-level clone records omit this and fall back to `golden`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_overlay_owner: Option<String>,
+
     /// Whether a fork clone is still parked at the inherited workload
     /// forkpoint. Held clones are clean, already-booted pool slots: a caller
     /// installs the job-specific fork parameters and releases each slot once.
@@ -702,6 +709,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
@@ -768,6 +776,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
             runtime_managed: false,
@@ -1465,6 +1474,7 @@ mod tests {
     fn held_fork_state_roundtrips_and_legacy_records_default_released() {
         let mut record = VmRecord::new("slot-0".to_string(), 2, 1024, vec![], vec![], false);
         record.golden = Some("golden".to_string());
+        record.fork_overlay_owner = Some("root".to_string());
         record.forkpoint_held = true;
         record.fork_env = vec![("SMOLVM_FORK_INDEX".to_string(), "0".to_string())];
 
@@ -1472,14 +1482,17 @@ mod tests {
         let decoded: VmRecord = serde_json::from_value(encoded.clone()).unwrap();
         assert!(decoded.forkpoint_held);
         assert_eq!(decoded.fork_env, record.fork_env);
+        assert_eq!(decoded.fork_overlay_owner.as_deref(), Some("root"));
 
         let mut legacy_value = encoded;
         let legacy_object = legacy_value.as_object_mut().unwrap();
         legacy_object.remove("forkpoint_held");
         legacy_object.remove("fork_env");
+        legacy_object.remove("fork_overlay_owner");
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert!(!legacy.forkpoint_held);
         assert!(legacy.fork_env.is_empty());
+        assert!(legacy.fork_overlay_owner.is_none());
     }
 
     #[test]

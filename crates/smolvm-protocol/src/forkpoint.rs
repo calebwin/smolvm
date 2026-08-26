@@ -9,6 +9,10 @@ pub const READY_PATH: &str = "/run/smolvm/forkpoint/ready";
 /// First line of every supported forkpoint readiness marker.
 pub const READY_VERSION: &str = "smolvm-forkpoint-v1";
 
+/// Prefix of the per-invocation token in a readiness marker. The token lets a
+/// releaser distinguish a new forkpoint from the previous helper's marker.
+pub const GENERATION_PREFIX: &str = "generation=";
+
 /// Optional readiness-marker capability requesting eager clone module loading.
 pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
 
@@ -27,6 +31,13 @@ pub const RESTORED_CONTAINER_PATH: &str = "/run/smolvm/forkpoint/restored-contai
 
 /// Marker written by the host after a clone is ready to resume.
 pub const RELEASE_PATH: &str = "/run/smolvm/forkpoint/release";
+
+/// Release token used before generation-addressed forkpoints. Accepting it in
+/// newer guests keeps independently-updated host and agent packages compatible.
+pub const LEGACY_RELEASE_TOKEN: &str = "smolvm-forkpoint-release-v1";
+
+/// Prefix of a generation-addressed release marker.
+pub const RELEASE_PREFIX: &str = "smolvm-forkpoint-release-v2:";
 
 /// Marker written after a released worker finishes clone-local preparation.
 pub const WORKER_READY_PATH: &str = "/run/smolvm/forkpoint/worker-ready";

@@ -1414,7 +1414,11 @@ async fn relaunch_image_workload(
             .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
             .collect::<Vec<_>>()
     };
-    let overlay_id = crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
+    let overlay_id = crate::workload::persistent_overlay_owner(
+        name,
+        record.golden.as_deref(),
+        record.fork_overlay_owner.as_deref(),
+    );
 
     let image_pull = image.clone();
     with_machine_client_traced(entry, None, move |c| {

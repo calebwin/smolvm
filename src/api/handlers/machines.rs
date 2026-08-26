@@ -1249,7 +1249,11 @@ pub async fn start_machine(
                 .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                 .collect::<Vec<_>>()
         };
-        let overlay_id = crate::workload::persistent_overlay_owner(&name, record.golden.as_deref());
+        let overlay_id = crate::workload::persistent_overlay_owner(
+            &name,
+            record.golden.as_deref(),
+            record.fork_overlay_owner.as_deref(),
+        );
         // Pull the image FIRST, as a FATAL step. A pull failure — the image /
         // tag doesn't exist, is private without access, or the machine has no
         // network to reach the registry — is a permanent, user-fixable
@@ -1356,12 +1360,12 @@ pub async fn start_machine(
 
 /// Classify a fork-preparation failure into the right HTTP status. The golden
 /// missing is a 404; the golden not being forkable / not yet ready, or the clone
-/// name already being taken, is a 409; a nested-fork request is a 400; anything
-/// else is a 500.
+/// name already being taken, is a 409; an unsupported descendant shape is a
+/// 400; anything else is a 500.
 fn classify_fork_error(e: SmolvmError) -> ApiError {
     let msg = e.to_string();
     let lc = msg.to_ascii_lowercase();
-    if lc.contains("nested fork") {
+    if lc.contains("cuda fork descendants") || lc.contains("fork lineage would exceed") {
         ApiError::BadRequest(msg)
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
@@ -1392,7 +1396,7 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
     request_body = ForkRequest,
     responses(
         (status = 200, description = "Clone forked and running", body = MachineInfo),
-        (status = 400, description = "Invalid request (e.g. nested fork)", body = ApiErrorResponse),
+        (status = 400, description = "Invalid or unsupported fork request", body = ApiErrorResponse),
         (status = 404, description = "Golden machine not found", body = ApiErrorResponse),
         (status = 409, description = "Golden not forkable, or clone name already exists", body = ApiErrorResponse),
         (status = 500, description = "Fork failed", body = ApiErrorResponse)
@@ -1415,6 +1419,7 @@ pub(crate) async fn fork_machine_inner(
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
+    let req_forkable = req.forkable;
     let req_hold = req.hold;
     let wait_ready = req.wait_ready || req_hold;
     let ready_timeout = std::time::Duration::from_secs(req.ready_timeout_secs.unwrap_or(240));
@@ -1426,6 +1431,12 @@ pub(crate) async fn fork_machine_inner(
     let fork_secrets = req.secrets.clone();
     crate::agent::fork::validate_fork_env(&fork_env)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if req_hold && req_forkable {
+        return Err(ApiError::BadRequest(
+            "hold and forkable cannot be combined; held pool slots are disposable leaves"
+                .to_string(),
+        ));
+    }
 
     if clone == golden {
         return Err(ApiError::Conflict(format!(
@@ -1505,7 +1516,12 @@ pub(crate) async fn fork_machine_inner(
                 )
             } else {
                 crate::agent::fork::prepare_fork(
-                    &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env,
+                    &db,
+                    &golden_b,
+                    &clone_b,
+                    &ports,
+                    req_forkable,
+                    &env,
                     &secrets,
                 )
             }
@@ -1832,6 +1848,7 @@ async fn boot_prepared_fork_inner(
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
+        features.forkable = record.forkable;
         features.snapshot_dir = Some(prep.snapshot_dir);
         features.cuda_share_weights = share_weights;
         features.cuda_preload_modules = record.cuda_preload_modules;
@@ -2301,18 +2318,18 @@ pub async fn delete_machine(
     Path(name): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
-    // Cascade: remove each dependent clone before the golden so its own delete
-    // (below) sees no dependents. Clones are leaves (launched non-forkable), so
-    // one level is exhaustive; the read is unlocked but delete_one re-checks
-    // under the golden's lifecycle lock, so a clone forked in the race still
-    // refuses rather than dangling.
+    // Cascade: remove the entire lineage deepest-first so every qcow2 overlay
+    // disappears before the image that backs it. The read is unlocked, but
+    // delete_one re-checks direct dependants under each lifecycle lock, so a
+    // concurrently-created child still refuses instead of dangling.
     if query.cascade {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(ApiError::database)?;
+        let clones =
+            tokio::task::spawn_blocking(move || db.dependent_descendants_postorder(&golden))
+                .await
+                .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+                .map_err(ApiError::database)?;
         for clone in clones {
             delete_one(state.clone(), clone).await?;
         }

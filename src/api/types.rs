@@ -897,6 +897,11 @@ pub struct ForkRequest {
     /// Name for the new clone machine.
     #[schema(example = "clone-1")]
     pub name: String,
+    /// Materialize the restored clone as a new checkpoint source so it can be
+    /// forked again. This pays one eager guest-memory copy at clone boot;
+    /// descendants remain copy-on-write.
+    #[serde(default)]
+    pub forkable: bool,
     /// Pin the clone's inbound port forwards. Without this, the golden's
     /// forwards are remapped to freshly-allocated host ports so the clone does
     /// not collide with the still-running golden or sibling clones.

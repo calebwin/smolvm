@@ -521,6 +521,7 @@ impl RunConfig {
         self.persistent_overlay_id = Some(crate::workload::persistent_overlay_owner(
             machine_name,
             record.golden.as_deref(),
+            record.fork_overlay_owner.as_deref(),
         ));
         self
     }

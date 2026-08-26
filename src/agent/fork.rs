@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
+/// compacted into a new root rather than accumulating unbounded lookup cost.
+const MAX_FORK_LINEAGE_DEPTH: usize = 32;
+
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
     vm_data_dir(name).join("control.sock")
@@ -139,13 +143,57 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
+/// Flush guest filesystems before checkpointing a restored clone again.
+///
+/// A first-generation clone may have just changed its persistent container
+/// overlay during identity rejuvenation. Capturing the next generation while
+/// those writes are still in the guest page cache can restore an overlayfs
+/// mount whose first lookup blocks indefinitely. `sync` is the guest-visible
+/// durability boundary: it completes before libkrun drains the block workers
+/// and freezes the vCPUs.
+fn sync_nested_fork_source(name: &str) -> Result<()> {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|error| Error::agent("sync fork source", error.to_string()))?;
+    match client.vm_exec(
+        vec!["/bin/sync".to_string()],
+        Vec::new(),
+        None,
+        Some(Duration::from_secs(30)),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "sync fork source",
+            format!(
+                "guest sync exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(error) => Err(Error::agent("sync fork source", error.to_string())),
+    }
+}
+
 /// Build the clone-local release and acknowledgement script.
 fn build_release_forkpoint_script() -> String {
     format!(
-        "set -e; mkdir -p '{dir}'; umask 077; printf '%s\\n' smolvm-forkpoint-release-v1 > '{release}.tmp'; mv '{release}.tmp' '{release}'; \
-         i=0; while [ -f '{ready}' ]; do i=$((i + 1)); [ \"$i\" -lt 500 ] || exit 46; sleep 0.02; done",
+        "set -e; mkdir -p '{dir}'; umask 077; \
+         if [ -f '{ready}' ]; then generation=$(sed -n 's/^{generation_prefix}//p' '{ready}' | head -n 1); else generation=''; fi; \
+         case \"$generation\" in ''|*[!0-9a-fA-F]*) generation='' ;; esac; \
+         if [ \"${{#generation}}\" -eq 32 ]; then \
+           printf '%s%s\\n' '{release_prefix}' \"$generation\" > '{release}.tmp'; \
+         else \
+           generation=''; printf '%s\\n' '{legacy_release}' > '{release}.tmp'; \
+         fi; \
+         mv '{release}.tmp' '{release}'; i=0; \
+         while if [ -n \"$generation\" ]; then grep -q -x \"{generation_prefix}$generation\" '{ready}' 2>/dev/null; else [ -f '{ready}' ]; fi; do \
+           i=$((i + 1)); [ \"$i\" -lt 500 ] || exit 46; sleep 0.02; \
+         done",
         dir = smolvm_protocol::forkpoint::STATE_DIR,
+        generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
+        legacy_release = smolvm_protocol::forkpoint::LEGACY_RELEASE_TOKEN,
         release = smolvm_protocol::forkpoint::RELEASE_PATH,
+        release_prefix = smolvm_protocol::forkpoint::RELEASE_PREFIX,
         ready = smolvm_protocol::forkpoint::READY_PATH,
     )
 }
@@ -418,10 +466,10 @@ pub(crate) fn prepare_forks_reusing(
                 format!("duplicate clone name '{}'", spec.clone),
             ));
         }
-        if spec.clone_forkable {
+        if spec.hold && spec.clone_forkable {
             return Err(Error::agent(
                 "fork",
-                "nested fork is not supported: a clone cannot be re-forked, so `forkable` on a fork has no effect (drop it)",
+                "a held pool slot cannot be forkable; release or replenish held slots instead",
             ));
         }
         if db.get_vm(spec.clone)?.is_some() {
@@ -443,6 +491,24 @@ pub(crate) fn prepare_forks_reusing(
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
+    let child_depth = db
+        .fork_lineage_depth(golden)?
+        .checked_add(1)
+        .ok_or_else(|| Error::agent("fork", "fork lineage depth overflow"))?;
+    if child_depth > MAX_FORK_LINEAGE_DEPTH {
+        return Err(Error::agent(
+            "fork",
+            format!(
+                "fork lineage would exceed {MAX_FORK_LINEAGE_DEPTH} generations; compact this state into a new root first"
+            ),
+        ));
+    }
+    if golden_rec.cuda && specs.iter().any(|spec| spec.clone_forkable) {
+        return Err(Error::agent(
+            "fork",
+            "CUDA fork descendants are not supported yet; create a leaf clone without `forkable`",
+        ));
+    }
     let ctl = control_socket_path(golden);
     if !ctl.exists() {
         return Err(Error::agent(
@@ -516,6 +582,13 @@ pub(crate) fn prepare_forks_reusing(
                 result.map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;
             crate::process::chown_tree(&snapshot_dir, uid, gid)
                 .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
+        }
+
+        if golden_rec.golden.is_some() {
+            if let Err(error) = sync_nested_fork_source(golden) {
+                let _ = std::fs::remove_dir_all(&snapshot_dir);
+                return Err(error);
+            }
         }
 
         let t_snap = std::time::Instant::now();
@@ -803,9 +876,18 @@ fn prepare_clone_from_snapshot(
             }
             clone_rec.ports = remapped;
         }
+        clone_rec.fork_overlay_owner = Some(
+            golden_rec
+                .fork_overlay_owner
+                .as_deref()
+                .or(golden_rec.golden.as_deref())
+                .unwrap_or(golden)
+                .to_string(),
+        );
         clone_rec.golden = Some(golden.to_string());
-        // Clones are leaf machines. Do not inherit a Smolfile-declared
-        // forkable launch default from the golden on later cold starts.
+        // Forkability is explicit per clone. A normal clone remains a cheap
+        // leaf; a forkable clone materializes its restored RAM into fresh
+        // backing files at boot so it can later checkpoint its own state.
         clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();
@@ -946,7 +1028,11 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
     // restored. A bare VM (no image) keeps the plain VM-rootfs paths.
     let (root, require_root, runtime_hostname, restored_container) = match record.image {
         Some(_) => {
-            let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+            let owner = crate::workload::persistent_overlay_owner(
+                clone,
+                record.golden.as_deref(),
+                record.fork_overlay_owner.as_deref(),
+            );
             let merged = format!("/storage/overlays/persistent-{owner}/merged");
             let container_id = format!("/storage/overlays/persistent-{owner}/main_container_id");
             let require = format!(
@@ -1049,10 +1135,13 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
     };
     format!(
         "set -e; \
+         echo 'rejuvenate-stage=overlay' >&2; \
          {require_root}\
+         echo 'rejuvenate-stage=hostname' >&2; \
          hostname '{c}' 2>/dev/null || true; \
          {runtime_hostname}\
          {restored_container}\
+         echo 'rejuvenate-stage=identity' >&2; \
          printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
          MID=$(printf '%.32s' '{s}'); \
          printf '%s\\n' '{c}' > {root}/etc/hostname; \
@@ -1137,7 +1226,15 @@ fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String>
     let mut client =
         AgentClient::connect_with_retry(sock).map_err(|e| format!("agent connect: {e}"))?;
     match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script.to_string()],
+        vec![
+            "/usr/bin/timeout".into(),
+            "-k".into(),
+            "1".into(),
+            "7".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            script.to_string(),
+        ],
         vec![],
         None,
         Some(std::time::Duration::from_secs(10)),
@@ -1252,7 +1349,11 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
     // Overlay owner is a validated machine name (alphanumeric + dashes), so
     // splicing it into the script is injection-safe — same contract as the
     // rejuvenation script's clone name.
-    let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+    let owner = crate::workload::persistent_overlay_owner(
+        clone,
+        record.golden.as_deref(),
+        record.fork_overlay_owner.as_deref(),
+    );
     let merged = format!("/storage/overlays/persistent-{owner}/merged");
     // Image machines MUST land the file in the workload container's rootfs
     // (the overlay merged dir): falling through silently would strand it in
@@ -1307,7 +1408,11 @@ pub fn activate_held_fork(
     validate_fork_env(assignment)?;
     let merged = merge_fork_env(&record.fork_env, assignment);
     let content = render_fork_env(&merged);
-    let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+    let owner = crate::workload::persistent_overlay_owner(
+        clone,
+        record.golden.as_deref(),
+        record.fork_overlay_owner.as_deref(),
+    );
     let merged_root = format!("/storage/overlays/persistent-{owner}/merged");
     let env_path = if record.image.is_some() {
         format!("{merged_root}{FORK_ENV_GUEST_PATH}")
@@ -1527,6 +1632,8 @@ fn build_activation_script(
            exit 42; \
          fi; \
          if [ ! -f '{ready}' ]; then exit 43; fi; \
+         generation=$(sed -n 's/^{generation_prefix}//p' '{ready}' | head -n 1); \
+         case \"$generation\" in ''|*[!0-9a-fA-F]*) generation='' ;; esac; \
          rm -f '{worker_ready}'; \
          receipt_tmp='{receipt}.{activation_token}.'$$; \
          printf '%s\\n' '{activation_token}' > \"$receipt_tmp\"; \
@@ -1539,8 +1646,13 @@ fn build_activation_script(
          release_tmp='{release}.{activation_token}.'$$; \
          trap 'rm -f \"$env_tmp\" \"$release_tmp\"' EXIT; \
          cat > \"$env_tmp\"; mv \"$env_tmp\" '{env_path}'; \
-         printf '%s\\n' smolvm-forkpoint-release-v1 > \"$release_tmp\"; \
-         mv \"$release_tmp\" '{release}'"
+         if [ \"${{#generation}}\" -eq 32 ]; then \
+           printf '%s%s\\n' '{release_prefix}' \"$generation\" > \"$release_tmp\"; \
+         else printf '%s\\n' '{legacy_release}' > \"$release_tmp\"; fi; \
+         mv \"$release_tmp\" '{release}'",
+        generation_prefix = smolvm_protocol::forkpoint::GENERATION_PREFIX,
+        legacy_release = smolvm_protocol::forkpoint::LEGACY_RELEASE_TOKEN,
+        release_prefix = smolvm_protocol::forkpoint::RELEASE_PREFIX,
     )
 }
 
@@ -1829,7 +1941,16 @@ mod tests {
         let state = temp.path().join("state");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(state.join("ready"), b"ready\n").unwrap();
+        let generation = "0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            state.join("ready"),
+            format!(
+                "{}\n{}{generation}\n",
+                smolvm_protocol::forkpoint::READY_VERSION,
+                smolvm_protocol::forkpoint::GENERATION_PREFIX
+            ),
+        )
+        .unwrap();
         let ready = state.join("ready");
         let release = state.join("release");
         let worker_ready = state.join("worker-ready");
@@ -1867,7 +1988,13 @@ mod tests {
             std::fs::read_to_string(&receipt).unwrap(),
             format!("{token}\n")
         );
-        assert!(release.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&release).unwrap(),
+            format!(
+                "{}{generation}\n",
+                smolvm_protocol::forkpoint::RELEASE_PREFIX
+            )
+        );
         assert!(!worker_ready.exists());
 
         // A lost reply may cause the host to send the same activation again.

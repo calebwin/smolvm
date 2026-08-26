@@ -31,8 +31,12 @@ pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(Stri
 /// workload container running from it). Aliasing the lookup, instead of
 /// renaming the directory on disk, keeps that live mount valid while making
 /// the clone's execs land in the inherited state.
-pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
-    golden.unwrap_or(name).to_string()
+pub fn persistent_overlay_owner(
+    name: &str,
+    golden: Option<&str>,
+    fork_overlay_owner: Option<&str>,
+) -> String {
+    fork_overlay_owner.or(golden).unwrap_or(name).to_string()
 }
 
 /// Launch an image machine's workload container in the background.
@@ -186,10 +190,14 @@ mod tests {
     // (and its still-live restored mount) instead of a fresh empty one.
     #[test]
     fn overlay_owner_aliases_fork_clones_to_their_golden() {
-        assert_eq!(persistent_overlay_owner("m1", None), "m1");
+        assert_eq!(persistent_overlay_owner("m1", None, None), "m1");
         assert_eq!(
-            persistent_overlay_owner("clone-a", Some("golden-a")),
+            persistent_overlay_owner("clone-a", Some("golden-a"), None),
             "golden-a"
+        );
+        assert_eq!(
+            persistent_overlay_owner("grandchild", Some("child"), Some("root")),
+            "root"
         );
     }
 

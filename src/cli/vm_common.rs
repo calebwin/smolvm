@@ -1121,6 +1121,7 @@ fn boot_prepared_fork(
     retry_gate: Option<&std::sync::Mutex<()>>,
 ) -> smolvm::Result<()> {
     let preload_modules = prep.clone_record.cuda_preload_modules;
+    let clone_forkable = prep.clone_record.forkable;
     eprintln!("Booting clone '{clone}' from snapshot...");
     let mut start = || {
         start_vm_named_with_db(
@@ -1130,6 +1131,7 @@ fn boot_prepared_fork(
             None,
             true,
             ForkLaunch {
+                forkable: clone_forkable,
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
@@ -2223,17 +2225,16 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // A golden's disks are the copy-on-write backing for its clones' overlays,
     // so it must outlive them. Refuse to delete a golden while clones depend on
     // it (unless forced, in which case the clones' overlays are left dangling).
-    let dependent_clones = SmolvmDb::open()?.dependent_clones(name)?;
+    let db = SmolvmDb::open()?;
+    let dependent_clones = db.dependent_clones(name)?;
     if !dependent_clones.is_empty() {
         if options.cascade {
-            // Children before the fork base: delete each dependent clone first,
-            // then fall through to remove the golden. A clone is never itself a
-            // fork base (clones launch non-forkable), so one level of recursion
-            // is exhaustive — no name-guessing, no stale overlays left dangling.
-            for clone in &dependent_clones {
+            // Delete the full lineage deepest-first. Every qcow2 overlay must
+            // disappear before the parent image that backs it.
+            for clone in db.dependent_descendants_postorder(name)? {
                 println!("Deleting dependent clone '{clone}' (cascade)...");
                 delete_vm(
-                    clone,
+                    &clone,
                     true, // no per-clone confirmation during a cascade
                     DeleteVmOptions {
                         stop_if_running: true,

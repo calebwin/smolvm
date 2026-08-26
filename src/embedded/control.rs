@@ -279,7 +279,7 @@ pub fn fork_vm(
     clone: &str,
     pinned_ports: &[(u16, u16)],
 ) -> Result<VmHandle> {
-    fork_vm_with_options(db, golden, clone, pinned_ports, false, None)
+    fork_vm_with_options(db, golden, clone, pinned_ports, false, false, None)
 }
 
 /// Fork a machine with launch options needed by non-embedded front-ends.
@@ -288,17 +288,17 @@ pub(crate) fn fork_vm_with_options(
     golden: &str,
     clone: &str,
     pinned_ports: &[(u16, u16)],
+    clone_forkable: bool,
     share_weights: bool,
     watch_parent: Option<bool>,
 ) -> Result<VmHandle> {
-    // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
-    // `clone_forkable = false`: a clone can't itself be re-forked (nested fork).
+    // Freeze + snapshot the source, then register the clone and its CoW disks.
     let prep = crate::agent::fork::prepare_fork(
         db,
         golden,
         clone,
         pinned_ports,
-        false,
+        clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
     )?;
@@ -316,6 +316,7 @@ fn boot_prepared_fork(
 ) -> Result<VmHandle> {
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
+        forkable: prep.clone_record.forkable,
         snapshot_dir: Some(prep.snapshot_dir.clone()),
         cuda_share_weights: share_weights,
         cuda_preload_modules: prep.clone_record.cuda_preload_modules,
@@ -561,6 +562,16 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
 
 /// Remove a VM record and its storage directory.
 pub fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+    let dependents = db.dependent_clones(name)?;
+    if !dependents.is_empty() {
+        return Err(Error::agent(
+            "delete machine",
+            format!(
+                "machine '{name}' has dependent fork(s) ({}); delete descendants first",
+                dependents.join(", ")
+            ),
+        ));
+    }
     let removed = db.remove_vm(name)?;
     if removed.is_none() {
         return Err(Error::vm_not_found(name));

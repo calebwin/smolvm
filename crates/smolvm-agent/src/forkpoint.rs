@@ -5,16 +5,16 @@
 //! the host freezes the golden. Restored clones are released independently by
 //! the host through a VM-private directory bind-mounted into the container.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::time::Duration;
 
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
-    CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, HELPER_PATH, READY_PATH, READY_VERSION, RELEASE_PATH,
-    RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH,
-    WORKER_READY_TOKEN_ENV,
+    CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN,
+    READY_PATH, READY_VERSION, RELEASE_PATH, RELEASE_PREFIX, RESTORED_CONTAINER_PATH,
+    RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
@@ -126,10 +126,11 @@ fn run_helper_at(
         .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
     let _ = std::fs::remove_file(release_path);
 
+    let generation = forkpoint_generation()?;
     let ready_temp = state_dir.join(format!(".ready.{}.tmp", std::process::id()));
     let mut ready = std::fs::File::create(&ready_temp)
         .map_err(|error| format!("create {}: {error}", ready_temp.display()))?;
-    let ready_content = ready_content(preload_modules);
+    let ready_content = ready_content(preload_modules, &generation);
     ready
         .write_all(ready_content.as_bytes())
         .map_err(|error| format!("write {}: {error}", ready_temp.display()))?;
@@ -153,16 +154,16 @@ fn run_helper_at(
     // release. A restored clone writes RESTORED_PATH during identity setup;
     // waits started after that point are native to the clone and safe to use.
     while !restored_path.is_file() {
-        if release_path.is_file() {
-            let _ = std::fs::remove_file(ready_path);
+        if release_matches(release_path, &generation) {
+            acknowledge_generation(ready_path, &generation);
             return Ok(());
         }
         std::thread::yield_now();
     }
 
     loop {
-        if release_path.is_file() {
-            let _ = std::fs::remove_file(ready_path);
+        if release_matches(release_path, &generation) {
+            acknowledge_generation(ready_path, &generation);
             return Ok(());
         }
         std::thread::sleep(poll_interval);
@@ -231,11 +232,37 @@ fn write_worker_ready_at(
     })
 }
 
-fn ready_content(preload_modules: bool) -> String {
+fn forkpoint_generation() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut bytes))
+        .map_err(|error| format!("generate forkpoint token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn ready_content(preload_modules: bool, generation: &str) -> String {
     if preload_modules {
-        format!("{READY_VERSION}\n{CUDA_PRELOAD_MODULES_HINT}\n")
+        format!("{READY_VERSION}\n{GENERATION_PREFIX}{generation}\n{CUDA_PRELOAD_MODULES_HINT}\n")
     } else {
-        format!("{READY_VERSION}\n")
+        format!("{READY_VERSION}\n{GENERATION_PREFIX}{generation}\n")
+    }
+}
+
+fn release_matches(release_path: &Path, generation: &str) -> bool {
+    std::fs::read_to_string(release_path).is_ok_and(|release| {
+        let release = release.trim();
+        release == format!("{RELEASE_PREFIX}{generation}") || release == LEGACY_RELEASE_TOKEN
+    })
+}
+
+fn acknowledge_generation(ready_path: &Path, generation: &str) {
+    let is_current = std::fs::read_to_string(ready_path).is_ok_and(|ready| {
+        ready
+            .lines()
+            .any(|line| line == format!("{GENERATION_PREFIX}{generation}"))
+    });
+    if is_current {
+        let _ = std::fs::remove_file(ready_path);
     }
 }
 
@@ -254,6 +281,15 @@ mod tests {
             "marker was not published: {}",
             path.display()
         );
+    }
+
+    fn marker_generation(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix(GENERATION_PREFIX))
+            .unwrap()
+            .to_string()
     }
 
     fn spec() -> OciSpec {
@@ -342,13 +378,14 @@ mod tests {
             )
         });
         wait_for_marker(&ready);
+        let generation = marker_generation(&ready);
         assert_eq!(
             std::fs::read_to_string(&ready).unwrap(),
-            ready_content(false)
+            ready_content(false, &generation)
         );
         assert!(!helper.is_finished());
         std::fs::write(&restored, b"restored\n").unwrap();
-        std::fs::write(&release, b"release\n").unwrap();
+        std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
     }
@@ -377,8 +414,9 @@ mod tests {
             )
         });
         wait_for_marker(&ready);
+        let generation = marker_generation(&ready);
         assert!(!restored.exists());
-        std::fs::write(&release, b"release\n").unwrap();
+        std::fs::write(&release, format!("{RELEASE_PREFIX}{generation}\n")).unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
     }
@@ -433,9 +471,24 @@ mod tests {
     #[test]
     fn helper_records_cuda_module_preload_hint() {
         assert_eq!(
-            ready_content(true),
-            "smolvm-forkpoint-v1\ncuda-preload-modules\n"
+            ready_content(true, "0123"),
+            "smolvm-forkpoint-v1\ngeneration=0123\ncuda-preload-modules\n"
         );
-        assert_eq!(ready_content(false), "smolvm-forkpoint-v1\n");
+        assert_eq!(
+            ready_content(false, "0123"),
+            "smolvm-forkpoint-v1\ngeneration=0123\n"
+        );
+    }
+
+    #[test]
+    fn release_requires_its_generation_or_the_legacy_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        std::fs::write(&release, format!("{RELEASE_PREFIX}old\n")).unwrap();
+        assert!(!release_matches(&release, "new"));
+        assert!(release_matches(&release, "old"));
+
+        std::fs::write(&release, format!("{LEGACY_RELEASE_TOKEN}\n")).unwrap();
+        assert!(release_matches(&release, "new"));
     }
 }
