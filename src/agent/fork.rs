@@ -225,15 +225,16 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
-/// Flush guest filesystems before checkpointing a restored clone again.
+/// Flush guest filesystems before capturing a new live checkpoint.
 ///
-/// A first-generation clone may have just changed its persistent container
-/// overlay during identity rejuvenation. Capturing the next generation while
-/// those writes are still in the guest page cache can restore an overlayfs
-/// mount whose first lookup blocks indefinitely. `sync` is the guest-visible
-/// durability boundary: it completes before libkrun drains the block workers
-/// and freezes the vCPUs.
-fn sync_nested_fork_source(name: &str) -> Result<()> {
+/// A branch sees dirty guest page-cache state through the RAM snapshot, but a
+/// later stop/restart of the source can only reopen its host disk images. If we
+/// freeze before `sync`, that restart silently loses writes that every live
+/// branch appeared to inherit. Restored children also need this boundary to
+/// avoid capturing an overlayfs mount whose first lookup can block. Complete
+/// the guest-visible durability boundary before libkrun drains block workers
+/// and freezes the vCPUs for every newly captured checkpoint.
+fn sync_fork_source(name: &str) -> Result<()> {
     let socket = vm_data_dir(name).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|error| Error::agent("sync fork source", error.to_string()))?;
@@ -660,11 +661,9 @@ pub(crate) fn prepare_forks_reusing(
                 .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
         }
 
-        if golden_rec.golden.is_some() {
-            if let Err(error) = sync_nested_fork_source(golden) {
-                let _ = std::fs::remove_dir_all(&snapshot_dir);
-                return Err(error);
-            }
+        if let Err(error) = sync_fork_source(golden) {
+            let _ = std::fs::remove_dir_all(&snapshot_dir);
+            return Err(error);
         }
 
         let t_snap = std::time::Instant::now();

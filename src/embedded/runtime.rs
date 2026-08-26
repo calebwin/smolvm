@@ -310,6 +310,17 @@ impl EmbeddedRuntime {
     /// Stop a machine and persist stopped state.
     pub fn stop_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let dependents = self.db.dependent_clones(name)?;
+            if !dependents.is_empty() {
+                return Err(Error::agent(
+                    "stop machine",
+                    format!(
+                        "machine '{name}' has dependent fork(s) ({}); delete descendants first",
+                        dependents.join(", ")
+                    ),
+                ));
+            }
             if let Some(handle) = self.remove_cached_handle(name)? {
                 lock_handle(&handle)?.stop()?;
                 control::mark_stopped(&self.db, name)?;
@@ -946,6 +957,23 @@ mod tests {
         assert!(error.to_string().contains("dependent fork"));
         assert!(db.get_vm("delete-parent").unwrap().is_some());
         assert!(db.get_vm("delete-child").unwrap().is_some());
+    }
+
+    #[test]
+    fn stop_machine_refuses_a_live_fork_parent_before_teardown() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        runtime
+            .create_machine(test_spec("stop-parent", true))
+            .unwrap();
+        let mut child = test_spec("stop-child", true).to_record();
+        child.golden = Some("stop-parent".to_string());
+        db.insert_vm("stop-child", &child).unwrap();
+
+        let error = runtime.stop_machine("stop-parent").unwrap_err();
+        assert!(error.to_string().contains("dependent fork"));
+        assert!(db.get_vm("stop-parent").unwrap().is_some());
+        assert!(db.get_vm("stop-child").unwrap().is_some());
     }
 
     #[test]
