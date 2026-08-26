@@ -19,7 +19,7 @@ use smolvm::config::{RecordState, SmolvmConfig};
 use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
-use smolvm_pack::format::{PackManifest, PackMode, PortableCheckpointManifest};
+use smolvm_pack::format::PackManifest;
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
@@ -89,209 +89,29 @@ pub struct CheckpointCmd {
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
-struct SavedVmPause {
-    control: PathBuf,
-    armed: bool,
-}
-
-impl SavedVmPause {
-    fn resume(&mut self) -> smolvm::Result<()> {
-        if !self.armed {
-            return Ok(());
-        }
-        let reply = smolvm::agent::fork::control_socket_cmd(&self.control, "RESUME")?;
-        if !reply.starts_with("OK") {
-            return Err(Error::agent(
-                "resume checkpoint source",
-                format!("libkrun returned: {reply}"),
-            ));
-        }
-        self.armed = false;
-        Ok(())
-    }
-}
-
-impl Drop for SavedVmPause {
-    fn drop(&mut self) {
-        if self.armed {
-            match smolvm::agent::fork::control_socket_cmd(&self.control, "RESUME") {
-                Ok(reply) if reply.starts_with("OK") => {}
-                Ok(reply) => warn!(%reply, "failed to resume checkpoint source"),
-                Err(error) => warn!(%error, "failed to resume checkpoint source"),
-            }
-        }
-    }
-}
-
 impl CheckpointCmd {
     /// Capture and package a live machine at one RAM/disk consistency boundary.
     pub fn run(self) -> smolvm::Result<()> {
-        let checkpoint_started = std::time::Instant::now();
-        if self
-            .output
-            .extension()
-            .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
-        {
-            return Err(Error::config(
-                "checkpoint machine",
-                "--output must end in .smolcheckpoint",
-            ));
-        }
-        if self.output.exists() {
-            return Err(Error::config(
-                "checkpoint machine",
-                format!("refusing to overwrite {}", self.output.display()),
-            ));
-        }
-
-        let config = SmolvmConfig::load()?;
-        let vm = config
-            .vms
-            .get(&self.name)
-            .ok_or_else(|| Error::vm_not_found(&self.name))?;
-        if smolvm::agent::state_probe::resolve_state(&self.name, vm) != RecordState::Running {
-            return Err(Error::agent(
-                "checkpoint machine",
-                format!("machine '{}' must be running", self.name),
-            ));
-        }
-        smolvm::portable_checkpoint::validate_capture_profile(vm)?;
-
-        let control = smolvm::agent::fork::control_socket_path(&self.name);
-        let status = smolvm::agent::fork::control_socket_cmd(&control, "STATUS").map_err(|error| {
-            Error::agent(
-                "checkpoint machine",
-                format!(
-                    "machine '{}' has no checkpoint control socket ({error}); start it with --forkable",
-                    self.name
-                ),
-            )
-        })?;
-        if status.trim() != "OK running" {
-            return Err(Error::agent(
-                "checkpoint machine",
-                format!("machine '{}' is not checkpointable: {status}", self.name),
-            ));
-        }
-
-        let helper = PackCreateCmd {
-            image: None,
-            from_vm: Some(self.name.clone()),
-            rebase_from_image: false,
-            output: self.output.clone(),
-            cpus: vm.cpus,
-            mem: vm.mem,
-            oci_platform: None,
-            entrypoint: None,
-            no_sign: true,
-            single_file: false,
-            stub: None,
-            lib_dir: self.lib_dir.clone(),
-            rootfs_dir: self.rootfs_dir.clone(),
-            smolfile: None,
-            gpu: false,
-            staging_dir: self.staging_dir.clone(),
-            proxy_opts: self.proxy_opts.clone(),
-        };
-        let temp_dir = tempfile::Builder::new()
-            .prefix("checkpoint-staging-")
-            .tempdir_in(helper.staging_root()?)
-            .map_err(|error| Error::agent("create checkpoint staging", error.to_string()))?;
-        let staging_dir = temp_dir.path().join("staging");
-        let mut collector = AssetCollector::new(staging_dir.clone())
-            .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
-        helper.collect_base_assets(&mut collector)?;
-
-        smolvm::agent::fork::sync_fork_source(&self.name)?;
-        let snapshot_dir = staging_dir.join(smolvm::portable_checkpoint::ASSET_DIR);
-        let pause_started = std::time::Instant::now();
-        let reply = smolvm::agent::fork::control_socket_cmd_with_timeout(
-            &control,
-            &format!("SAVE {}", snapshot_dir.display()),
-            std::time::Duration::from_secs(30 * 60),
+        let result = smolvm::portable_checkpoint::capture_to_path(
+            &self.name,
+            &self.output,
+            &smolvm::portable_checkpoint::CaptureOptions {
+                staging_dir: self.staging_dir,
+                lib_dir: self.lib_dir,
+                rootfs_dir: self.rootfs_dir,
+            },
         )?;
-        if !reply.starts_with("OK") {
-            return Err(Error::agent(
-                "checkpoint machine",
-                format!("libkrun save failed: {reply}"),
-            ));
-        }
-        let mut pause = SavedVmPause {
-            control,
-            armed: true,
-        };
-
-        // Clone the complete exact block chains while block workers remain
-        // paused, then resume immediately. This includes relative backings from
-        // an earlier portable restore; copying only the writable top image
-        // would leave those chains unresolved during re-checkpoint. Writable
-        // tops are cloned, immutable backings are hard-linked where possible.
-        // Hashing and compression operate after resume on this stable boundary.
-        let checkpoint_disks = smolvm::portable_checkpoint::stage_disk_chains(
-            &smolvm::agent::vm_data_dir(&self.name),
-            &snapshot_dir,
-        )?;
-        pause.resume()?;
-        let source_pause = pause_started.elapsed();
         println!(
-            "Source resumed after {:.3}s; packaging continues in the background",
-            source_pause.as_secs_f64()
+            "Source resumed after {:.3}s; packaging continued in the background",
+            result.source_pause.as_secs_f64()
         );
-        let assets = smolvm::pack_export::FromVmAssets {
-            mode: PackMode::Vm,
-            image: None,
-            image_env: Vec::new(),
-            layer_bytes: 0,
-        };
-
-        let platform = format!("linux/{}", Arch::current().oci_arch());
-        let host_platform = Platform::current().host_oci_platform().to_string();
-        let mut manifest = PackManifest::new(
-            format!("vm://{}", self.name),
-            "none".to_string(),
-            platform,
-            host_platform.clone(),
-        );
-        smolvm::pack_export::seed_manifest_from_vm(&mut manifest, vm, &assets);
-        manifest.cpus = vm.cpus;
-        manifest.mem = vm.mem;
-        manifest.checkpoint = Some(PortableCheckpointManifest {
-            version: smolvm::portable_checkpoint::FORMAT_VERSION,
-            runtime_abi: smolvm::portable_checkpoint::RUNTIME_ABI.to_string(),
-            host_platform,
-            cpu_fingerprint: smolvm::portable_checkpoint::cpu_fingerprint()?,
-            cpus: vm.cpus,
-            memory_mib: vm.mem,
-            device_profile: smolvm::portable_checkpoint::DEVICE_PROFILE.to_string(),
-            state: smolvm::portable_checkpoint::describe_asset(
-                &snapshot_dir.join("checkpoint.bin"),
-                "checkpoint/checkpoint.bin",
-            )?,
-            memory: smolvm::portable_checkpoint::describe_asset(
-                &snapshot_dir.join("memory.bin"),
-                "checkpoint/memory.bin",
-            )?,
-            layout: smolvm::portable_checkpoint::describe_asset(
-                &snapshot_dir.join("manifest.bin"),
-                "checkpoint/manifest.bin",
-            )?,
-            disks: checkpoint_disks,
-        });
-        manifest.assets = collector.into_inventory();
-
-        let collector = AssetCollector::new(staging_dir)
-            .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
-        let info = Packer::new(manifest)
-            .with_asset_collector(collector)
-            .pack_artifact(&self.output)
-            .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
         println!(
             "Checkpointed '{}' to {} ({} MiB compressed, {:.3}s total, {:.3}s source pause)",
             self.name,
             self.output.display(),
-            info.total_size / (1024 * 1024),
-            checkpoint_started.elapsed().as_secs_f64(),
-            source_pause.as_secs_f64()
+            result.size_bytes / (1024 * 1024),
+            result.elapsed.as_secs_f64(),
+            result.source_pause.as_secs_f64()
         );
         Ok(())
     }

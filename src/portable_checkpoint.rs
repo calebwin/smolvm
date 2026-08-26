@@ -5,15 +5,18 @@
 //! anywhere; live state is restored only under an exact, fail-closed runtime
 //! compatibility contract.
 
-use crate::config::VmRecord;
+use crate::config::{RecordState, SmolvmConfig, VmRecord};
 use crate::{Error, Result};
 use imago::file::File as ImagoFile;
 use imago::qcow2::Qcow2;
 use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate};
 use sha2::{Digest, Sha256};
+use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{
-    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, PortableCheckpointManifest,
+    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, PackManifest, PackMode,
+    PortableCheckpointManifest,
 };
+use smolvm_pack::packer::Packer;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -28,6 +31,255 @@ pub const ASSET_DIR: &str = "checkpoint";
 
 const INSTALLED_DIR: &str = "portable-checkpoint";
 const PENDING_MARKER: &str = "pending";
+
+/// Optional host paths used while building a portable checkpoint artifact.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureOptions {
+    /// Disk-backed directory used for the temporary, uncompressed image.
+    pub staging_dir: Option<PathBuf>,
+    /// Directory containing libkrun and libkrunfw.
+    pub lib_dir: Option<PathBuf>,
+    /// Directory containing the guest agent root filesystem.
+    pub rootfs_dir: Option<PathBuf>,
+}
+
+/// Timings and size returned by a completed portable checkpoint capture.
+#[derive(Debug, Clone)]
+pub struct CaptureResult {
+    /// Compressed artifact size in bytes.
+    pub size_bytes: u64,
+    /// Time for which the source's vCPUs and disks were frozen.
+    pub source_pause: std::time::Duration,
+    /// Complete capture and compression time.
+    pub elapsed: std::time::Duration,
+}
+
+struct SavedVmPause {
+    control: PathBuf,
+    armed: bool,
+}
+
+impl SavedVmPause {
+    fn resume(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        let reply = crate::agent::fork::control_socket_cmd(&self.control, "RESUME")?;
+        if !reply.starts_with("OK") {
+            return Err(Error::agent(
+                "resume checkpoint source",
+                format!("libkrun returned: {reply}"),
+            ));
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for SavedVmPause {
+    fn drop(&mut self) {
+        if self.armed {
+            match crate::agent::fork::control_socket_cmd(&self.control, "RESUME") {
+                Ok(reply) if reply.starts_with("OK") => {}
+                Ok(reply) => tracing::warn!(%reply, "failed to resume checkpoint source"),
+                Err(error) => tracing::warn!(%error, "failed to resume checkpoint source"),
+            }
+        }
+    }
+}
+
+fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
+    let root = options
+        .staging_dir
+        .clone()
+        .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
+        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&root)
+        .map_err(|error| Error::agent("create checkpoint staging root", error.to_string()))?;
+    Ok(root)
+}
+
+fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
+    options
+        .lib_dir
+        .clone()
+        .or_else(crate::agent::find_lib_dir)
+        .ok_or_else(|| {
+            Error::agent(
+                "find checkpoint runtime libraries",
+                "could not find libkrun; set SMOLVM_LIB_DIR",
+            )
+        })
+}
+
+fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
+    let candidates = [
+        options.rootfs_dir.clone(),
+        std::env::var_os("SMOLVM_AGENT_ROOTFS").map(PathBuf::from),
+        dirs::data_dir().map(|dir| dir.join("smolvm/agent-rootfs")),
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.join("agent-rootfs"))),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| std::fs::symlink_metadata(candidate.join("sbin/init")).is_ok())
+        .ok_or_else(|| {
+            Error::agent(
+                "find checkpoint agent rootfs",
+                "could not find agent rootfs; set SMOLVM_AGENT_ROOTFS",
+            )
+        })
+}
+
+/// Capture a running checkpointable machine into a self-contained artifact.
+///
+/// The source is paused only while libkrun saves execution state and the exact
+/// disk chains are cloned. Hashing and compression continue after it resumes.
+pub fn capture_to_path(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+) -> Result<CaptureResult> {
+    let started = std::time::Instant::now();
+    if output
+        .extension()
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
+    {
+        return Err(Error::config(
+            "checkpoint machine",
+            "output must end in .smolcheckpoint",
+        ));
+    }
+    if output.exists() {
+        return Err(Error::config(
+            "checkpoint machine",
+            format!("refusing to overwrite {}", output.display()),
+        ));
+    }
+
+    let config = SmolvmConfig::load()?;
+    let vm = config
+        .vms
+        .get(name)
+        .ok_or_else(|| Error::vm_not_found(name))?;
+    if crate::agent::state_probe::resolve_state(name, vm) != RecordState::Running {
+        return Err(Error::agent_conflict(
+            "checkpoint machine",
+            format!("machine '{name}' must be running"),
+        ));
+    }
+    validate_capture_profile(vm)?;
+
+    let control = crate::agent::fork::control_socket_path(name);
+    let status = crate::agent::fork::control_socket_cmd(&control, "STATUS").map_err(|error| {
+        Error::agent_conflict(
+            "checkpoint machine",
+            format!(
+                "machine '{name}' has no checkpoint control socket ({error}); start it with --forkable"
+            ),
+        )
+    })?;
+    if status.trim() != "OK running" {
+        return Err(Error::agent_conflict(
+            "checkpoint machine",
+            format!("machine '{name}' is not checkpointable: {status}"),
+        ));
+    }
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("checkpoint-staging-")
+        .tempdir_in(staging_root(options)?)
+        .map_err(|error| Error::agent("create checkpoint staging", error.to_string()))?;
+    let staging_dir = temp_dir.path().join("staging");
+    let mut collector = AssetCollector::new(staging_dir.clone())
+        .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+    collector
+        .collect_libraries(&checkpoint_lib_dir(options)?)
+        .map_err(|error| Error::agent("collect checkpoint libraries", error.to_string()))?;
+    collector
+        .collect_agent_rootfs(&checkpoint_rootfs_dir(options)?)
+        .map_err(|error| Error::agent("collect checkpoint rootfs", error.to_string()))?;
+    collector
+        .create_storage_template()
+        .map_err(|error| Error::agent("create checkpoint storage template", error.to_string()))?;
+
+    crate::agent::fork::sync_fork_source(name)?;
+    let snapshot_dir = staging_dir.join(ASSET_DIR);
+    let pause_started = std::time::Instant::now();
+    let reply = crate::agent::fork::control_socket_cmd_with_timeout(
+        &control,
+        &format!("SAVE {}", snapshot_dir.display()),
+        std::time::Duration::from_secs(30 * 60),
+    )?;
+    if !reply.starts_with("OK") {
+        return Err(Error::agent(
+            "checkpoint machine",
+            format!("libkrun save failed: {reply}"),
+        ));
+    }
+    let mut pause = SavedVmPause {
+        control,
+        armed: true,
+    };
+    let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
+    pause.resume()?;
+    let source_pause = pause_started.elapsed();
+
+    let assets = crate::pack_export::FromVmAssets {
+        mode: PackMode::Vm,
+        image: None,
+        image_env: Vec::new(),
+        layer_bytes: 0,
+    };
+    let platform = format!("linux/{}", crate::platform::Arch::current().oci_arch());
+    let host_platform = crate::platform::Platform::current()
+        .host_oci_platform()
+        .to_string();
+    let mut manifest = PackManifest::new(
+        format!("vm://{name}"),
+        "none".to_string(),
+        platform,
+        host_platform.clone(),
+    );
+    crate::pack_export::seed_manifest_from_vm(&mut manifest, vm, &assets);
+    manifest.cpus = vm.cpus;
+    manifest.mem = vm.mem;
+    manifest.checkpoint = Some(PortableCheckpointManifest {
+        version: FORMAT_VERSION,
+        runtime_abi: RUNTIME_ABI.to_string(),
+        host_platform,
+        cpu_fingerprint: cpu_fingerprint()?,
+        cpus: vm.cpus,
+        memory_mib: vm.mem,
+        device_profile: DEVICE_PROFILE.to_string(),
+        state: describe_asset(
+            &snapshot_dir.join("checkpoint.bin"),
+            "checkpoint/checkpoint.bin",
+        )?,
+        memory: describe_asset(&snapshot_dir.join("memory.bin"), "checkpoint/memory.bin")?,
+        layout: describe_asset(
+            &snapshot_dir.join("manifest.bin"),
+            "checkpoint/manifest.bin",
+        )?,
+        disks: checkpoint_disks,
+    });
+    manifest.assets = collector.into_inventory();
+
+    let collector = AssetCollector::new(staging_dir)
+        .map_err(|error| Error::agent("collect checkpoint assets", error.to_string()))?;
+    let info = Packer::new(manifest)
+        .with_asset_collector(collector)
+        .pack_artifact(output)
+        .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    Ok(CaptureResult {
+        size_bytes: info.total_size,
+        source_pause,
+        elapsed: started.elapsed(),
+    })
+}
 
 /// Return the strict host CPU feature fingerprint used for snapshot matching.
 pub fn cpu_fingerprint() -> Result<String> {
@@ -129,7 +381,7 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if unsupported.is_empty() {
         return Ok(());
     }
-    Err(Error::agent(
+    Err(Error::config(
         "checkpoint machine",
         format!(
             "the initial portable checkpoint profile does not support {}; stop or detach these resources before capture",

@@ -23,13 +23,16 @@
 //! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Path, Query, State},
+    http::{header, Response},
     Json,
 };
 use futures_util::StreamExt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount, PortMapping};
@@ -141,6 +144,163 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         disk_used_mb: crate::agent::disk_used_mb(name),
         created_at: record.created_at,
     }
+}
+
+fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
+    let root = std::env::var_os("SMOLVM_PACK_STAGING")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&root)
+        .map_err(|error| ApiError::internal(format!("create checkpoint staging root: {error}")))?;
+    Ok(root)
+}
+
+fn max_checkpoint_upload_bytes() -> u64 {
+    std::env::var("SMOLVM_MAX_CHECKPOINT_UPLOAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2 * 1024 * 1024 * 1024 * 1024)
+}
+
+fn checkpoint_capture_error(error: crate::Error) -> ApiError {
+    match error {
+        crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
+        other => ApiError::from(other),
+    }
+}
+
+/// Stream a running machine's complete live state as a `.smolcheckpoint`.
+pub async fn capture_portable_checkpoint(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Response<Body>, ApiError> {
+    // Serialize capture with start/stop/delete/fork so the saved vCPU state and
+    // cloned qcow chains describe one stable machine generation.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+    // Resolve through state first so an unknown name fails before allocating a
+    // potentially large staging directory. The capture core revalidates the
+    // machine's state and checkpoint profile at the consistency boundary.
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+
+    let transfer = tempfile::Builder::new()
+        .prefix("checkpoint-transfer-")
+        .tempdir_in(checkpoint_transfer_root()?)
+        .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
+    let artifact = transfer.path().join(format!("{name}.smolcheckpoint"));
+    let capture_name = name.clone();
+    let capture_path = artifact.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::portable_checkpoint::capture_to_path(
+            &capture_name,
+            &capture_path,
+            &crate::portable_checkpoint::CaptureOptions::default(),
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("checkpoint capture task failed: {error}")))?
+    .map_err(checkpoint_capture_error)?;
+
+    let mut file = tokio::fs::File::open(&artifact)
+        .await
+        .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
+    let size = result.size_bytes;
+    let stream = async_stream::stream! {
+        // Keeping the TempDir in the stream owns the artifact until the client
+        // finishes or disconnects; dropping the body cleans it up either way.
+        let _transfer = transfer;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(count) => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&buffer[..count]));
+                }
+                Err(error) => {
+                    yield Err(error);
+                    break;
+                }
+            }
+        }
+    };
+    Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.smolmachines.checkpoint",
+        )
+        .header(header::CONTENT_LENGTH, size)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{name}.smolcheckpoint\""),
+        )
+        .header(
+            "x-smolvm-checkpoint-pause-ms",
+            result.source_pause.as_millis().to_string(),
+        )
+        .body(Body::from_stream(stream))
+        .map_err(|error| ApiError::internal(format!("build checkpoint response: {error}")))
+}
+
+/// Create a machine by streaming a `.smolcheckpoint` into this node.
+pub async fn restore_portable_checkpoint(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    request: axum::extract::Request,
+) -> Result<Json<MachineInfo>, ApiError> {
+    validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    let transfer = tempfile::Builder::new()
+        .prefix("checkpoint-restore-")
+        .tempdir_in(checkpoint_transfer_root()?)
+        .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
+    let artifact = transfer.path().join("upload.smolcheckpoint");
+    let mut file = tokio::fs::File::create(&artifact)
+        .await
+        .map_err(|error| ApiError::internal(format!("create checkpoint upload: {error}")))?;
+    let limit = max_checkpoint_upload_bytes();
+    let mut received = 0_u64;
+    let mut body = request.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk
+            .map_err(|error| ApiError::BadRequest(format!("read checkpoint upload: {error}")))?;
+        received = received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| ApiError::BadRequest("checkpoint upload size overflow".to_string()))?;
+        if received > limit {
+            return Err(ApiError::BadRequest(format!(
+                "checkpoint exceeds the configured {limit}-byte upload limit"
+            )));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| ApiError::internal(format!("write checkpoint upload: {error}")))?;
+    }
+    if received == 0 {
+        return Err(ApiError::BadRequest(
+            "checkpoint upload is empty".to_string(),
+        ));
+    }
+    file.flush()
+        .await
+        .map_err(|error| ApiError::internal(format!("flush checkpoint upload: {error}")))?;
+    file.sync_all()
+        .await
+        .map_err(|error| ApiError::internal(format!("sync checkpoint upload: {error}")))?;
+    drop(file);
+
+    let request: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+        "name": name,
+        "from": artifact.to_string_lossy(),
+    }))
+    .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
+    // create_machine consumes and verifies the artifact before this TempDir is
+    // dropped, installing owned checkpoint payloads and exact qcow chains.
+    create_machine(State(state), Json(request)).await
 }
 
 /// Build a MachineEntry from a VmRecord and AgentManager.
