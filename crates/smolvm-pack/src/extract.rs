@@ -166,6 +166,58 @@ fn host_unpack_preserves_ownership() -> bool {
     }
 }
 
+/// First release whose in-guest agent unpacks host-staged layer tars.
+///
+/// Staging was introduced together with that agent. A pack built before it
+/// carries an agent that only recognises layer *directories*, so handing one
+/// staged tars leaves `/packed_layers` with nothing it can use and the machine
+/// dies with "no layer directories found in /packed_layers" — an error that
+/// describes the host's staging area and says nothing about the real mismatch.
+const MIN_STAGED_LAYERS_VERSION: (u64, u64, u64) = (1, 8, 1);
+
+/// Whether the agent baked into a pack built by `version` can unpack staged
+/// layer tars itself.
+///
+/// An absent or unreadable version answers "no". `smolvm_version` is a
+/// defaulted field, so a pack without one necessarily predates it, and the
+/// conservative answer merely costs host-side extraction — while guessing "yes"
+/// costs a machine that will not boot.
+fn packed_agent_unpacks_staged_layers(version: &str) -> bool {
+    let Some(parsed) = parse_pack_version(version) else {
+        return false;
+    };
+    parsed >= (MIN_STAGED_LAYERS_VERSION, true)
+}
+
+/// `((major, minor, patch), is_release)` from a pack's recorded version.
+///
+/// The bool carries prerelease ordering: `1.8.1-rc.1` predates the `1.8.1` that
+/// introduced staging, so comparing the numbers alone would credit it with a
+/// capability it does not have. Ordering `false < true` at equal numbers is
+/// exactly the semver rule, without taking on a dependency for one comparison.
+fn parse_pack_version(version: &str) -> Option<((u64, u64, u64), bool)> {
+    let version = version.trim().trim_start_matches('v');
+    if version.is_empty() {
+        return None;
+    }
+    // Build metadata never affects precedence; a prerelease suffix does.
+    let version = version.split('+').next()?;
+    let (core, is_release) = match version.split_once('-') {
+        Some((core, _prerelease)) => (core, false),
+        None => (version, true),
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    // A two-component "1.8" is not valid semver but is worth reading as 1.8.0
+    // rather than refusing a version the pack plainly states.
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(((major, minor, patch), is_release))
+}
+
 /// Files larger than this threshold are extracted with a sparse write
 /// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
 /// dense sequential write.  Chosen to match typical overlay disk sizes while
@@ -1333,10 +1385,14 @@ fn extract_sidecar_inner(
         eprintln!("debug: extracted assets to {}", cache_dir.display());
     }
 
+    // A sidecar can be any age while the smolvm running it is current, so its
+    // manifest is the only thing that says what the agent inside can do.
+    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
+
     // Layer order from the sidecar manifest (bottom→top). Best-effort: if the
     // manifest can't be read the agent falls back to a name sort.
-    let layer_order = crate::packer::read_manifest_from_sidecar(sidecar_path)
-        .ok()
+    let layer_order = manifest
+        .as_ref()
         .map(|m| {
             m.assets
                 .layers
@@ -1346,7 +1402,28 @@ fn extract_sidecar_inner(
         })
         .unwrap_or_default();
 
-    post_process_extraction(cache_dir, &layer_order, debug)?;
+    let pack_version = manifest.as_ref().map(|m| m.smolvm_version.as_str());
+    let guest_unpacks_layers = pack_version.is_some_and(packed_agent_unpacks_staged_layers);
+    if !guest_unpacks_layers && !host_unpack_preserves_ownership() && has_layer_tars(cache_dir) {
+        // Extracting here is what every smolvm did before staging existed, so
+        // the pack runs exactly as it always has. Say why anyway: the ownership
+        // this loses is silent at extraction time and only shows up later as a
+        // service that cannot read its own data directory.
+        eprintln!(
+            "warning: this pack was built by smolvm {}, whose in-guest agent cannot unpack \
+             staged layers; extracting them on the host instead.\n\
+             warning: file ownership inside the machine will follow the current user rather \
+             than the image. Re-pack with smolvm {}.{}.{} or later to restore it.",
+            pack_version
+                .filter(|v| !v.is_empty())
+                .unwrap_or("an unknown version"),
+            MIN_STAGED_LAYERS_VERSION.0,
+            MIN_STAGED_LAYERS_VERSION.1,
+            MIN_STAGED_LAYERS_VERSION.2,
+        );
+    }
+
+    post_process_extraction(cache_dir, &layer_order, guest_unpacks_layers, debug)?;
     Ok(())
 }
 
@@ -1390,8 +1467,10 @@ pub fn extract_from_binary(
         }
 
         // Embedded self-exec stub: no separate sidecar manifest to source layer
-        // order from here, so let the agent fall back to a name sort.
-        post_process_extraction(cache_dir, &[], debug)?;
+        // order from here, so let the agent fall back to a name sort. The stub
+        // and the agent it carries were built by the same release, so staging
+        // can never outrun the agent the way a sidecar from another version can.
+        post_process_extraction(cache_dir, &[], true, debug)?;
         Ok(())
     }
 }
@@ -1431,8 +1510,9 @@ pub unsafe fn extract_from_section(
         eprintln!("debug: extracted assets to {}", cache_dir.display());
     }
 
-    // Mach-O section self-exec stub: same as embedded mode — name-sort fallback.
-    post_process_extraction(cache_dir, &[], debug)?;
+    // Mach-O section self-exec stub: same as embedded mode — name-sort fallback,
+    // and likewise self-consistent on staging.
+    post_process_extraction(cache_dir, &[], true, debug)?;
     Ok(())
 }
 
@@ -1462,6 +1542,7 @@ fn layer_id_from_asset_path(path: &str) -> Option<String> {
 fn post_process_extraction(
     cache_dir: &Path,
     layer_order: &[String],
+    guest_unpacks_layers: bool,
     debug: bool,
 ) -> std::io::Result<()> {
     // Extract agent-rootfs.tar to agent-rootfs directory
@@ -1490,7 +1571,7 @@ fn post_process_extraction(
     // APFS sparse disk image on macOS. The image is persisted in the cache and
     // re-mounted on subsequent runs.
     let layers_dir = cache_dir.join("layers");
-    if layers_dir.exists() && !host_unpack_preserves_ownership() {
+    if layers_dir.exists() && !host_unpack_preserves_ownership() && guest_unpacks_layers {
         // This host cannot reproduce the archived uid/gid (see
         // `host_unpack_preserves_ownership`), so leave the tars staged and let
         // the guest agent unpack them, where it is root on every host OS.
@@ -1823,7 +1904,7 @@ fn extraction_layers_dir(cache_dir: &Path, debug: bool) -> std::io::Result<PathB
 
 // --- macOS-only implementation details ---
 
-#[cfg(target_os = "macos")]
+/// Whether the cache holds layer tars the host has not unpacked.
 fn has_layer_tars(cache_dir: &Path) -> bool {
     let layers_dir = cache_dir.join("layers");
     layers_dir.exists()
@@ -2529,6 +2610,47 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The version that shipped in the pack this was written for. A regression
+    /// here is not cosmetic: crediting an old pack with staging support hands
+    /// its agent an empty `/packed_layers` and the machine never boots.
+    #[test]
+    fn a_pack_older_than_staging_is_not_credited_with_it() {
+        assert!(!packed_agent_unpacks_staged_layers("0.9.0"));
+        assert!(!packed_agent_unpacks_staged_layers("1.8.0"));
+        assert!(packed_agent_unpacks_staged_layers("1.8.1"));
+        assert!(packed_agent_unpacks_staged_layers("1.12.0"));
+        // Numeric order alone would rank 1.10 below 1.9 on a string compare.
+        assert!(packed_agent_unpacks_staged_layers("1.10.0"));
+    }
+
+    /// A prerelease sorts BELOW its release, so the rc that predates the
+    /// staging agent must not inherit the release's capability.
+    #[test]
+    fn a_prerelease_does_not_inherit_its_releases_capability() {
+        assert!(!packed_agent_unpacks_staged_layers("1.8.1-rc.1"));
+        assert!(packed_agent_unpacks_staged_layers("1.8.2-rc.1"));
+        // Build metadata is not precedence.
+        assert!(packed_agent_unpacks_staged_layers("1.8.1+build.5"));
+    }
+
+    /// `smolvm_version` is a defaulted field, so its absence means "older than
+    /// the field" — never "new enough".
+    #[test]
+    fn an_unreadable_version_is_treated_as_too_old() {
+        assert!(!packed_agent_unpacks_staged_layers(""));
+        assert!(!packed_agent_unpacks_staged_layers("   "));
+        assert!(!packed_agent_unpacks_staged_layers("not-a-version"));
+        assert!(!packed_agent_unpacks_staged_layers("1.2.3.4"));
+    }
+
+    #[test]
+    fn version_parsing_tolerates_what_packs_actually_record() {
+        assert_eq!(parse_pack_version("v1.8.1"), Some(((1, 8, 1), true)));
+        // Two components is not valid semver but is unambiguous.
+        assert_eq!(parse_pack_version("1.8"), Some(((1, 8, 0), true)));
+        assert_eq!(parse_pack_version("1.8.1-rc.1"), Some(((1, 8, 1), false)));
+    }
 
     #[test]
     fn cached_layers_usable_requires_the_layers_not_just_the_marker() {
