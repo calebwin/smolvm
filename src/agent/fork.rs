@@ -111,14 +111,24 @@ pub fn control_socket_path(name: &str) -> PathBuf {
 
 /// Send a single line command to a VM control socket and return its reply line.
 pub fn control_socket_cmd(sock: &Path, cmd: &str) -> Result<String> {
+    control_socket_cmd_with_timeout(sock, cmd, std::time::Duration::from_secs(60))
+}
+
+/// Send a control command with an operation-specific read timeout.
+///
+/// Durable saves stream configured guest RAM before replying and therefore
+/// need a much larger bound than ordinary pause/fork/status operations.
+pub fn control_socket_cmd_with_timeout(
+    sock: &Path,
+    cmd: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
     use crate::platform::uds::UdsStream;
     use std::io::{Read, Write};
 
     let mut stream = UdsStream::connect(sock)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-        .ok();
+    stream.set_read_timeout(Some(timeout)).ok();
     stream
         .write_all(format!("{cmd}\n").as_bytes())
         .map_err(|e| Error::agent("write control socket", e.to_string()))?;
@@ -234,7 +244,7 @@ fn fork_base_already_paused(status: &str) -> bool {
 /// avoid capturing an overlayfs mount whose first lookup can block. Complete
 /// the guest-visible durability boundary before libkrun drains block workers
 /// and freezes the vCPUs for every newly captured checkpoint.
-fn sync_fork_source(name: &str) -> Result<()> {
+pub fn sync_fork_source(name: &str) -> Result<()> {
     let socket = vm_data_dir(name).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|error| Error::agent("sync fork source", error.to_string()))?;

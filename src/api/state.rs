@@ -139,6 +139,10 @@ pub struct MachineRegistration {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Whether ordinary starts should preserve file-backed, forkable RAM.
+    pub forkable: bool,
+    /// Whether image pull and init were already completed in captured state.
+    pub init_completed: bool,
     /// Whether to expose the guest Docker daemon socket to the host.
     pub docker_socket: bool,
     /// OCI image reference (e.g., "alpine:latest").
@@ -913,6 +917,8 @@ impl ApiState {
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
         record.cuda = reg.resources.cuda.unwrap_or(false);
+        record.forkable = reg.forkable;
+        record.init_completed = reg.init_completed;
         record.docker_socket = reg.docker_socket;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
@@ -959,7 +965,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
-                        forkable: false,
+                        forkable: reg.forkable,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,
                         forkpoint_held: false,

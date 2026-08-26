@@ -1,0 +1,909 @@
+//! Portable live-checkpoint compatibility and installation.
+//!
+//! A `.smolcheckpoint` uses the ordinary pack container for files and disks,
+//! plus an eager libkrun memory/device snapshot. The container can be copied
+//! anywhere; live state is restored only under an exact, fail-closed runtime
+//! compatibility contract.
+
+use crate::config::VmRecord;
+use crate::{Error, Result};
+use imago::file::File as ImagoFile;
+use imago::qcow2::Qcow2;
+use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate};
+use sha2::{Digest, Sha256};
+use smolvm_pack::format::{
+    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, PortableCheckpointManifest,
+};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+/// First portable-checkpoint metadata version.
+pub const FORMAT_VERSION: u32 = 1;
+/// libkrun VM/vCPU/device-state compatibility identifier.
+pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
+/// Device topology supported by the initial portable checkpoint profile.
+pub const DEVICE_PROFILE: &str = "smolvm-basic-v1";
+/// Directory inside an extracted artifact containing live state.
+pub const ASSET_DIR: &str = "checkpoint";
+
+const INSTALLED_DIR: &str = "portable-checkpoint";
+const PENDING_MARKER: &str = "pending";
+
+/// Return the strict host CPU feature fingerprint used for snapshot matching.
+pub fn cpu_fingerprint() -> Result<String> {
+    let mut identity = format!(
+        "platform={}\n",
+        crate::platform::Platform::current().host_oci_platform()
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|error| Error::agent("fingerprint CPU", error.to_string()))?;
+        let accepted = [
+            "vendor_id",
+            "cpu family",
+            "model",
+            "stepping",
+            "flags",
+            "Features",
+            "CPU implementer",
+            "CPU architecture",
+            "CPU variant",
+            "CPU part",
+            "CPU revision",
+        ];
+        for line in cpuinfo.lines().take_while(|line| !line.trim().is_empty()) {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            if accepted.contains(&key.trim()) {
+                identity.push_str(key.trim());
+                identity.push('=');
+                identity.push_str(
+                    value
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .as_str(),
+                );
+                identity.push('\n');
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string", "hw.model"])
+            .output()
+            .map_err(|error| Error::agent("fingerprint CPU", error.to_string()))?;
+        if !output.status.success() {
+            return Err(Error::agent(
+                "fingerprint CPU",
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        identity.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        identity.push_str(&std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
+        identity.push('\n');
+        identity.push_str(&std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default());
+    }
+    Ok(hex::encode(Sha256::digest(identity.as_bytes())))
+}
+
+/// Reject host-bound device state that cannot yet be resumed from an artifact.
+pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if !vm.mounts.is_empty() {
+        unsupported.push("host mounts");
+    }
+    if !vm.ports.is_empty() || vm.network {
+        unsupported.push("network/port forwarding");
+    }
+    if !vm.published_sockets.is_empty() {
+        unsupported.push("published sockets");
+    }
+    if !vm.remote_volumes.is_empty() {
+        unsupported.push("remote volumes");
+    }
+    if vm.gpu.unwrap_or(false) {
+        unsupported.push("Vulkan GPU state");
+    }
+    if vm.cuda {
+        unsupported.push("CUDA state");
+    }
+    if vm.rosetta.unwrap_or(false) {
+        unsupported.push("Rosetta");
+    }
+    if vm.ssh_agent {
+        unsupported.push("SSH agent forwarding");
+    }
+    if vm.docker_socket {
+        unsupported.push("Docker socket forwarding");
+    }
+    if vm.image.is_some() {
+        unsupported.push("image-backed rootfs");
+    }
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(Error::agent(
+        "checkpoint machine",
+        format!(
+            "the initial portable checkpoint profile does not support {}; stop or detach these resources before capture",
+            unsupported.join(", ")
+        ),
+    ))
+}
+
+fn disk_target(role: &str, index: usize, format: &str) -> Result<String> {
+    if index == 0 {
+        return match (role, format) {
+            ("storage", "qcow2") => Ok("storage.qcow2".to_string()),
+            ("storage", "raw") => Ok("storage.raw".to_string()),
+            ("overlay", "qcow2") => Ok("overlay.qcow2".to_string()),
+            ("overlay", "raw") => Ok("overlay.raw".to_string()),
+            _ => Err(Error::agent(
+                "checkpoint disk",
+                format!("invalid disk role/format {role}/{format}"),
+            )),
+        };
+    }
+    let alphabet = match role {
+        "storage" => b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".as_slice(),
+        "overlay" => b"abcdefghijklmnopqrstuvwxyz".as_slice(),
+        _ => {
+            return Err(Error::agent(
+                "checkpoint disk",
+                format!("invalid disk role '{role}'"),
+            ));
+        }
+    };
+    let byte = *alphabet.get(index - 1).ok_or_else(|| {
+        Error::agent(
+            "checkpoint disk",
+            format!("{role} backing chain is too deep"),
+        )
+    })?;
+    Ok(char::from(byte).to_string())
+}
+
+fn inspect_qcow2(path: &Path) -> Result<(Option<String>, Option<String>)> {
+    let qcow = Qcow2::<ImagoFile>::builder_path(path)
+        .backing(None)
+        .data_file(None)
+        // The gate opens only the explicitly supplied top-level path here;
+        // backing and external-data auto-open are both disabled above.
+        .open_sync(PermissiveImplicitOpenGate::default())
+        .map_err(|error| Error::agent("inspect checkpoint qcow2", error.to_string()))?;
+    if qcow.requires_external_data_file() {
+        return Err(Error::agent(
+            "checkpoint disk",
+            format!("{} uses an unsupported external data file", path.display()),
+        ));
+    }
+    Ok((
+        qcow.implicit_backing_file().cloned(),
+        qcow.implicit_backing_format().cloned(),
+    ))
+}
+
+fn detect_disk_format(path: &Path, declared: Option<&str>) -> Result<&'static str> {
+    match declared {
+        Some("raw" | "file") => return Ok("raw"),
+        Some("qcow2") => return Ok("qcow2"),
+        Some(other) => {
+            return Err(Error::agent(
+                "checkpoint disk",
+                format!("unsupported backing format '{other}'"),
+            ));
+        }
+        None => {}
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+    let mut magic = [0_u8; 4];
+    let count = file
+        .read(&mut magic)
+        .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+    Ok(if count == magic.len() && magic == *b"QFI\xfb" {
+        "qcow2"
+    } else {
+        "raw"
+    })
+}
+
+fn resolve_backing_path(image: &Path, backing: &str) -> PathBuf {
+    let backing = PathBuf::from(backing);
+    if backing.is_absolute() {
+        backing
+    } else {
+        image
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(backing)
+    }
+}
+
+fn rewrite_qcow2_backing(path: &Path, backing: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
+    let mut header = [0_u8; 20];
+    file.read_exact(&mut header)
+        .map_err(|error| Error::agent("read qcow2 header", error.to_string()))?;
+    if header[..4] != *b"QFI\xfb" {
+        return Err(Error::agent(
+            "rewrite qcow2 backing",
+            format!("{} is not qcow2", path.display()),
+        ));
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let old_len = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
+    if offset == 0 || old_len == 0 || backing.len() > old_len {
+        return Err(Error::agent(
+            "rewrite qcow2 backing",
+            format!(
+                "{} cannot replace its {}-byte backing name with {} bytes",
+                path.display(),
+                old_len,
+                backing.len()
+            ),
+        ));
+    }
+    let end = offset
+        .checked_add(old_len as u64)
+        .ok_or_else(|| Error::agent("rewrite qcow2 backing", "header offset overflow"))?;
+    if end
+        > file
+            .metadata()
+            .map_err(|e| Error::agent("inspect qcow2", e.to_string()))?
+            .len()
+    {
+        return Err(Error::agent(
+            "rewrite qcow2 backing",
+            "backing filename lies outside the qcow2 file",
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.write_all(backing.as_bytes()))
+        .and_then(|_| file.write_all(&vec![0_u8; old_len - backing.len()]))
+        .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
+    file.seek(SeekFrom::Start(16))
+        .and_then(|_| file.write_all(&(backing.len() as u32).to_be_bytes()))
+        .and_then(|_| file.sync_all())
+        .map_err(|error| Error::agent("rewrite qcow2 backing", error.to_string()))?;
+    Ok(())
+}
+
+/// Stage exact, self-contained disk chains without flattening them.
+///
+/// Each qcow2 layer is copied as-is and rebased to a one-character relative
+/// filename. This preserves the block backend's allocation/topology state,
+/// avoids multi-gigabyte logical scans, and prevents restored images from
+/// retaining absolute references to the capture host.
+pub fn stage_disk_chains(
+    snapshot_dir: &Path,
+    checkpoint_dir: &Path,
+) -> Result<Vec<CheckpointDisk>> {
+    let mut disks = Vec::new();
+    for (role, raw_name) in [
+        ("storage", crate::storage::STORAGE_DISK_FILENAME),
+        ("overlay", crate::storage::OVERLAY_DISK_FILENAME),
+    ] {
+        let (mut source, initial_format) = crate::agent::resolve_disk_image(snapshot_dir, raw_name);
+        if !source.is_file() {
+            continue;
+        }
+        let mut format = match initial_format {
+            crate::data::disk::DiskFormat::Raw => "raw",
+            crate::data::disk::DiskFormat::Qcow2 => "qcow2",
+        };
+        let disk_staging = checkpoint_dir.join("disks").join(role);
+        std::fs::create_dir_all(&disk_staging)
+            .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
+        let mut files = Vec::new();
+        for index in 0..64 {
+            let target = disk_target(role, index, format)?;
+            let artifact_path = format!("checkpoint/disks/{role}/{index}");
+            let staged = disk_staging.join(index.to_string());
+            if index == 0 {
+                // The active top layer is writable. Capture an independent
+                // reflink/sparse copy at the frozen disk boundary.
+                crate::disk_utils::clone_or_copy_file(&source, &staged)?;
+            } else {
+                // Qcow backings are immutable while referenced by a writable
+                // top. An owned hard link is an exact O(1) snapshot and remains
+                // valid even if the source machine is later deleted.
+                match std::fs::hard_link(&source, &staged) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                        crate::disk_utils::clone_or_copy_file(&source, &staged)?;
+                    }
+                    Err(error) => {
+                        return Err(Error::agent("stage checkpoint disk", error.to_string()));
+                    }
+                }
+            }
+
+            let next = if format == "qcow2" {
+                let (backing, backing_format) = inspect_qcow2(&source)?;
+                match backing {
+                    Some(backing) => {
+                        let backing_source = resolve_backing_path(&source, &backing);
+                        if !backing_source.is_file() {
+                            return Err(Error::agent(
+                                "stage checkpoint disk",
+                                format!("missing qcow2 backing image {}", backing_source.display()),
+                            ));
+                        }
+                        let next_format =
+                            detect_disk_format(&backing_source, backing_format.as_deref())?;
+                        let next_target = disk_target(role, index + 1, next_format)?;
+                        rewrite_qcow2_backing(&staged, &next_target)?;
+                        Some((backing_source, next_format))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            let metadata = std::fs::metadata(&staged)
+                .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+            // The pack footer authenticates the entire compressed asset blob.
+            // Avoid hashing a 20 GiB logical raw backing full of sparse holes.
+            let asset = CheckpointAsset {
+                path: artifact_path,
+                size: metadata.len(),
+                sha256: String::new(),
+            };
+            files.push(CheckpointDiskFile {
+                asset,
+                target,
+                format: format.to_string(),
+            });
+            match next {
+                Some((next_source, next_format)) => {
+                    source = next_source;
+                    format = next_format;
+                }
+                None => break,
+            }
+        }
+        if files.is_empty() || files.len() == 64 {
+            return Err(Error::agent(
+                "stage checkpoint disk",
+                format!("invalid or unterminated {role} disk chain"),
+            ));
+        }
+        disks.push(CheckpointDisk {
+            role: role.to_string(),
+            files,
+        });
+    }
+    if disks.len() != 2 {
+        return Err(Error::agent(
+            "stage checkpoint disk",
+            "portable checkpoints require storage and overlay disks",
+        ));
+    }
+    Ok(disks)
+}
+
+/// Build an integrity entry for a staged checkpoint payload.
+pub fn describe_asset(path: &Path, relative_path: &str) -> Result<CheckpointAsset> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| Error::agent("inspect checkpoint payload", error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent(
+            "inspect checkpoint payload",
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| Error::agent("open checkpoint payload", error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| Error::agent("hash checkpoint payload", error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(CheckpointAsset {
+        path: relative_path.to_string(),
+        size: metadata.len(),
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
+/// Validate that a checkpoint may be restored by this host and runtime.
+pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    if checkpoint.version != FORMAT_VERSION {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "unsupported checkpoint version {} (runtime supports {})",
+                checkpoint.version, FORMAT_VERSION
+            ),
+        ));
+    }
+    if checkpoint.runtime_abi != RUNTIME_ABI {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "checkpoint requires runtime ABI '{}', this runtime provides '{}'",
+                checkpoint.runtime_abi, RUNTIME_ABI
+            ),
+        ));
+    }
+    let host_platform = crate::platform::Platform::current()
+        .host_oci_platform()
+        .to_string();
+    if checkpoint.host_platform != host_platform {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "checkpoint host platform '{}' does not match '{}'",
+                checkpoint.host_platform, host_platform
+            ),
+        ));
+    }
+    if checkpoint.device_profile != DEVICE_PROFILE {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "unsupported checkpoint device profile '{}'",
+                checkpoint.device_profile
+            ),
+        ));
+    }
+    if checkpoint.cpus == 0 || checkpoint.memory_mib == 0 {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "checkpoint has invalid zero CPU or memory resources",
+        ));
+    }
+    // Reject resource-exhaustion artifacts before extracting or allocating
+    // their eager memory image. The current device profile maps configured RAM
+    // plus rootfs DAX and small fixed regions; 2 GiB is a deliberately generous
+    // ceiling for those non-configured mappings.
+    const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
+    const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    let configured_memory = u64::from(checkpoint.memory_mib)
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| Error::agent("restore checkpoint", "memory size overflow"))?;
+    let max_memory_image = configured_memory
+        .checked_add(FIXED_MEMORY_OVERHEAD_BYTES)
+        .ok_or_else(|| Error::agent("restore checkpoint", "memory size overflow"))?;
+    if checkpoint.state.size == 0
+        || checkpoint.state.size > MAX_STATE_BYTES
+        || checkpoint.layout.size == 0
+        || checkpoint.layout.size > MAX_LAYOUT_BYTES
+        || checkpoint.memory.size == 0
+        || checkpoint.memory.size > max_memory_image
+    {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "checkpoint payload sizes are inconsistent with the captured machine",
+        ));
+    }
+    let current_cpu = cpu_fingerprint()?;
+    if checkpoint.cpu_fingerprint != current_cpu {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "checkpoint CPU feature contract does not match this host",
+        ));
+    }
+    Ok(())
+}
+
+fn expected_assets(
+    checkpoint: &PortableCheckpointManifest,
+) -> [(&CheckpointAsset, &'static str); 3] {
+    [
+        (&checkpoint.state, "checkpoint/checkpoint.bin"),
+        (&checkpoint.memory, "checkpoint/memory.bin"),
+        (&checkpoint.layout, "checkpoint/manifest.bin"),
+    ]
+}
+
+fn validate_disk_manifest(disks: &[CheckpointDisk]) -> Result<()> {
+    if disks.len() != 2 {
+        return Err(Error::agent(
+            "install checkpoint",
+            "checkpoint must contain storage and overlay disk chains",
+        ));
+    }
+    for (expected_role, disk) in ["storage", "overlay"].into_iter().zip(disks) {
+        if disk.role != expected_role || disk.files.is_empty() {
+            return Err(Error::agent(
+                "install checkpoint",
+                format!("invalid {} disk chain", disk.role),
+            ));
+        }
+        for (index, file) in disk.files.iter().enumerate() {
+            if file.format != "raw" && file.format != "qcow2" {
+                return Err(Error::agent(
+                    "install checkpoint",
+                    format!("unsupported checkpoint disk format '{}'", file.format),
+                ));
+            }
+            let expected_target = disk_target(&disk.role, index, &file.format)?;
+            let expected_path = format!("checkpoint/disks/{}/{index}", disk.role);
+            if file.target != expected_target || file.asset.path != expected_path {
+                return Err(Error::agent(
+                    "install checkpoint",
+                    format!(
+                        "invalid checkpoint disk mapping '{} -> {}'",
+                        file.asset.path, file.target
+                    ),
+                ));
+            }
+            if file.format == "raw" && index + 1 != disk.files.len() {
+                return Err(Error::agent(
+                    "install checkpoint",
+                    "a raw disk must terminate its image chain",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_verified(source: &Path, destination: &Path, asset: &CheckpointAsset) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| Error::agent("inspect checkpoint payload", error.to_string()))?;
+    if !metadata.file_type().is_file() || metadata.len() != asset.size {
+        return Err(Error::agent(
+            "verify checkpoint payload",
+            format!("{} has an unexpected type or size", source.display()),
+        ));
+    }
+    let mut input = std::fs::File::open(source)
+        .map_err(|error| Error::agent("open checkpoint payload", error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| Error::agent("read checkpoint payload", error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hex::encode(hasher.finalize()) != asset.sha256 {
+        return Err(Error::agent(
+            "verify checkpoint payload",
+            format!("SHA-256 mismatch for {}", source.display()),
+        ));
+    }
+
+    // The portable restore path only reads these files. Keep an owned hard
+    // link when the extraction cache shares this filesystem instead of writing
+    // another full RAM image per machine; cache eviction unlinks only its name.
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            input
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| Error::agent("rewind checkpoint payload", error.to_string()))?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|error| Error::agent("create checkpoint payload", error.to_string()))?;
+            std::io::copy(&mut input, &mut output)
+                .map_err(|error| Error::agent("copy checkpoint payload", error.to_string()))?;
+            output
+                .sync_all()
+                .map_err(|error| Error::agent("sync checkpoint payload", error.to_string()))?;
+            Ok(())
+        }
+        Err(error) => Err(Error::agent("link checkpoint payload", error.to_string())),
+    }
+}
+
+fn copy_verified_sparse(source: &Path, destination: &Path, asset: &CheckpointAsset) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+    if !metadata.file_type().is_file() || metadata.len() != asset.size {
+        return Err(Error::agent(
+            "verify checkpoint disk",
+            format!("size/type mismatch for {}", source.display()),
+        ));
+    }
+    // Disk assets are already covered by the pack's whole-blob SHA-256. A
+    // second logical-file hash would read every sparse hole and turn a small
+    // qcow2 chain into minutes of CPU work.
+    if !asset.sha256.is_empty() {
+        return Err(Error::agent(
+            "verify checkpoint disk",
+            "sparse disk assets must use container-level integrity",
+        ));
+    }
+    crate::disk_utils::clone_or_copy_file(source, destination)?;
+    std::fs::File::open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| Error::agent("sync checkpoint disk", error.to_string()))?;
+    Ok(())
+}
+
+/// Publish an immutable backing image without copying its sparse address space.
+///
+/// Extracted artifacts and VM data normally share a filesystem, so a hard link
+/// makes even a multi-gigabyte sparse raw backing an O(1) install. The VM owns a
+/// second link after the extraction cache is pruned. Cross-filesystem/private
+/// extraction falls back to the ordinary reflink/sparse-copy path.
+fn link_or_copy_verified_sparse(
+    source: &Path,
+    destination: &Path,
+    asset: &CheckpointAsset,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+    if !metadata.file_type().is_file() || metadata.len() != asset.size {
+        return Err(Error::agent(
+            "verify checkpoint disk",
+            format!("size/type mismatch for {}", source.display()),
+        ));
+    }
+    if !asset.sha256.is_empty() {
+        return Err(Error::agent(
+            "verify checkpoint disk",
+            "sparse disk assets must use container-level integrity",
+        ));
+    }
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            copy_verified_sparse(source, destination, asset)
+        }
+        Err(error) => Err(Error::agent("link checkpoint disk", error.to_string())),
+    }
+}
+
+/// Install an extracted artifact's checkpoint into one machine's private data
+/// directory and mark it for one-shot restore.
+pub fn install(
+    extracted: &Path,
+    vm_data_dir: &Path,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<()> {
+    validate_compatibility(checkpoint)?;
+    validate_disk_manifest(&checkpoint.disks)?;
+    let destination = vm_data_dir.join(INSTALLED_DIR);
+    if destination.exists() {
+        return Err(Error::agent(
+            "install checkpoint",
+            format!("{} already exists", destination.display()),
+        ));
+    }
+    let partial = vm_data_dir.join(format!(".{INSTALLED_DIR}-{}-partial", std::process::id()));
+    let _ = std::fs::remove_dir_all(&partial);
+    std::fs::create_dir(&partial)
+        .map_err(|error| Error::agent("create checkpoint directory", error.to_string()))?;
+
+    let result = (|| -> Result<()> {
+        for (asset, expected) in expected_assets(checkpoint) {
+            if asset.path != expected {
+                return Err(Error::agent(
+                    "install checkpoint",
+                    format!("unexpected checkpoint asset path '{}'", asset.path),
+                ));
+            }
+            let filename = Path::new(expected)
+                .file_name()
+                .expect("fixed checkpoint asset path");
+            copy_verified(&extracted.join(expected), &partial.join(filename), asset)?;
+        }
+
+        let staged_disks = partial.join("disks");
+        std::fs::create_dir(&staged_disks)
+            .map_err(|error| Error::agent("stage checkpoint disks", error.to_string()))?;
+        for disk in &checkpoint.disks {
+            for (index, file) in disk.files.iter().enumerate() {
+                let staged = staged_disks.join(&file.target);
+                let source = extracted.join(&file.asset.path);
+                if index == 0 {
+                    // The active top layer is writable after resume and must
+                    // never alias the immutable extraction cache.
+                    copy_verified_sparse(&source, &staged, &file.asset)?;
+                } else {
+                    // Backings remain immutable. Linking them avoids scanning
+                    // tens of GiB of sparse holes during every import.
+                    link_or_copy_verified_sparse(&source, &staged, &file.asset)?;
+                }
+                if file.format == "qcow2" {
+                    let (backing, _) = inspect_qcow2(&staged)?;
+                    let expected_backing =
+                        disk.files.get(index + 1).map(|next| next.target.as_str());
+                    if backing.as_deref() != expected_backing {
+                        return Err(Error::agent(
+                            "install checkpoint",
+                            format!(
+                                "qcow2 '{}' references {:?}, expected {:?}",
+                                file.target, backing, expected_backing
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        std::fs::write(partial.join(PENDING_MARKER), b"1\n")
+            .map_err(|error| Error::agent("mark checkpoint pending", error.to_string()))?;
+        std::fs::rename(&partial, &destination)
+            .map_err(|error| Error::agent("publish checkpoint", error.to_string()))?;
+
+        // Publish the exact captured block chains into the paths the launcher
+        // attaches. Creation is still private/uncommitted at this point, so a
+        // failure causes the entire machine reservation to be rolled back.
+        for raw_name in [
+            crate::storage::STORAGE_DISK_FILENAME,
+            crate::storage::OVERLAY_DISK_FILENAME,
+        ] {
+            for path in [
+                vm_data_dir.join(raw_name),
+                vm_data_dir.join(Path::new(raw_name).with_extension("qcow2")),
+            ] {
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|error| {
+                        Error::agent("replace checkpoint disk", error.to_string())
+                    })?;
+                }
+            }
+        }
+        for disk in &checkpoint.disks {
+            for file in &disk.files {
+                // The staged chain is already private (top) or has an owned
+                // hard link (immutable backing). Move those exact inodes into
+                // the launcher's disk namespace instead of copying them again.
+                std::fs::rename(
+                    destination.join("disks").join(&file.target),
+                    vm_data_dir.join(&file.target),
+                )
+                .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
+            }
+            std::fs::write(vm_data_dir.join(format!("{}.formatted", disk.role)), b"1").map_err(
+                |error| Error::agent("mark checkpoint disk formatted", error.to_string()),
+            )?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&partial);
+        let _ = std::fs::remove_dir_all(&destination);
+    }
+    result
+}
+
+/// Return the pending one-shot checkpoint directory for a machine, if any.
+pub fn pending_dir(vm_data_dir: &Path) -> Option<PathBuf> {
+    let dir = vm_data_dir.join(INSTALLED_DIR);
+    let marker = dir.join(PENDING_MARKER);
+    if marker.is_file()
+        && dir.join("checkpoint.bin").is_file()
+        && dir.join("memory.bin").is_file()
+        && dir.join("manifest.bin").is_file()
+    {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Consume a successfully restored checkpoint so later starts cold-boot from
+/// the machine's current disks rather than replaying stale live state.
+pub fn consume(vm_data_dir: &Path) -> Result<()> {
+    let Some(dir) = pending_dir(vm_data_dir) else {
+        return Ok(());
+    };
+    std::fs::remove_file(dir.join(PENDING_MARKER))
+        .map_err(|error| Error::agent("consume checkpoint", error.to_string()))?;
+    if let Err(error) = std::fs::remove_dir_all(&dir) {
+        tracing::warn!(path = %dir.display(), %error, "checkpoint consumed but payload cleanup failed");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_verifies_and_consumes_checkpoint() {
+        let extracted = tempfile::tempdir().unwrap();
+        let source = extracted.path().join(ASSET_DIR);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("checkpoint.bin"), b"state").unwrap();
+        std::fs::write(source.join("memory.bin"), b"memory").unwrap();
+        std::fs::write(source.join("manifest.bin"), b"layout").unwrap();
+        for role in ["storage", "overlay"] {
+            let disk_dir = source.join("disks").join(role);
+            std::fs::create_dir_all(&disk_dir).unwrap();
+            std::fs::write(disk_dir.join("0"), format!("{role}-disk")).unwrap();
+        }
+        let disk = |role: &str, target: &str| CheckpointDisk {
+            role: role.to_string(),
+            files: vec![CheckpointDiskFile {
+                asset: CheckpointAsset {
+                    path: format!("checkpoint/disks/{role}/0"),
+                    size: std::fs::metadata(source.join("disks").join(role).join("0"))
+                        .unwrap()
+                        .len(),
+                    sha256: String::new(),
+                },
+                target: target.to_string(),
+                format: "raw".to_string(),
+            }],
+        };
+        let metadata = PortableCheckpointManifest {
+            version: FORMAT_VERSION,
+            runtime_abi: RUNTIME_ABI.to_string(),
+            host_platform: crate::platform::Platform::current()
+                .host_oci_platform()
+                .to_string(),
+            cpu_fingerprint: cpu_fingerprint().unwrap(),
+            cpus: 2,
+            memory_mib: 512,
+            device_profile: DEVICE_PROFILE.to_string(),
+            state: describe_asset(&source.join("checkpoint.bin"), "checkpoint/checkpoint.bin")
+                .unwrap(),
+            memory: describe_asset(&source.join("memory.bin"), "checkpoint/memory.bin").unwrap(),
+            layout: describe_asset(&source.join("manifest.bin"), "checkpoint/manifest.bin")
+                .unwrap(),
+            disks: vec![
+                disk("storage", "storage.raw"),
+                disk("overlay", "overlay.raw"),
+            ],
+        };
+        let machine = tempfile::tempdir().unwrap();
+        install(extracted.path(), machine.path(), &metadata).unwrap();
+        assert!(pending_dir(machine.path()).is_some());
+        assert_eq!(
+            std::fs::read(machine.path().join("storage.raw")).unwrap(),
+            b"storage-disk"
+        );
+        assert_eq!(
+            std::fs::read(machine.path().join("overlay.raw")).unwrap(),
+            b"overlay-disk"
+        );
+        assert!(machine.path().join("storage.formatted").is_file());
+        assert!(machine.path().join("overlay.formatted").is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(source.join("memory.bin")).unwrap().ino(),
+                std::fs::metadata(machine.path().join(INSTALLED_DIR).join("memory.bin"))
+                    .unwrap()
+                    .ino()
+            );
+        }
+        consume(machine.path()).unwrap();
+        assert!(pending_dir(machine.path()).is_none());
+        assert_eq!(
+            std::fs::read(machine.path().join("storage.raw")).unwrap(),
+            b"storage-disk"
+        );
+
+        let mut oversized = metadata.clone();
+        oversized.memory.size =
+            u64::from(oversized.memory_mib) * 1024 * 1024 + 2 * 1024 * 1024 * 1024 + 1;
+        assert!(validate_compatibility(&oversized).is_err());
+
+        let mut incompatible = metadata;
+        incompatible.runtime_abi.push_str("-other");
+        assert!(validate_compatibility(&incompatible).is_err());
+    }
+}

@@ -592,8 +592,9 @@ pub struct CreateMachineRequest {
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
-    /// Path to a .smolmachine sidecar file. Creates the machine from pre-packed
-    /// layers instead of pulling from a registry. Mutually exclusive with `image`.
+    /// Path to a `.smolmachine` or `.smolcheckpoint` artifact. Creates from
+    /// pre-packed layers or restores the artifact's captured live state.
+    /// Mutually exclusive with `image`.
     #[serde(default)]
     pub from: Option<String>,
     /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").

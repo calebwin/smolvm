@@ -331,6 +331,70 @@ pub enum PackMode {
     Vm,
 }
 
+/// One integrity-protected file belonging to a portable live checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointAsset {
+    /// Relative path within the artifact assets.
+    pub path: String,
+    /// Uncompressed byte length.
+    pub size: u64,
+    /// Lowercase SHA-256 digest of the file contents. Empty for sparse block
+    /// files whose integrity is provided by the pack container checksum.
+    pub sha256: String,
+}
+
+/// One file in a checkpoint's portable block-image chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointDiskFile {
+    /// Integrity metadata and artifact-relative source path.
+    pub asset: CheckpointAsset,
+    /// Safe filename installed in the machine data directory.
+    pub target: String,
+    /// `raw` or `qcow2`.
+    pub format: String,
+}
+
+/// An exact block-image chain captured for one virtual disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointDisk {
+    /// Stable disk role: `storage` or `overlay`.
+    pub role: String,
+    /// Ordered top-to-base chain. The first file is the disk attached to the VM.
+    pub files: Vec<CheckpointDiskFile>,
+}
+
+/// Compatibility and payload metadata for a portable live checkpoint.
+///
+/// The pack container itself is portable storage; live CPU/device state is
+/// deliberately accepted only by a runtime with the same checkpoint ABI,
+/// architecture, CPU contract, and device profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortableCheckpointManifest {
+    /// Version of this metadata contract.
+    pub version: u32,
+    /// Exact libkrun checkpoint-state ABI required by this artifact.
+    pub runtime_abi: String,
+    /// Host OS and architecture that captured the live state.
+    pub host_platform: String,
+    /// Hash of the host CPU virtualization feature contract.
+    pub cpu_fingerprint: String,
+    /// Number of virtual CPUs in the captured machine.
+    pub cpus: u8,
+    /// Configured guest memory in MiB.
+    pub memory_mib: u32,
+    /// Stable identifier for the captured virtual device topology.
+    pub device_profile: String,
+    /// Serialized VM, vCPU, and device state.
+    pub state: CheckpointAsset,
+    /// Eager guest-memory image.
+    pub memory: CheckpointAsset,
+    /// Guest physical-memory layout manifest.
+    pub layout: CheckpointAsset,
+    /// Exact block-image chains from the same paused boundary as RAM.
+    #[serde(default)]
+    pub disks: Vec<CheckpointDisk>,
+}
+
 /// Manifest describing the packed image and configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackManifest {
@@ -416,6 +480,10 @@ pub struct PackManifest {
 
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
+
+    /// Live execution state when this artifact is a `.smolcheckpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<PortableCheckpointManifest>,
 }
 
 /// Inventory of assets included in the packed binary.
@@ -521,6 +589,7 @@ impl PackManifest {
                 overlay_template: None,
                 overlay_logical_size: None,
             },
+            checkpoint: None,
         }
     }
 

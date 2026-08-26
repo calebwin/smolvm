@@ -334,6 +334,9 @@ pub enum MachineCmd {
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
+    /// Save a running machine, including RAM, as a portable checkpoint
+    Checkpoint(super::pack::CheckpointCmd),
+
     /// Assign parameters and release one held fork-pool slot
     ForkRelease(ForkReleaseCmd),
 
@@ -410,6 +413,7 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::Checkpoint(cmd) => cmd.run(),
             MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -3129,8 +3133,7 @@ pub struct CreateCmd {
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
 
-    /// Create machine from a packed .smolmachine artifact.
-    /// Uses pre-extracted layers instead of pulling from a registry.
+    /// Create from a `.smolmachine` pack or restore a `.smolcheckpoint`.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
 
@@ -3323,6 +3326,36 @@ impl CreateCmd {
         // Read manifest from the sidecar to get image metadata.
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
+        let checkpoint = manifest.checkpoint.clone();
+        if let Some(ref checkpoint) = checkpoint {
+            smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
+            let topology_overridden = !self.volume.is_empty()
+                || !self.port.is_empty()
+                || self.net
+                || self.net_backend.is_some()
+                || self.dns.is_some()
+                || self.network_name.is_some()
+                || !self.allow_cidr.is_empty()
+                || !self.allow_host.is_empty()
+                || self.outbound_localhost_only
+                || self.gpu
+                || self.gpu_vram_mib.is_some()
+                || self.rosetta
+                || !self.expose_socket.is_empty()
+                || !self.mount_socket.is_empty()
+                || self.ssh_agent
+                || self.cuda
+                || self.auto_graph
+                || self.docker_socket
+                || self.storage.is_some()
+                || self.overlay.is_some();
+            if topology_overridden {
+                return Err(smolvm::Error::config(
+                    "create from .smolcheckpoint",
+                    "a live checkpoint must restore its captured CPU, memory, disk, and device topology; topology-changing create flags are not supported",
+                ));
+            }
+        }
 
         // Reject a cross-architecture artifact up front: a packed VM/image carries
         // native binaries and cannot boot under a different-arch guest kernel. Only
@@ -3346,7 +3379,8 @@ impl CreateCmd {
             overlay_logical_size: Option<u64>,
             storage_logical_size: Option<u64>,
         }
-        let vm_seed = if manifest.mode == smolvm_pack::format::PackMode::Vm {
+        let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
+        {
             Some(VmModeSeed {
                 overlay_template: manifest
                     .assets
@@ -3391,6 +3425,17 @@ impl CreateCmd {
         } else {
             manifest.mem
         };
+        if let Some(ref checkpoint) = checkpoint {
+            if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
+                return Err(smolvm::Error::config(
+                    "create from .smolcheckpoint",
+                    format!(
+                        "checkpoint requires {} vCPU(s) and {} MiB memory (requested {cpus} and {mem})",
+                        checkpoint.cpus, checkpoint.memory_mib
+                    ),
+                ));
+            }
+        }
 
         let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr.clone(),
@@ -3428,7 +3473,7 @@ impl CreateCmd {
             // label would make exec/start/re-pack treat it as a pullable image
             // (the /bin/sh-not-found bug). None routes every `image.is_some()`
             // consumer to VM behavior; provenance is in `source_smolmachine`.
-            image: if vm_seed.is_some() {
+            image: if vm_seed.is_some() || checkpoint.is_some() {
                 None
             } else {
                 Some(manifest.image)
@@ -3478,7 +3523,9 @@ impl CreateCmd {
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
             cuda: self.cuda || self.auto_graph,
-            forkable: false,
+            // A restored durable checkpoint remains eligible to become a new
+            // fork/checkpoint source without a topology-changing restart.
+            forkable: checkpoint.is_some(),
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
@@ -3487,7 +3534,13 @@ impl CreateCmd {
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
-            source_smolmachine: Some(canonical_path),
+            // A live checkpoint uses the pack only as a transport envelope.
+            // Its block devices and running guest state are restored from the
+            // checkpoint payload, so treating the artifact as an OCI-layer
+            // source would attach an extra virtiofs device and change the
+            // captured device topology. The payload is private to the machine
+            // after install and no longer depends on the original artifact.
+            source_smolmachine: checkpoint.is_none().then_some(canonical_path),
         };
 
         let resources = VmResources {
@@ -3512,7 +3565,13 @@ impl CreateCmd {
             params.port.len(),
         )?;
 
-        let record = vm_common::build_vm_record(&params)?;
+        let mut record = vm_common::build_vm_record(&params)?;
+        if checkpoint.is_some() {
+            // The restored RAM already contains the initialized guest and its
+            // running workload. Re-running image pull/init after resume would
+            // duplicate side effects and violate checkpoint semantics.
+            record.init_completed = true;
+        }
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 
         // Create the machine data dir while the DB reservation is held, then
@@ -3598,6 +3657,14 @@ impl CreateCmd {
                     },
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
+            }
+
+            if let Some(ref checkpoint) = checkpoint {
+                smolvm::portable_checkpoint::install(
+                    &pack_content_dir,
+                    &smolvm::agent::vm_data_dir(&name_for_layers),
+                    checkpoint,
+                )?;
             }
 
             reservation.commit(&record)?;

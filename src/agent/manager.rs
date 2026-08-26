@@ -1780,6 +1780,28 @@ impl AgentManager {
         // Wait for the agent to be ready
         match self.wait_for_ready() {
             Ok(_) => {
+                // Restoring the same RAM state after this VM has mutated its
+                // disks would be inconsistent. Consume the private payload as
+                // soon as the restored agent is proven ready; later starts are
+                // ordinary cold boots from the machine's current disks.
+                if let Some(name) = self.name() {
+                    if let Err(error) = crate::portable_checkpoint::consume(&vm_data_dir(name)) {
+                        let _ = process::stop_vm_process(
+                            child_pid,
+                            AGENT_STOP_TIMEOUT,
+                            process::VM_SIGKILL_TIMEOUT,
+                        );
+                        let _ = std::fs::remove_file(&self.pid_file);
+                        let mut inner = self.inner.lock();
+                        inner.state = AgentState::Stopped;
+                        inner.child = None;
+                        #[cfg(unix)]
+                        {
+                            inner.vm_lock_handle = None;
+                        }
+                        return Err(error);
+                    }
+                }
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
                 let boot_secs = boot_start.elapsed().as_secs_f64();
@@ -1868,6 +1890,19 @@ impl AgentManager {
         use super::boot_config::BootConfig;
 
         let t_launch = Instant::now();
+
+        // A machine created from a `.smolcheckpoint` carries a private,
+        // one-shot restore directory in its data dir. Discover it centrally so
+        // CLI, API, SDK, implicit exec starts, and restart paths cannot drift.
+        // An explicit live-fork snapshot always wins.
+        if features.snapshot_dir.is_none() {
+            if let Some(name) = self.name() {
+                if let Some(snapshot) = crate::portable_checkpoint::pending_dir(&vm_data_dir(name))
+                {
+                    features.snapshot_dir = Some(snapshot);
+                }
+            }
+        }
 
         // A privileged node drops each VMM to a distinct uid. Start the shared
         // CUDA daemon while this manager still has access to the node data dir;
