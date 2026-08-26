@@ -218,6 +218,35 @@ fn parse_pack_version(version: &str) -> Option<((u64, u64, u64), bool)> {
     Some(((major, minor, patch), is_release))
 }
 
+/// Report a fallback to host-side extraction and what it costs.
+///
+/// Silent unless the fallback actually changes something: a root host extracts
+/// on its own account, and a pack carrying no layer tars has nothing to stage.
+/// Extracting here is what every smolvm did before staging existed, so the pack
+/// still runs — but the ownership it loses is invisible at extraction time and
+/// resurfaces much later as a service that cannot read its own data directory.
+fn warn_if_host_extracting_for_an_old_pack(
+    cache_dir: &Path,
+    guest_unpacks_layers: bool,
+    pack_version: Option<&str>,
+) {
+    if guest_unpacks_layers || host_unpack_preserves_ownership() || !has_layer_tars(cache_dir) {
+        return;
+    }
+    eprintln!(
+        "warning: this pack was built by smolvm {}, whose in-guest agent cannot unpack \
+         staged layers; extracting them on the host instead.\n\
+         warning: file ownership inside the machine will follow the current user rather \
+         than the image. Re-pack with smolvm {}.{}.{} or later to restore it.",
+        pack_version
+            .filter(|v| !v.is_empty())
+            .unwrap_or("an unknown version"),
+        MIN_STAGED_LAYERS_VERSION.0,
+        MIN_STAGED_LAYERS_VERSION.1,
+        MIN_STAGED_LAYERS_VERSION.2,
+    );
+}
+
 /// Files larger than this threshold are extracted with a sparse write
 /// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
 /// dense sequential write.  Chosen to match typical overlay disk sizes while
@@ -1404,24 +1433,7 @@ fn extract_sidecar_inner(
 
     let pack_version = manifest.as_ref().map(|m| m.smolvm_version.as_str());
     let guest_unpacks_layers = pack_version.is_some_and(packed_agent_unpacks_staged_layers);
-    if !guest_unpacks_layers && !host_unpack_preserves_ownership() && has_layer_tars(cache_dir) {
-        // Extracting here is what every smolvm did before staging existed, so
-        // the pack runs exactly as it always has. Say why anyway: the ownership
-        // this loses is silent at extraction time and only shows up later as a
-        // service that cannot read its own data directory.
-        eprintln!(
-            "warning: this pack was built by smolvm {}, whose in-guest agent cannot unpack \
-             staged layers; extracting them on the host instead.\n\
-             warning: file ownership inside the machine will follow the current user rather \
-             than the image. Re-pack with smolvm {}.{}.{} or later to restore it.",
-            pack_version
-                .filter(|v| !v.is_empty())
-                .unwrap_or("an unknown version"),
-            MIN_STAGED_LAYERS_VERSION.0,
-            MIN_STAGED_LAYERS_VERSION.1,
-            MIN_STAGED_LAYERS_VERSION.2,
-        );
-    }
+    warn_if_host_extracting_for_an_old_pack(cache_dir, guest_unpacks_layers, pack_version);
 
     post_process_extraction(cache_dir, &layer_order, guest_unpacks_layers, debug)?;
     Ok(())
@@ -1466,11 +1478,18 @@ pub fn extract_from_binary(
             eprintln!("debug: extracted assets to {}", cache_dir.display());
         }
 
-        // Embedded self-exec stub: no separate sidecar manifest to source layer
-        // order from here, so let the agent fall back to a name sort. The stub
-        // and the agent it carries were built by the same release, so staging
-        // can never outrun the agent the way a sidecar from another version can.
-        post_process_extraction(cache_dir, &[], true, debug)?;
+        // No separate sidecar manifest to source layer order from here, so the
+        // agent falls back to a name sort.
+        //
+        // A self-exec stub carries an agent from its own release and could just
+        // assume staging is safe. The version is read from the binary anyway:
+        // this takes an arbitrary `exe_path`, and an assumption about who built
+        // it fails as an unbootable machine the moment it stops holding.
+        let manifest = crate::packer::read_manifest(exe_path).ok();
+        let pack_version = manifest.as_ref().map(|m| m.smolvm_version.as_str());
+        let guest_unpacks_layers = pack_version.is_some_and(packed_agent_unpacks_staged_layers);
+        warn_if_host_extracting_for_an_old_pack(cache_dir, guest_unpacks_layers, pack_version);
+        post_process_extraction(cache_dir, &[], guest_unpacks_layers, debug)?;
         Ok(())
     }
 }
