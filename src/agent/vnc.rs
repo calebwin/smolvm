@@ -404,13 +404,23 @@ impl Stats {
     /// tests do not mutate process-wide state that other tests are reading
     /// concurrently.
     ///
-    /// A value containing '/' names a file to append to; anything else
-    /// reports through tracing. The file form matters because the VNC
-    /// server runs inside the `_boot-vm` child, whose stdout and stderr
-    /// are /dev/null unless SMOLVM_BOOT_DEBUG is set — the same reason
-    /// `SMOLVM_DISPLAY_TRACE` takes a path rather than a flag.
+    /// A bare on-switch ("1", "true", "yes", "on") reports through tracing;
+    /// any other value names a file to append to. Deliberately not "does it
+    /// look like a path" — a Windows path holds no '/', so that test would
+    /// silently drop the file and leave the operator with nothing.
+    ///
+    /// The file form matters because the VNC server runs inside the
+    /// `_boot-vm` child, whose stdout and stderr are /dev/null unless
+    /// SMOLVM_BOOT_DEBUG is set — the same reason `SMOLVM_DISPLAY_TRACE`
+    /// takes a path rather than a flag.
     fn from_setting(setting: Option<&str>) -> Self {
-        let sink = setting.filter(|v| v.contains('/')).and_then(|path| {
+        let names_a_file = |v: &&str| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "1" | "true" | "yes" | "on"
+            )
+        };
+        let sink = setting.filter(names_a_file).and_then(|path| {
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -1048,6 +1058,30 @@ mod tests {
         // Counters reset, but the sink stays open across reports.
         assert_eq!(s.frames, 0);
         assert!(s.sink.is_some());
+    }
+
+    #[test]
+    fn a_bare_switch_reports_without_opening_a_file() {
+        for on in ["1", "true", "YES", "on"] {
+            let s = Stats::from_setting(Some(on));
+            assert_eq!(s.report_every, Duration::from_secs(2), "{on} should enable");
+            assert!(s.sink.is_none(), "{on} is a switch, not a filename");
+        }
+    }
+
+    #[test]
+    fn a_windows_style_path_still_names_a_file() {
+        // A path test based on '/' would treat this as a switch and silently
+        // report nowhere, since the boot child's stdout is discarded.
+        let dir = std::env::temp_dir().join("smolvm-vnc-stats-win");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.log");
+        let backslashed = path.to_string_lossy().replace('/', "\\");
+        let s = Stats::from_setting(Some(&backslashed));
+        assert_eq!(s.report_every, Duration::from_secs(2));
+        // On unix the backslash form is just an odd filename, which is still
+        // the point: anything that is not a switch must open a file.
+        assert!(s.sink.is_some(), "a non-switch value must open a sink");
     }
 
     #[test]
