@@ -18,6 +18,7 @@ pub mod state_probe;
 pub mod terminal;
 pub mod vnc;
 mod vsock_service;
+mod websocket;
 
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;

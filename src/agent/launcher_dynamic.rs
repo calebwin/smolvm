@@ -294,9 +294,11 @@ pub fn launch_agent_vm_dynamic(
                                     }
                                 };
                                 match crate::agent::vnc::serve(&bind, framebuffer, input) {
-                                    Ok(addr) => {
-                                        tracing::info!(%addr, "vnc server listening")
-                                    }
+                                    Ok(addr) => tracing::info!(
+                                        %addr,
+                                        url = %crate::agent::vnc::browser_url(addr),
+                                        "vnc server listening"
+                                    ),
                                     // A failed viewer must not take down the
                                     // VM; the display works without it.
                                     Err(e) => tracing::warn!(

@@ -212,6 +212,21 @@ impl DisplayFramebuffer {
         }
     }
 
+    /// A framebuffer already holding one presented frame, so viewer tests
+    /// have something to serve without a guest behind them.
+    #[cfg(test)]
+    pub(crate) fn with_presented_frame(width: u32, height: u32, pixel: [u8; 4]) -> Self {
+        let fb = Self::new();
+        {
+            let mut front = fb.front.lock().unwrap();
+            front.buf = pixel.repeat((width * height) as usize);
+            front.width = width;
+            front.height = height;
+            front.generation = 1;
+        }
+        fb
+    }
+
     /// Block until a frame newer than `since` is presented, or `timeout`
     /// elapses. Returns the frame if one arrived.
     pub fn wait_for_frame(&self, since: u64, timeout: std::time::Duration) -> Option<Frame> {

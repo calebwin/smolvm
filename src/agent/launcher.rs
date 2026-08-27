@@ -913,7 +913,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         }
                     };
                     match super::vnc::serve(&bind, framebuffer, input) {
-                        Ok(addr) => tracing::info!(%addr, "vnc server listening"),
+                        Ok(addr) => tracing::info!(
+                            %addr,
+                            url = %super::vnc::browser_url(addr),
+                            "vnc server listening"
+                        ),
                         Err(e) => {
                             // A failed viewer must not take down the VM: the
                             // display itself is already working without it.
