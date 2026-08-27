@@ -351,11 +351,10 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if !vm.mounts.is_empty() {
         unsupported.push("host mounts");
     }
-    // Patched (calebwin/smolvm): plain virtio-net attachment and an
-    // image-backed rootfs are both re-established at restore time from the
-    // manifest, not bit-for-bit serialized, so they don't actually need this
-    // gate. Port-forwarding rules specifically are still unverified, so keep
-    // rejecting those.
+    // Patched (calebwin/smolvm): plain virtio-net attachment is
+    // re-established at restore time from the manifest, not bit-for-bit
+    // serialized, so it doesn't actually need this gate. Port-forwarding
+    // rules specifically are still unverified, so keep rejecting those.
     if !vm.ports.is_empty() {
         unsupported.push("port forwarding");
     }
@@ -379,6 +378,9 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     }
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
+    }
+    if vm.image.is_some() {
+        unsupported.push("image-backed rootfs (overlay disk is not yet restored -- see calebwin/smolvm#1)");
     }
     if unsupported.is_empty() {
         return Ok(());
