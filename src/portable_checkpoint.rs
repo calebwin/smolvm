@@ -351,8 +351,13 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if !vm.mounts.is_empty() {
         unsupported.push("host mounts");
     }
-    if !vm.ports.is_empty() || vm.network {
-        unsupported.push("network/port forwarding");
+    // Patched (calebwin/smolvm): plain virtio-net attachment and an
+    // image-backed rootfs are both re-established at restore time from the
+    // manifest, not bit-for-bit serialized, so they don't actually need this
+    // gate. Port-forwarding rules specifically are still unverified, so keep
+    // rejecting those.
+    if !vm.ports.is_empty() {
+        unsupported.push("port forwarding");
     }
     if !vm.published_sockets.is_empty() {
         unsupported.push("published sockets");
@@ -374,9 +379,6 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     }
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
-    }
-    if vm.image.is_some() {
-        unsupported.push("image-backed rootfs");
     }
     if unsupported.is_empty() {
         return Ok(());
