@@ -3511,8 +3511,20 @@ impl CreateCmd {
             // label would make exec/start/re-pack treat it as a pullable image
             // (the /bin/sh-not-found bug). None routes every `image.is_some()`
             // consumer to VM behavior; provenance is in `source_smolmachine`.
-            image: if vm_seed.is_some() || checkpoint.is_some() {
+            //
+            // A live checkpoint is different: `init_completed` (set below) is
+            // what actually suppresses re-pull/re-init on the restored
+            // record's own boot, so `image` is free to carry the captured
+            // machine's real OCI reference (`checkpoint.image_ref`, `None`
+            // for a checkpoint of a bare VM). Every other `image.is_some()`
+            // consumer -- exec, interactive, cp, status -- needs it to route
+            // into the restored container's rootfs instead of the bare agent
+            // VM; nulling it here (as a VM-mode pack correctly does) silently
+            // stranded every file the checkpoint had actually restored.
+            image: if vm_seed.is_some() {
                 None
+            } else if let Some(ref checkpoint) = checkpoint {
+                checkpoint.image_ref.clone()
             } else {
                 Some(manifest.image)
             },
@@ -3604,11 +3616,23 @@ impl CreateCmd {
         )?;
 
         let mut record = vm_common::build_vm_record(&params)?;
-        if checkpoint.is_some() {
+        if let Some(ref checkpoint) = checkpoint {
             // The restored RAM already contains the initialized guest and its
             // running workload. Re-running image pull/init after resume would
             // duplicate side effects and violate checkpoint semantics.
             record.init_completed = true;
+            // The container/overlay directory inside the restored storage disk
+            // was created under the SOURCE machine's persistent-overlay owner
+            // name (its own name, or its root golden's). A restore under a
+            // different --name must keep addressing that owner exactly like a
+            // fork clone addresses its golden's overlay -- otherwise exec/cp/
+            // interactive would silently open a fresh, empty overlay instead
+            // of the one the checkpoint actually restored.
+            if let Some(ref owner) = checkpoint.overlay_owner {
+                if owner != &name_for_layers {
+                    record.fork_overlay_owner = Some(owner.clone());
+                }
+            }
         }
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 

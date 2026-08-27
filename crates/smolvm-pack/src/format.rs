@@ -393,6 +393,34 @@ pub struct PortableCheckpointManifest {
     /// Exact block-image chains from the same paused boundary as RAM.
     #[serde(default)]
     pub disks: Vec<CheckpointDisk>,
+    /// The captured machine's OCI image reference, if it was image-backed.
+    /// `None` for a bare (non-image) VM checkpoint.
+    ///
+    /// The restored record's own `image` field is deliberately left as this
+    /// exact value (not nulled): `init_completed` is what actually suppresses
+    /// re-pull/re-init on the restored machine's next `start`, so `image`
+    /// stays available for every OTHER `image.is_some()` consumer -- exec,
+    /// interactive, cp, status -- which need it to route into the restored
+    /// container's rootfs instead of the bare agent VM. Carried as its own
+    /// field rather than reusing `PackManifest.image`, which stays the
+    /// synthetic `vm://<name>` placeholder for every checkpoint, matching
+    /// VM-mode packs.
+    #[serde(default)]
+    pub image_ref: Option<String>,
+    /// The captured machine's persistent-overlay owner: its own name, or its
+    /// root golden's name if it was itself a fork clone at capture time.
+    /// `None` for a bare (non-image) machine, which has no persistent-overlay
+    /// container.
+    ///
+    /// The container filesystem paths inside the restored storage disk (e.g.
+    /// `/storage/overlays/persistent-<owner>/...`) were baked in at capture
+    /// time under this owner's name and do not follow a `create --from`
+    /// rename. A restore under a different `--name` must set the new
+    /// record's `fork_overlay_owner` to this value so
+    /// `persistent_overlay_owner_with_lineage` keeps addressing the same
+    /// directory -- exactly how a fork clone addresses its golden's overlay.
+    #[serde(default)]
+    pub overlay_owner: Option<String>,
 }
 
 /// Manifest describing the packed image and configuration.

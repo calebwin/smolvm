@@ -265,6 +265,16 @@ pub fn capture_to_path(
             "checkpoint/manifest.bin",
         )?,
         disks: checkpoint_disks,
+        image_ref: vm.image.clone(),
+        // Only an image-backed machine has a persistent-overlay container to
+        // re-address after a rename; a bare VM checkpoint carries no owner.
+        overlay_owner: vm.image.as_ref().map(|_| {
+            crate::workload::persistent_overlay_owner_with_lineage(
+                name,
+                vm.golden.as_deref(),
+                vm.fork_overlay_owner.as_deref(),
+            )
+        }),
     });
     manifest.assets = collector.into_inventory();
 
@@ -379,9 +389,17 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
     }
-    if vm.image.is_some() {
-        unsupported.push("image-backed rootfs (overlay disk is not yet restored -- see calebwin/smolvm#1)");
-    }
+    // Patched (calebwin/smolvm#1): an image-backed rootfs used to be rejected
+    // here because `create --from` nulled out the restored record's `image`
+    // field entirely, which silently broke every `image.is_some()` consumer
+    // (`machine exec`, interactive, cp, status) -- they'd address the bare
+    // agent VM instead of the restored container, making every file the
+    // checkpoint had actually captured look "gone". The disk/memory capture
+    // and restore were always byte-correct; see `PortableCheckpointManifest`'s
+    // `image_ref`/`overlay_owner` and their use in `cli::machine::CreateCmd::
+    // run_from_smolmachine` for the real fix (also carries the persistent-
+    // overlay owner across a restore-time rename via `fork_overlay_owner`,
+    // the same mechanism a fork clone uses to address its golden's overlay).
     if unsupported.is_empty() {
         return Ok(());
     }
@@ -1122,6 +1140,8 @@ mod tests {
                 disk("storage", "storage.raw"),
                 disk("overlay", "overlay.raw"),
             ],
+            image_ref: None,
+            overlay_owner: None,
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
