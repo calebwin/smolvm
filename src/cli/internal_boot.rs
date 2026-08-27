@@ -209,6 +209,20 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let pod_net_launch: Option<smolvm::agent::pod_net::PodNetLaunch> = None;
 
+    // Encoded video uses an external ffmpeg process so smolvm neither links
+    // nor bundles codec libraries. Start its broker before the parent's uid
+    // drop and Landlock/seccomp; the broker independently drops to the same
+    // per-VM uid; hardware modes retain only render/video device groups while
+    // software mode retains none. Any failure leaves Raw VNC intact.
+    if std::env::var_os("SMOLVM_VIDEO").is_some()
+        && std::env::var_os("SMOLVM_DISPLAY").is_some()
+        && std::env::var_os("SMOLVM_VNC").is_some()
+    {
+        if let Err(e) = smolvm::agent::video::prestart_helper() {
+            eprintln!("[video] encoder unavailable; using Raw VNC: {e}");
+        }
+    }
+
     // Drop to an unprivileged uid before touching the guest, so a guest→VMM
     // escape can't signal/ptrace the supervisor or neighbor VMs nor reach
     // root-owned host files. Gated by SMOLVM_VM_UID (+ optional SMOLVM_VM_GID,

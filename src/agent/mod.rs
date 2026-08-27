@@ -16,6 +16,7 @@ mod manager;
 pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
+pub mod video;
 pub mod vnc;
 mod vsock_service;
 mod websocket;

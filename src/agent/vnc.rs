@@ -275,6 +275,18 @@ fn serve_http(
     };
 
     if let Some(key) = request.websocket_key.as_deref() {
+        let route = request.path.as_str();
+        if route != "/websockify" && route != "/video" {
+            return respond(&mut s, "404 Not Found", "text/plain", b"not found");
+        }
+        if route == "/video" && !super::video::is_available() {
+            return respond(
+                &mut s,
+                "503 Service Unavailable",
+                "text/plain",
+                b"encoded video unavailable",
+            );
+        }
         let mut reply = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\
              Upgrade: websocket\r\n\
@@ -289,6 +301,10 @@ fn serve_http(
         }
         reply.push_str("\r\n");
         s.write_all(reply.as_bytes())?;
+        if route == "/video" {
+            tracing::info!("encoded video browser client connected");
+            return super::video::serve_browser(super::websocket::WsStream::new(s), fb);
+        }
         tracing::info!("vnc browser client connected");
         return handle_client(super::websocket::WsStream::new(s), fb, input);
     }
@@ -895,6 +911,8 @@ mod tests {
         // in a browser, long after the build went green.
         assert!(CLIENT_HTML.starts_with("<!doctype html>"));
         assert!(CLIENT_HTML.contains("/websockify"));
+        assert!(CLIENT_HTML.contains("/video"));
+        assert!(CLIENT_HTML.contains("VideoDecoder"));
         assert!(CLIENT_HTML.trim_end().ends_with("</html>"));
     }
 
@@ -1008,6 +1026,22 @@ mod tests {
         let mut reply = Vec::new();
         s.read_to_end(&mut reply).unwrap();
         assert!(String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn video_upgrade_without_a_prestarted_helper_is_503() {
+        // Encoded video is optional. A page receiving this response starts
+        // Raw RFB on its already-established input/display connection.
+        assert!(std::env::var_os("SMOLVM_VIDEO_SOCKET").is_none());
+        let mut s = connect(serve_a_test_desktop());
+        s.write_all(
+            b"GET /video HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .unwrap();
+        let mut reply = Vec::new();
+        s.read_to_end(&mut reply).unwrap();
+        assert!(String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 503"));
     }
 
     /// The client half of a WebSocket: masks what it writes, unmasks what it

@@ -212,6 +212,16 @@ impl DisplayFramebuffer {
         }
     }
 
+    /// Generation of the most recently presented frame, or zero before the
+    /// first present.  Video pacing uses this cheap check to avoid cloning a
+    /// full framebuffer when an idle desktop has not changed.
+    pub fn current_generation(&self) -> u64 {
+        self.front
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
     /// A framebuffer already holding one presented frame, so viewer tests
     /// have something to serve without a guest behind them.
     #[cfg(test)]

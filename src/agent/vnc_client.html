@@ -28,6 +28,7 @@ const ctx = canvas.getContext("2d", { alpha: false });
 const statusEl = document.getElementById("status");
 
 let fbWidth = 0, fbHeight = 0, buttonMask = 0;
+let rawStarted = false, videoStarted = false, videoSocket = null, decoder = null;
 
 function setStatus(text, isError) {
   statusEl.textContent = text;
@@ -112,12 +113,33 @@ async function session() {
   clearStatus();
   canvas.focus();
 
-  // Ask for DesktopSize so a guest mode change resizes us instead of
-  // silently cropping, plus Raw — the only encoding this server emits.
+  // Keep RFB connected for keyboard and pointer input in both modes.  A
+  // second WebSocket carries encoded H.264 when the browser and host support
+  // it; otherwise this same session falls back to ordinary Raw rectangles.
   const enc = new Uint8Array(12);
   enc[0] = 2; putU16(enc, 2, 2); putI32(enc, 4, -223); putI32(enc, 8, 0);
   send(enc);
 
+  if ("VideoDecoder" in window) {
+    try {
+      await startVideo();
+      return;
+    } catch (e) {
+      console.info("encoded video unavailable; using Raw RFB", e);
+    }
+  }
+  startRaw();
+}
+
+function startRaw() {
+  if (rawStarted) return;
+  rawStarted = true;
+  if (videoSocket) { videoSocket.onclose = null; videoSocket.close(); }
+  if (decoder) { try { decoder.close(); } catch (_) {} decoder = null; }
+  rawLoop().catch((e) => setStatus(String(e && e.message || e), true));
+}
+
+async function rawLoop() {
   requestUpdate(false);
   for (;;) {
     const type = (await recv(1))[0];
@@ -138,6 +160,74 @@ async function session() {
     }
     requestUpdate(true);
   }
+}
+
+// H.264 access units arrive in Annex-B form, one per WebSocket message.  With
+// no AVCDecoderConfigurationRecord in `description`, WebCodecs interprets AVC
+// chunks as Annex-B, so SPS/PPS stay in-band and reconnects are self-contained.
+function startVideo() {
+  return new Promise((resolve, reject) => {
+    let configured = false, settled = false;
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") +
+                location.host + "/video";
+    const vws = videoSocket = new WebSocket(url);
+    vws.binaryType = "arraybuffer";
+    const timer = setTimeout(() => fail(new Error("encoded video timed out")), 5000);
+
+    function fail(error) {
+      clearTimeout(timer);
+      if (!settled) { settled = true; reject(error); }
+      else if (videoStarted) startRaw();
+      try { vws.close(); } catch (_) {}
+    }
+
+    decoder = new VideoDecoder({
+      output: (frame) => {
+        resize(frame.displayWidth || frame.codedWidth, frame.displayHeight || frame.codedHeight);
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        frame.close();
+        clearStatus();
+        if (!settled) {
+          settled = true; videoStarted = true; clearTimeout(timer); resolve();
+        }
+      },
+      error: (e) => fail(e),
+    });
+
+    vws.onerror = () => fail(new Error("encoded video connection failed"));
+    vws.onclose = () => fail(new Error("encoded video disconnected"));
+    vws.onmessage = (event) => {
+      const bytes = new Uint8Array(event.data);
+      if (bytes.length === 12 && bytes[0] === 0) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        resize(view.getUint32(1), view.getUint32(5));
+        decoder.configure({
+          codec: "avc1.4D002A",
+          codedWidth: fbWidth,
+          codedHeight: fbHeight,
+          hardwareAcceleration: "prefer-hardware",
+          optimizeForLatency: true,
+        });
+        configured = true;
+        return;
+      }
+      if (!configured || bytes.length < 10 || (bytes[0] !== 1 && bytes[0] !== 2)) {
+        fail(new Error("invalid encoded video packet"));
+        return;
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const timestamp = Number(view.getBigUint64(1));
+      try {
+        decoder.decode(new EncodedVideoChunk({
+          type: bytes[0] === 1 ? "key" : "delta",
+          timestamp,
+          data: bytes.subarray(9),
+        }));
+      } catch (e) {
+        fail(e);
+      }
+    };
+  });
 }
 
 function resize(w, h) {
