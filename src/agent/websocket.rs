@@ -60,6 +60,7 @@ impl<S: Read + Write> WsStream<S> {
 
     /// Send exactly one binary message, preserving its boundary for clients
     /// such as WebCodecs that consume one encoded video access unit at a time.
+    #[cfg(unix)]
     pub fn write_binary(&mut self, payload: &[u8]) -> Result<()> {
         self.send_frame(OP_BINARY, payload)
     }

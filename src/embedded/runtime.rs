@@ -762,14 +762,15 @@ mod tests {
     use super::*;
 
     fn test_db() -> SmolvmDb {
+        static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "smolvm-embedded-runtime-{}-{}.db",
+            "smolvm-embedded-runtime-{}-{unique}-{sequence}.db",
             std::process::id(),
-            unique
         ));
         SmolvmDb::open_at(&path).unwrap()
     }

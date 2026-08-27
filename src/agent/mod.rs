@@ -16,7 +16,58 @@ mod manager;
 pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
+#[cfg(unix)]
 pub mod video;
+/// Encoded browser video is unavailable on non-Unix hosts because the helper
+/// transport uses a mode-restricted Unix socket.
+#[cfg(not(unix))]
+pub mod video {
+    /// Leave the existing Raw VNC path active when encoded video is disabled.
+    pub fn prestart_helper() -> Result<(), String> {
+        let disabled = std::env::var_os("SMOLVM_VIDEO").is_none_or(|value| {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("disabled")
+        });
+        if disabled {
+            Ok(())
+        } else {
+            Err("encoded video currently requires Unix sockets".into())
+        }
+    }
+
+    /// Non-Unix hosts always serve Raw VNC.
+    pub fn is_available() -> bool {
+        false
+    }
+
+    /// Reject the encoded browser route without disturbing its Raw RFB socket.
+    pub(crate) fn serve_browser<S: std::io::Read + std::io::Write>(
+        _ws: super::websocket::WsStream<S>,
+        _fb: std::sync::Arc<super::display::DisplayFramebuffer>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "encoded video currently requires Unix sockets",
+        ))
+    }
+
+    /// Reject direct starts of the Unix-only encoder helper.
+    pub fn run_helper(
+        _socket: &std::path::Path,
+        _owner_pid: u32,
+        _run_as: Option<(u32, u32)>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "video encoder helper requires Unix sockets",
+        ))
+    }
+}
 pub mod vnc;
 mod vsock_service;
 mod websocket;
