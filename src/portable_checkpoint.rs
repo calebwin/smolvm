@@ -206,6 +206,28 @@ pub fn capture_to_path(
         .create_storage_template()
         .map_err(|error| Error::agent("create checkpoint storage template", error.to_string()))?;
 
+    // The SAVE below is written by the VM's own already-dropped, per-VM
+    // isolated uid (see `process::vm_uid_drop_active`), not by this
+    // (still-privileged) process -- so without this, it can reach everything
+    // collected above (owned by us) but can't create its own "checkpoint"
+    // subdir inside `staging_dir`. Same two-step as the fork/restore path in
+    // `agent/fork.rs`: `ensure_traversable` for the ancestor chain up to
+    // `temp_dir` (execute-only -- nothing needs to be *written* there),
+    // `chown_tree` for `staging_dir` itself, which the VM's uid needs to
+    // create new entries in.
+    crate::process::ensure_traversable(temp_dir.path());
+    if let Some(result) = crate::process::vm_drop_ids(
+        &crate::agent::vm_uid_registry_dir(),
+        &crate::agent::vm_data_dir(name),
+        None,
+        None,
+    ) {
+        let (uid, gid) = result
+            .map_err(|error| Error::agent("resolve VM uid for checkpoint staging", error.to_string()))?;
+        crate::process::chown_tree(&staging_dir, uid, gid)
+            .map_err(|error| Error::agent("chown checkpoint staging for VM uid", error.to_string()))?;
+    }
+
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
